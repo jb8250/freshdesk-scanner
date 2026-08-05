@@ -135,6 +135,69 @@ with tempfile.TemporaryDirectory() as tmp:
 PY
 ok "clicked-ticket review state is saved locally and deliberate states are preserved"
 
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import re
+import app
+# Last-Opened focus marker (Prompt03): server-side wiring, distinct dark-blue
+# styling, confirmed-only DOM move, and the jump control / hidden-by-filters
+# message. All strings below also exist as JS comments, so assert on the
+# rendered CSS/HTML/JS constructs, not bare marker words.
+r = app.app.test_client().get("/queue")
+assert r.status_code == 200
+html = r.get_data(as_text=True)
+# Distinct dark-blue focus styling, off the yellow/orange review family.
+assert "tr.rv-last-opened{outline:3px solid #0d47a1" in html
+assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}" in html
+assert ".b-last-opened{background:#0d47a1;color:#fff}" in html
+# Rows carry a semantic data-ticket-id focus anchor.
+assert re.search(r'data-ticket-id="5000\d\d"', html)
+# JS: marker moves only on a confirmed save, stripping the old row first.
+assert "function moveLastOpened(newId)" in html
+assert "moveLastOpened(d.last_opened_id);" in html
+assert "target.classList.add('rv-last-opened')" in html
+# Jump control targets the table and never navigates/uses the network.
+assert "id=last-opened-jump" in html and "aria-controls=queue-table" in html
+assert re.search(r"scrollIntoView\(\{behavior: 'smooth', block: 'center'\}\)", html)
+print("last-opened focus markup, distinct CSS, jump control, and confirmed-only JS wiring present")
+PY
+ok "last-opened focus markup/CSS/JS wiring is present"
+
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import tempfile, os
+with tempfile.TemporaryDirectory() as tmp:
+    # Set REVIEW_DB_PATH BEFORE importing app so the Flask app (and its
+    # test client) resolves the isolated DB for the render checks below.
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    import app
+    app.init_db(os.environ["REVIEW_DB_PATH"])
+    app.mark_opened(500001)
+    app.mark_opened(500002)   # newer last_opened_at -> 500002 wins
+    assert app.last_opened_ticket_id() == 500002
+    # Reviewing another ticket does not move the focus.
+    app.set_review_result(500003, "Resolved")
+    assert app.last_opened_ticket_id() == 500002
+    # Move the marker onto 500001 (a ticket rendered by the default/overdue
+    # view) so the jump control is actually emitted for the render checks.
+    app.mark_opened(500001)
+    assert app.last_opened_ticket_id() == 500001
+    # Render checks against this isolated DB: 500001 is Opened (active view only).
+    c = app.app.test_client()
+    active = c.get("/queue").get_data(as_text=True)
+    assert '<tr class="rv-opened rv-last-opened" data-ticket-id="500001">' in active
+    assert "id=last-opened-jump" in active
+    assert "id=last-opened-hidden" not in active
+    completed = c.get("/queue?review_view=completed").get_data(as_text=True)
+    assert "id=last-opened-jump" not in completed
+    assert "id=last-opened-hidden" in completed
+    # Invalid timestamps fail safe (skipped, never crash).
+    conn = app._db_conn()
+    conn.execute("UPDATE review_state SET last_opened_at = 'garbage' WHERE ticket_id = 500002")
+    conn.commit(); conn.close()
+    assert app.last_opened_ticket_id() == 500001
+    print("last_opened selection: newest valid wins, review-separated, fail-safe")
+PY
+ok "last-opened selection is newest-valid, review-independent, and fail-safe"
+
 "$PYTHON" - <<'PY'
 import app
 try:

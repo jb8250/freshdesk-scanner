@@ -43,6 +43,7 @@ from app import (
     is_overdue,
     is_waiting_on_customer,
     keyword_filter_hits,
+    last_opened_ticket_id,
     load_review_rows,
     mark_opened,
     matches_any_category,
@@ -76,7 +77,7 @@ def _ids(text):
 
 def _row_for(html, tid):
     """Return the <tr>...</tr> segment for a given ticket id, or None."""
-    for row in re.findall(r'<tr class="rv-[a-z]+">.*?</tr>', html, re.S):
+    for row in re.findall(r'<tr class="rv-[a-z]+[^"]*"[^>]*>.*?</tr>', html, re.S):
         if f'data-ticket-id="{tid}"' in row:
             return row
     return None
@@ -1060,8 +1061,9 @@ def test_single_row_per_ticket(client):
     n_rows = len(re.findall(r'<tr class="rv-', html))
     assert n_rows == 10  # default view
     for tid in _ids(html):
-        # exactly one row -> data-ticket-id appears exactly twice (tid + subject links)
-        assert html.count(f'data-ticket-id="{tid}"') == 2, f"duplicate row for {tid}"
+        # exactly one row -> data-ticket-id appears exactly three times
+        # (the <tr> focus anchor + ticket-number link + subject link)
+        assert html.count(f'data-ticket-id="{tid}"') == 3, f"duplicate row for {tid}"
 
 
 # ===========================================================================
@@ -1516,7 +1518,9 @@ def test_opened_badge_renders_uppercase_and_highlighted(client):
     client.post("/queue/api/opened", json={"ticket_id": "500021"}, headers={"X-CSRF-Token": tok})
     html = client.get("/queue").get_data(as_text=True)
     assert 'class="badge b-review rv-opened">OPENED / IN REVIEW' in html
-    assert '<tr class="rv-opened">' in html
+    # The clicked ticket is also the most recently opened: the Last Opened
+    # marker class is layered on the review class (spec §3).
+    assert '<tr class="rv-opened rv-last-opened"' in html
 
 
 def test_mark_opened_preserves_deliberate_states():
@@ -1595,7 +1599,9 @@ def test_opened_state_persists_across_clients(client):
     html = client2.get("/queue").get_data(as_text=True)
     assert 'value="Opened / In Review" selected' in html
     assert 'class="badge b-review rv-opened">OPENED / IN REVIEW' in html
-    assert '<tr class="rv-opened">' in html
+    # The clicked ticket is also the most recently opened: the Last Opened
+    # marker class is layered on the review class (spec §3).
+    assert '<tr class="rv-opened rv-last-opened"' in html
 
 
 # ===========================================================================
@@ -1649,3 +1655,442 @@ def test_sqlite_operations_do_not_trigger_http(client):
     mark_opened(500002)
     rows = load_review_rows()
     assert set(rows) == {500001, 500002}
+
+
+# ===========================================================================
+# Last Opened focus marker (Prompt03-LastOpenedFocus.md)
+#
+# The focus is the single ticket with the newest *valid* last_opened_at among
+# all review_state rows (spec section 3/6), picked independently of the review
+# result and of the current filters. Invalid/missing timestamps fail safe and
+# equal timestamps resolve deterministically to the higher ticket id.
+# ===========================================================================
+
+def _open(client, tid):
+    tok = _csrf(client)
+    r = client.post("/queue/api/opened", json={"ticket_id": str(tid)},
+                    headers={"X-CSRF-Token": tok})
+    return r.get_json()
+
+
+def _opened_rows(html):
+    return [r for r in re.findall(r'<tr[^>]*>.*?</tr>', html, re.S)
+            if 'rv-last-opened' in r.split('>', 1)[0]]
+
+
+def test_no_last_opened_ivory_when_never_opened(client):
+    # Fresh DB: no marker row, no marker badge, no jump control, no message.
+    # (The marker strings also live in the inline JS, so assert on elements.)
+    html = client.get("/queue").get_data(as_text=True)
+    assert _opened_rows(html) == []
+    assert 'class="badge b-last-opened">' not in html
+    assert 'id=last-opened-jump' not in html
+    assert 'id=last-opened-hidden' not in html
+    assert last_opened_ticket_id() is None
+
+
+def test_first_click_marks_single_last_opened(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    row = _row_for(html, 500001)
+    assert 'rv-last-opened' in row.split('>', 1)[0]          # on the <tr>
+    assert 'class="badge b-last-opened">LAST OPENED' in row
+    assert len(_opened_rows(html)) == 1
+    assert html.count('class="badge b-last-opened">') == 1
+    assert 'id=last-opened-jump' in html
+
+
+def test_second_click_moves_marker_off_first(client):
+    _open(client, 500001)
+    _open(client, 500003)
+    html = client.get("/queue").get_data(as_text=True)
+    a_row = _row_for(html, 500001)
+    b_row = _row_for(html, 500003)
+    assert "rv-last-opened" not in a_row.split('>', 1)[0]
+    assert "b-last-opened" not in a_row
+    assert "rv-last-opened" in b_row.split('>', 1)[0]
+    assert "LAST OPENED" in b_row
+    assert html.count('class="badge b-last-opened">') == 1
+
+
+def test_exactly_one_marker_after_many_opens(client):
+    for tid in (500001, 500003, 500007, 500013, 500021):
+        _open(client, tid)
+    html = client.get("/queue").get_data(as_text=True)
+    assert len(_opened_rows(html)) == 1
+    assert html.count('class="badge b-last-opened">') == 1
+    assert last_opened_ticket_id() == 500021  # newest open wins
+
+
+def test_repeated_clicks_do_not_duplicate_database_rows(client):
+    _open(client, 500001)
+    _open(client, 500001)
+    _open(client, 500001)
+    rows = load_review_rows()
+    assert set(rows) == {500001}                      # single row for 500001
+    html = client.get("/queue").get_data(as_text=True)
+    assert html.count('class="badge b-last-opened">') == 1  # no duplicated badge
+    assert len(_opened_rows(html)) == 1
+
+
+def test_equal_timestamps_resolve_deterministically(client):
+    # now_utc is pinned by the suite clock, so the two opens share a timestamp;
+    # the selector must break the tie by the higher ticket id (deterministic).
+    _open(client, 500001)
+    _open(client, 500003)
+    assert last_opened_ticket_id() == 500003
+    _open(client, 500007)
+    assert last_opened_ticket_id() == 500007
+
+
+def test_malformed_timestamps_fail_safe(client):
+    now = app.iso_now()
+    conn = app._db_conn()
+    conn.execute("INSERT OR REPLACE INTO review_state "
+                 "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (500001, "Unreviewed", "not-a-date", now, now))
+    conn.execute("INSERT OR REPLACE INTO review_state "
+                 "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (500003, "Unreviewed", app.iso_now(), now, now))
+    conn.commit()
+    conn.close()
+    # invalid row is skipped; the valid one wins.
+    assert last_opened_ticket_id() == 500003
+
+
+def test_all_invalid_timestamps_return_none(client):
+    now = app.iso_now()
+    conn = app._db_conn()
+    for tid in (500001, 500003):
+        conn.execute("INSERT OR REPLACE INTO review_state "
+                     "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (tid, "Unreviewed", "garbage", now, now))
+    conn.commit()
+    conn.close()
+    assert last_opened_ticket_id() is None
+
+
+def test_null_last_opened_at_is_skipped(client):
+    now = app.iso_now()
+    conn = app._db_conn()
+    conn.execute("INSERT OR REPLACE INTO review_state "
+                 "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (500001, "Unreviewed", None, now, now))
+    conn.execute("INSERT OR REPLACE INTO review_state "
+                 "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (500003, "Unreviewed", app.iso_now(), now, now))
+    conn.commit()
+    conn.close()
+    assert last_opened_ticket_id() == 500003
+
+
+def test_naive_timestamp_treated_as_utc(client):
+    now = app.iso_now()
+    conn = app._db_conn()
+    # 500001 stored naive (assumed UTC) at 12:00; 500003 aware UTC at 10:00.
+    conn.execute("INSERT OR REPLACE INTO review_state "
+                 "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (500003, "Unreviewed", "2026-08-05T10:00:00", now, now))
+    conn.execute("INSERT OR REPLACE INTO review_state "
+                 "(ticket_id, review_result, last_opened_at, created_at, modified_at) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (500001, "Unreviewed", "2026-08-05T12:00:00+00:00", now, now))
+    conn.commit()
+    conn.close()
+    assert last_opened_ticket_id() == 500001
+
+
+def test_marker_is_not_derived_from_review_result(client):
+    # Reviewing a ticket (Resolved) without ever opening it must NOT mark it.
+    set_review_result(500001, "Resolved")
+    assert last_opened_ticket_id() is None
+
+
+def test_opened_api_returns_last_opened_id(client):
+    d1 = _open(client, 500001)
+    assert d1["last_opened_id"] == 500001
+    d2 = _open(client, 500003)
+    assert d2["last_opened_id"] == 500003
+    assert set(d1.keys()) == {"ok", "review_result", "last_opened_id"}
+
+
+def test_save_failure_does_not_move_marker(client):
+    _open(client, 500001)
+    # Invalid POST (missing CSRF) -> rejected; marker must not move.
+    r = client.post("/queue/api/opened", json={"ticket_id": "500003"})
+    assert r.status_code == 403
+    assert last_opened_ticket_id() == 500001
+
+
+def test_needs_followup_and_last_opened_displayed_together(client):
+    set_review_result(500003, "Needs Follow-Up")
+    _open(client, 500003)
+    html = client.get("/queue").get_data(as_text=True)
+    row = _row_for(html, 500003)
+    assert "rv-followup" in row.split('>', 1)[0]
+    assert "rv-last-opened" in row.split('>', 1)[0]
+    assert ">Needs Follow-Up" in row
+    assert ">LAST OPENED" in row
+
+
+def test_resolved_and_last_opened_displayed_together(client):
+    set_review_result(500003, "Resolved")
+    _open(client, 500003)
+    html = client.get("/queue?review_view=all").get_data(as_text=True)
+    row = _row_for(html, 500003)
+    assert "rv-resolved" in row.split('>', 1)[0]
+    assert "rv-last-opened" in row.split('>', 1)[0]
+    assert ">Resolved" in row
+    assert ">LAST OPENED" in row
+
+
+def test_no_action_needed_and_last_opened_displayed_together(client):
+    set_review_result(500003, "No Action Needed")
+    _open(client, 500003)
+    html = client.get("/queue?review_view=all").get_data(as_text=True)
+    row = _row_for(html, 500003)
+    assert "rv-none" in row.split('>', 1)[0]
+    assert "rv-last-opened" in row.split('>', 1)[0]
+    assert ">No Action Needed" in row
+    assert ">LAST OPENED" in row
+
+
+def test_opened_and_last_opened_displayed_together(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    row = _row_for(html, 500001)
+    assert "rv-opened" in row.split('>', 1)[0]
+    assert "rv-last-opened" in row.split('>', 1)[0]
+    assert ">OPENED / IN REVIEW" in row
+    assert ">LAST OPENED" in row
+
+
+def test_followup_class_is_distinct_from_last_opened(client):
+    html = client.get("/queue").get_data(as_text=True)
+    # two separate CSS rules, distinct dark-blue focus styling (spec section 4).
+    assert "tr.rv-followup{background:#fff3e0}" in html
+    assert "tr.rv-last-opened{outline:3px solid #0d47a1" in html
+
+
+def test_changing_review_result_preserves_marker(client):
+    _open(client, 500001)                       # Opened / In Review + marker
+    set_review_result(500001, "Resolved")      # deliberate result change
+    assert last_opened_ticket_id() == 500001   # marker keeps its focus state
+    html = client.get("/queue?review_view=completed").get_data(as_text=True)
+    row = _row_for(html, 500001)
+    assert "rv-last-opened" in row.split('>', 1)[0]
+
+
+def test_clicking_removes_marker_only_from_previous(client):
+    _open(client, 500001)                          # A becomes Opened
+    _open(client, 500003)                       # B becomes last-opened
+    rows = load_review_rows()
+    # A's deliberate review state is preserved; only the focus marker moved.
+    assert rows[500001]["review_result"] == "Opened / In Review"
+    assert last_opened_ticket_id() == 500003
+
+
+# --- persistence -----------------------------------------------------------
+
+def test_marker_persists_across_fresh_request(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)      # "first reload"
+    assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+    html2 = client.get("/queue").get_data(as_text=True)     # "second reload"
+    assert "rv-last-opened" in _row_for(html2, 500001).split('>', 1)[0]
+    assert len(_opened_rows(html2)) == 1
+
+
+def test_marker_persists_across_new_client(client):
+    # A second client (equivalent to a fresh page session / app restart) reads
+    # the same isolated review DB and still sees the marker (spec: persistent).
+    _open(client, 500001)
+    client2 = app.app.test_client()
+    html = client2.get("/queue").get_data(as_text=True)
+    assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+    assert last_opened_ticket_id() == 500001
+
+
+def test_marker_persists_across_url_filter_changes(client):
+    _open(client, 500001)
+    # Each combo still renders ticket 500001 (overdue default, all-view, 60-day).
+    for url in ("/queue", "/queue?review_view=all", "/queue?days=365"):
+        html = client.get(url).get_data(as_text=True)
+        assert last_opened_ticket_id() == 500001
+        assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+
+
+def test_marker_survives_unrelated_review_of_other_ticket(client):
+    _open(client, 500001)
+    set_review_result(500003, "Resolved")   # reviewing another ticket...
+    assert last_opened_ticket_id() == 500001  # ...does not move the marker
+    html = client.get("/queue").get_data(as_text=True)
+    assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+
+
+def test_reset_defaults_keeps_focus(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)  # defaults
+    assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+    assert last_opened_ticket_id() == 500001
+
+
+# --- filter interplay ------------------------------------------------------
+
+def test_marker_visible_in_default_view_shows_jump(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    assert "id=last-opened-jump" in html
+    assert "id=last-opened-hidden" not in html
+    assert len(_opened_rows(html)) == 1
+
+
+def test_marker_hidden_by_completed_view_shows_message(client):
+    _open(client, 500001)                      # Opened / In Review -> active only
+    html = client.get("/queue?review_view=completed").get_data(as_text=True)
+    assert _opened_rows(html) == []            # no falsely marked row
+    assert "id=last-opened-jump" not in html   # no jump control
+    assert "id=last-opened-hidden" in html     # server-rendered notice element
+
+
+def test_resolved_marker_hidden_from_active_view(client):
+    set_review_result(500001, "Resolved")
+    _open(client, 500001)
+    html_active = client.get("/queue").get_data(as_text=True)  # active view
+    assert "id=last-opened-hidden" in html_active
+    html_completed = client.get("/queue?review_view=completed").get_data(as_text=True)
+    assert "rv-last-opened" in _row_for(html_completed, 500001).split('>', 1)[0]
+    assert "id=last-opened-jump" in html_completed
+
+
+def test_marker_visible_in_all_view(client):
+    _open(client, 500001)
+    html = client.get("/queue?review_view=all").get_data(as_text=True)
+    assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+    assert "id=last-opened-hidden" not in html
+
+
+def test_hidden_by_filters_does_not_move_marker(client):
+    _open(client, 500001)
+    client.get("/queue?review_view=completed")  # hidden here...
+    assert last_opened_ticket_id() == 500001    # ...but focus state unchanged
+    html = client.get("/queue").get_data(as_text=True)
+    assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
+
+
+# --- jump control ----------------------------------------------------------
+
+def test_jump_button_attributes(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    assert "id=last-opened-jump" in html
+    assert "type=button" in html                # never a form submit
+    assert "aria-controls=queue-table" in html  # a11y: targets the table
+    assert "<table id=queue-table>" in html
+
+
+def test_jump_uses_smooth_scroll_and_temp_focus(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    # Spec: smooth-scroll if supported, still functional without animation.
+    assert "row.scrollIntoView({behavior: 'smooth', block: 'center'})" in html
+    assert "row.focus({preventScroll: true})" in html
+    assert "row.setAttribute('tabindex', '-1')" in html
+    assert "row.removeAttribute('tabindex')" in html
+
+
+def test_jump_handler_never_navigates_or_uses_network(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    start = html.index("function jumpToLastOpened()")
+    end = html.index("// both the ticket-number and subject links.")
+    segment = html[start:end]
+    assert "scrollIntoView" in segment
+    assert "fetch(" not in segment and "XMLHttpRequest" not in segment
+    assert "location" not in segment and "window.open" not in segment
+    assert "preventDefault" not in segment
+
+
+def test_js_builds_jump_chrome_when_first_marker(client):
+    # The jump bar + hidden notice are server-rendered only when a marker
+    # exists at load. After the FIRST click creates the marker client-side,
+    # ensureLastOpenedChrome() must construct them instead of a reload.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "function ensureLastOpenedChrome()" in html
+    assert "function jumpToLastOpened()" in html
+    seg_start = html.index("function ensureLastOpenedChrome()")
+    seg_end = html.index("// Delegated listener")
+    seg = html[seg_start:seg_end]
+    assert "className = 'last-opened-bar'" in seg
+    assert "btn.id = 'last-opened-jump'" in seg
+    assert "btn.setAttribute('aria-controls', 'queue-table')" in seg
+    assert "id = 'last-opened-hidden'" in seg
+    assert "Last opened ticket is hidden by the current filters." in seg
+
+
+def test_jump_listener_is_delegated(client):
+    # Delegated document listener => works whether the button was rendered at
+    # load or created later by ensureLastOpenedChrome().
+    html = client.get("/queue").get_data(as_text=True)
+    assert "document.addEventListener('click', function (e)" in html
+    assert "e.target.id === 'last-opened-jump'" in html
+    assert "jumpToLastOpened()" in html
+
+
+# --- immediate DOM update (JS) ----------------------------------------------
+
+def test_js_defines_move_last_opened_and_calls_on_confirm(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert "function moveLastOpened(newId)" in html
+    # Called only inside the confirmed-save branch of the opened handler.
+    assert "moveLastOpened(d.last_opened_id);" in html
+    assert "Marker only moves on a confirmed save" in html
+
+
+def test_js_strips_old_marker_before_adding(client):
+    # Idempotent strip of the marker from every row prevents duplicated badges
+    # when the same ticket is clicked repeatedly.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "querySelectorAll('.b-last-opened')" in html
+    assert "querySelectorAll('tr.rv-last-opened')" in html
+    assert "target.classList.add('rv-last-opened')" in html
+
+
+def test_js_toggles_jump_and_hidden_message_on_move(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert "bar.style.display = ''" in html
+    assert "bar.style.display = 'none'" in html
+    assert "hidden.style.display = 'none'" in html
+    assert "hidden.style.display = ''" in html
+
+
+# --- styling / a11y ---------------------------------------------------------
+
+def test_last_opened_css_distinct_blue(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert "tr.rv-last-opened{outline:3px solid #0d47a1" in html
+    assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}" in html
+    assert ".b-last-opened{background:#0d47a1;color:#fff}" in html
+
+
+def test_focus_marker_never_uses_review_colors(client):
+    # The focus indicator is dark blue (#0d47a1) — never the yellow/orange of
+    # the review highlight (#fff8e1 / #f9a825), so the two are distinguishable.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "#0d47a1" in html
+    for forbidden in ("rv-last-opened{background:#fff8e1}",
+                      "rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}"):
+        assert forbidden not in html
+
+
+def test_marker_row_keeps_semantic_row_anchor(client):
+    _open(client, 500001)
+    html = client.get("/queue").get_data(as_text=True)
+    row = _row_for(html, 500001)
+    assert 'data-ticket-id="500001"' in row.split('>', 1)[0]

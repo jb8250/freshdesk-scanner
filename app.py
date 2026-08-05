@@ -497,6 +497,42 @@ def load_review_rows():
         conn.close()
 
 
+def last_opened_ticket_id():
+    """Ticket id of the single most recently opened ticket, or None.
+
+    The Last Opened focus marker is derived from the newest valid
+    `last_opened_at` across review_state rows (spec §3/§6) — never from the
+    review result, so a ticket can be e.g. "Resolved + Last Opened" at the
+    same time. Selection is deterministic:
+
+    - every stored last_opened_at is parsed as UTC; missing, empty, or
+      malformed values are skipped (fail safe);
+    - the chosen ticket is the maximum (last_opened_at, ticket_id), so two
+      records with identical timestamps resolve to the higher ticket id
+      instead of leaving the marker ambiguous;
+    - None is returned when no ticket has ever been opened, in which case
+      the dashboard renders neither marker nor jump control.
+    """
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT ticket_id, last_opened_at FROM review_state"
+        ).fetchall()
+    finally:
+        conn.close()
+    best = None  # (parsed UTC datetime, ticket_id)
+    for r in rows:
+        ts = parse_dt(r["last_opened_at"])
+        if ts is None:
+            continue  # missing / malformed timestamp fails safe
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)  # naive stored value == UTC
+        key = (ts, r["ticket_id"])
+        if best is None or key > best:
+            best = key
+    return best[1] if best else None
+
+
 def _state_row(ticket_id):
     conn = _db_conn()
     try:
@@ -758,6 +794,7 @@ def queue():
         tickets = apply_queue_filters(raw, config)
 
     state_rows = load_review_rows()
+    last_opened_id = last_opened_ticket_id()  # focus state, independent of filters
 
     # Per-ticket view decision + row data (single row per ticket, sorted by id).
     rows = []
@@ -771,6 +808,13 @@ def queue():
         pid = t.get("priority", 0)
         due = t.get("due_by") or t.get("fr_due_by")
         updated_at = t.get("updated_at")
+        row_class = REVIEW_CLASS.get(
+            state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
+            "rv-unreviewed",
+        )
+        is_last_opened = last_opened_id is not None and tid == last_opened_id
+        if is_last_opened:
+            row_class += " rv-last-opened"  # layered on top of the review class
         rows.append({
             "id": tid,
             "url": ticket_url(tid),
@@ -783,10 +827,8 @@ def queue():
             "tags": (t.get("tags") or []) if isinstance(t.get("tags"), list) else [],
             "type": t.get("type"),
             "result": state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
-            "row_class": REVIEW_CLASS.get(
-                state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
-                "rv-unreviewed",
-            ),
+            "row_class": row_class,
+            "last_opened": is_last_opened,
             "badges": ticket_badges(t, state_row, updated_flag),
         })
 
@@ -797,6 +839,8 @@ def queue():
         offline=offline, cache_age=cache_age, config=config,
         csrf_token=get_csrf_token(), flash=flash_msg,
         all_categories_off=all_categories_off,
+        last_opened_id=last_opened_id,
+        last_opened_rendered=any(r["last_opened"] for r in rows),
     )
 
 
@@ -879,7 +923,11 @@ def opened_api():
     except Exception as e:
         return jsonify({"ok": False, "error": f"database error: {e}"}), 500
 
-    return jsonify({"ok": True, "review_result": result})
+    return jsonify({
+        "ok": True,
+        "review_result": result,
+        "last_opened_id": last_opened_ticket_id(),
+    })
 
 
 def resolve_bind_host(host):
@@ -931,6 +979,9 @@ QUEUE_HTML = """\
  tr.rv-na{background:#eeeeee}
  tr.rv-none{background:#e3f2fd}
  tr.rv-followup{background:#fff3e0}
+tr.rv-last-opened{outline:3px solid #0d47a1;outline-offset:-3px}
+tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}
+.b-last-opened{background:#0d47a1;color:#fff}
  a.tid{font-weight:bold;color:#1565c0;text-decoration:none}
  a.tid:hover{text-decoration:underline}
  a.sbj{color:#222;text-decoration:none}
@@ -987,11 +1038,18 @@ QUEUE_HTML = """\
 </form>
 
 <p class=count>{{ total }} tickets matching your filters</p>
+{% if last_opened_id is not none %}
+  {% if last_opened_rendered %}
+<p class=last-opened-bar><button type=button id=last-opened-jump aria-controls=queue-table>Jump to Last Opened</button></p>
+  {% else %}
+<div class="banner" id=last-opened-hidden role=status>Last opened ticket is hidden by the current filters.</div>
+  {% endif %}
+{% endif %}
 {% if all_categories_off %}
 <div class=empty>Select at least one ticket category to display results.</div>
 {% elif tickets %}
 <div class=tablewrap>
-<table>
+<table id=queue-table>
 <caption class=visually-hidden>Freshdesk review queue</caption>
 <tr>
   <th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Status</th>
@@ -1000,11 +1058,11 @@ QUEUE_HTML = """\
   <th scope=col>Tags</th><th scope=col>Type</th>
 </tr>
 {% for t in tickets %}
-<tr class="{{ t.row_class }}">
+<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}">
   <td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td>
   <td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td>
   <td>{{ t.status_label }}</td>
-  <td><div class=badges>{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td>
+  <td><div class=badges>{% if t.last_opened %}<span class="badge b-last-opened">LAST OPENED</span>{% endif %}{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td>
   <td>
     <form class=rvform method=post action=/queue/api/review>
       <input type=hidden name=csrf_token value="{{ csrf_token }}">
@@ -1060,7 +1118,83 @@ function showError(msg) {
   clearTimeout(showError._t);
   showError._t = setTimeout(function () { toastEl.classList.add('hidden'); }, 6000);
 }
-// Anchor on the reliable data-ticket-id identifier (spec section 4). Covers
+// The Last Opened focus marker is derived server-side from the newest valid
+// last_opened_at (spec section 3/6) and reported back by the opened endpoint
+// as last_opened_id. On a *confirmed* save we move the marker in the DOM
+// without reloading: strip the marker class/badge from every row (idempotent,
+// so repeat clicks never duplicate the badge), then apply it to the target row
+// (if rendered) and keep the jump control / hidden-message in sync.
+function moveLastOpened(newId) {
+  if (typeof newId === 'undefined' || newId === null) { return; }
+  ensureLastOpenedChrome();
+  document.querySelectorAll('.b-last-opened').forEach(function (b) {
+    b.parentNode.removeChild(b);
+  });
+  document.querySelectorAll('tr.rv-last-opened').forEach(function (r) {
+    r.classList.remove('rv-last-opened');
+  });
+  var target = document.querySelector('tr[data-ticket-id="' + newId + '"]');
+  var bar = document.querySelector('.last-opened-bar');
+  var hidden = document.getElementById('last-opened-hidden');
+  if (target) {
+    target.classList.add('rv-last-opened');
+    var badges = target.querySelector('.badges');
+    if (badges) {
+      var span = document.createElement('span');
+      span.className = 'badge b-last-opened';
+      span.textContent = 'LAST OPENED';
+      badges.appendChild(span);
+    }
+    if (bar) { bar.style.display = ''; }
+    if (hidden) { hidden.style.display = 'none'; }
+  } else {
+    if (bar) { bar.style.display = 'none'; }
+    if (hidden) { hidden.style.display = ''; }
+  }
+}
+// Jump to Last Opened: smooth-scroll to the marked row and set temporary
+// keyboard focus. Never opens the Freshdesk link and never makes a network
+// request (spec section 5).
+function jumpToLastOpened() {
+  var row = document.querySelector('tr.rv-last-opened');
+  if (!row) { return; }
+  row.scrollIntoView({behavior: 'smooth', block: 'center'});
+  row.setAttribute('tabindex', '-1');
+  row.focus({preventScroll: true});
+  setTimeout(function () { row.removeAttribute('tabindex'); }, 1500);
+}
+// The jump bar and the hidden-by-filters notice are server-rendered only when
+// a last-opened marker already existed at page load. When the *first* click
+// creates the marker client-side, build the same chrome here so the jump
+// control appears without a reload.
+function ensureLastOpenedChrome() {
+  if (!document.querySelector('.last-opened-bar')) {
+    var bar = document.createElement('p');
+    bar.className = 'last-opened-bar';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'last-opened-jump';
+    btn.setAttribute('aria-controls', 'queue-table');
+    btn.textContent = 'Jump to Last Opened';
+    bar.appendChild(btn);
+    var anchor = document.querySelector('.tablewrap') || document.body;
+    anchor.parentNode.insertBefore(bar, anchor);
+  }
+  if (!document.getElementById('last-opened-hidden')) {
+    var div = document.createElement('div');
+    div.className = 'banner';
+    div.id = 'last-opened-hidden';
+    div.setAttribute('role', 'status');
+    div.textContent = 'Last opened ticket is hidden by the current filters.';
+    var divAnchor = document.querySelector('.tablewrap') || document.body;
+    divAnchor.parentNode.insertBefore(div, divAnchor);
+  }
+}
+// Delegated listener: works whether the button was server-rendered at load or
+// created later by ensureLastOpenedChrome() after the first marker click.
+document.addEventListener('click', function (e) {
+  if (e.target && e.target.id === 'last-opened-jump') { jumpToLastOpened(); }
+});
 // both the ticket-number and subject links. The default navigation is never
 // prevented: the Freshdesk ticket always opens in a new tab synchronously,
 // and the local state request runs in the background (spec section 5).
@@ -1086,6 +1220,9 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
         if (badge) { badge.className = 'badge b-review ' + cls; badge.textContent = badgeText(d.review_result); }
         var sel = row ? row.querySelector('select[name=review_result]') : null;
         if (sel && sel.querySelector('option[value="' + d.review_result + '"]')) { sel.value = d.review_result; }
+        // Marker only moves on a confirmed save (spec: save failure must not
+        // falsely move the Last Opened marker).
+        moveLastOpened(d.last_opened_id);
       } else {
         showError('Could not save Opened / In Review state for #' + tid + ' (not saved).');
       }
