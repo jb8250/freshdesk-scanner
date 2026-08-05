@@ -242,6 +242,31 @@ def filter_query_string(config):
     })
 
 
+_VIEW_LABEL = {"active": "Active", "completed": "Completed", "all": "All"}
+
+
+def filter_summary_text(config):
+    """Human-readable active-filter summary derived solely from the canonical
+    filter config (which itself comes from the parsed URL state). Rendered as
+    the dashboard's filter-summary bar so it always matches the filters the
+    page is actually using."""
+    prim = []
+    if config.get("overdue"):
+        prim.append("Overdue")
+    if config.get("responded"):
+        prim.append("Customer Responded")
+    if config.get("waiting"):
+        prim.append("Waiting on Customer")
+    if not prim:
+        return "Showing: No ticket category selected"
+    label = _VIEW_LABEL.get(config.get("review_view"), _VIEW_LABEL["active"])
+    segments = list(prim)
+    if config.get("missing_tags"):
+        segments.append("Missing Tags")
+    return f"Showing: {' + '.join(segments)} \u00b7 Last {config.get('days', 60)} days \u00b7 {label}"
+
+
+
 # ---------------------------------------------------------------------------
 # Category logic (section 6 of the spec)
 # ---------------------------------------------------------------------------
@@ -989,20 +1014,43 @@ QUEUE_HTML = """\
  .banner{background:#fff3cd;border:1px solid #e0c060;padding:8px 12px;border-radius:6px;font-size:13px;margin-bottom:14px}
  .banner.err{background:#fdecea;border-color:#d66;color:#8a1f1f}
  .banner.ok{background:#e8f5e9;border-color:#6a9;color:#1e4d2b}
- .controls{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 14px;margin-bottom:14px}
- .controls .row{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
- .controls .row:last-child{margin-bottom:0}
- .controls label{font-size:13px;display:inline-flex;align-items:center;gap:5px;cursor:pointer}
- .controls input[type=number]{width:70px;padding:5px 8px;font-size:13px;border:1px solid #bbb;border-radius:4px}
- .controls select{padding:5px 8px;font-size:13px;border:1px solid #bbb;border-radius:4px}
- .controls button{padding:6px 14px;font-size:13px;border-radius:4px;border:1px solid #388e3c;background:#388e3c;color:#fff;cursor:pointer}
- .controls button.reset{background:#fff;color:#666;border-color:#bbb}
- .controls a.preset{font-size:12px;color:#1565c0;margin-left:8px}
- .field{display:flex;align-items:center;gap:6px}
+ .controls{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px 18px;margin-bottom:10px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+ .controls .panel-region{display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid #f0f0f0}
+ .controls .panel-region:last-child{padding-bottom:0;margin-bottom:0;border-bottom:0}
+ .region-time{justify-content:space-between}
+ .days-field{display:inline-flex;align-items:center;gap:7px;flex-wrap:wrap}
+ .days-field .lbl{font-size:13px;color:#444;white-space:nowrap}
+ .controls input[type=number]{width:76px;padding:6px 9px;font-size:14px;border:1px solid #bdbdbd;border-radius:6px;background:#fff}
+ .controls input[type=number]:focus-visible{outline:2px solid #1a73e8;outline-offset:1px}
+ .preset-group{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:4px}
+ .preset{font-size:12px;font-weight:600;color:#444;text-decoration:none;padding:5px 11px;border-radius:6px;line-height:1;letter-spacing:.02em}
+ .preset:hover{background:#e5e7eb;color:#111}
+ .preset[aria-current=page]{background:#1a73e8;color:#fff;box-shadow:inset 0 0 0 1.5px #175cd3}
+ .preset[aria-current=page] .preset-mark{font-weight:700}
+ .preset:focus-visible{outline:2px solid #1a73e8;outline-offset:2px}
+ .region-groups{display:flex;flex-wrap:wrap;gap:12px}
+ .filter-group{border:1px solid #e4e6eb;border-radius:8px;padding:10px 12px 11px;margin:0;min-width:150px;flex:1 1 200px;display:flex;flex-direction:column;gap:7px;background:#fcfcfd}
+ .filter-group .group-lbl{font-size:11px;font-weight:700;color:#5f6368;text-transform:uppercase;letter-spacing:.5px;padding:0 2px}
+ .field{display:inline-flex;align-items:center;gap:5px}
  .field .lbl{font-size:13px;color:#444;white-space:nowrap}
- .filter-group{border:1px solid #e0e0e0;border-radius:6px;padding:7px 12px 9px;display:inline-flex;flex-direction:column;gap:6px;align-items:flex-start;margin:0}
- .filter-group .group-lbl{font-size:11px;font-weight:600;color:#616161;text-transform:uppercase;letter-spacing:.4px;padding:0 3px}
- .filter-group .field-hint{font-size:11px;color:#888;line-height:1.35}
+ .filter-group .field label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:#222;text-transform:none;letter-spacing:0;font-weight:400}
+ .filter-group .field input[type=checkbox]{width:16px;height:16px;accent-color:#1a73e8;cursor:pointer}
+ .filter-group .field input[type=checkbox]:focus-visible{outline:2px solid #1a73e8;outline-offset:2px}
+ .filter-group .field-hint{font-size:11px;color:#8a8f98;line-height:1.4;margin:0}
+ .region-actions{display:flex;flex-wrap:wrap;align-items:center;gap:14px;justify-content:space-between}
+ .view-field{display:inline-flex;align-items:center;gap:8px}
+ .view-field label{font-size:13px;color:#444;white-space:nowrap}
+ .controls select{padding:7px 10px;font-size:13px;border:1px solid #bdbdbd;border-radius:6px;background:#fff}
+ .controls select:focus-visible{outline:2px solid #1a73e8;outline-offset:1px}
+ .action-buttons{display:inline-flex;gap:10px;flex-wrap:wrap;align-items:center}
+ .controls button[type=submit]{padding:8px 18px;font-size:13px;font-weight:600;border:1px solid #1565c0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer}
+ .controls button[type=submit]:hover{background:#1664d0}
+ .controls button[type=submit]:focus-visible{outline:2px solid #0d47a1;outline-offset:2px}
+ .controls a.reset{display:inline-block;padding:7px 15px;font-size:13px;font-weight:500;color:#5f6368;background:#fff;border:1px solid #c6c9cf;border-radius:6px;text-decoration:none}
+ .controls a.reset:hover{border-color:#9aa0a6;color:#202124}
+ .controls a.reset:focus-visible{outline:2px solid #1a73e8;outline-offset:2px}
+ .filter-summary{font-size:13px;color:#3c4043;background:#f1f3f4;border:1px solid #e0e0e0;border-radius:8px;padding:7px 12px;margin:8px 0 12px}
+ @media (max-width:720px){.controls{padding:14px}.region-time{flex-direction:column;align-items:flex-start;gap:10px}.region-groups{flex-direction:column}.filter-group{flex:1 1 auto;min-width:0}.region-actions{flex-direction:column;align-items:flex-start;gap:12px}.action-buttons{width:100%;justify-content:space-between}.controls button[type=submit]{flex:1 1 auto}.controls a.reset{flex:1 1 auto;text-align:center}}
  .count{font-size:13px;color:#555;margin-bottom:8px}
  .tablewrap{overflow-x:auto;background:#fff;border:1px solid #ddd;border-radius:8px}
  table{border-collapse:collapse;width:100%;font-size:13px;min-width:960px}
@@ -1052,39 +1100,44 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
 {% endif %}
 
 <form class="controls" method=get action=/queue novalidate>
-  <div class=row>
-    <span class=field><span class=lbl>Tickets updated in the last</span>
+  <div class="panel-region region-time">
+    <span class="days-field field"><span class=lbl>Tickets updated in the last</span>
       <input type=number name=days min=1 max=365 value={{ config.days }} aria-label="Days back">
       <span class=lbl>days</span>
-      {% for d in [7, 14, 30, 60] %}<a class=preset href="/queue?{{ preset_urls[d] }}">{{ d }}d</a>{% endfor %}
     </span>
+    <div class=preset-group role=group aria-label="Quick time presets">
+      {% for d in [7, 14, 30, 60, 90] %}<a class=preset href="/queue?{{ preset_urls[d] }}" {% if config.days == d %}aria-current=page{% endif %}>{% if config.days == d %}<span class=preset-mark aria-hidden=true>&#10003;</span> {% endif %}{{ d }}d</a>{% endfor %}
+    </div>
   </div>
-  <div class=row>
+  <div class="panel-region region-groups">
     <fieldset class=filter-group>
       <legend class=group-lbl>Ticket conditions</legend>
-      <span class=field><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></span>
-      <span class=field-hint>Overdue is combined with the selected status.</span>
+      <div class=field><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></div>
+      <p class=field-hint>Works together with the selected status.</p>
     </fieldset>
     <fieldset class=filter-group>
       <legend class=group-lbl>Freshdesk status</legend>
-      <span class=field><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></span>
-      <span class=field><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></span>
-      <span class=field-hint>Selecting both statuses shows either status.</span>
+      <div class=field><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></div>
+      <div class=field><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></div>
+      <p class=field-hint>Select one or both statuses.</p>
     </fieldset>
     <fieldset class=filter-group>
       <legend class=group-lbl>Additional filters</legend>
-      <span class=field><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></span>
+      <div class=field><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></div>
     </fieldset>
   </div>
-  <div class=row>
-    <span class=field><label for=review_view>Review view</label>
+  <div class="panel-region region-actions">
+    <span class=view-field><label for=review_view>Review view</label>
       <select id=review_view name=review_view>
         {% for v in ['active','completed','all'] %}<option value={{ v }} {{ 'selected' if config.review_view == v }}>{% if v == 'active' %}Active{% elif v == 'completed' %}Completed{% else %}All{% endif %}</option>{% endfor %}
       </select></span>
-    <button type=submit>Apply Filters</button>
-    <a class="controls button reset" href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active" role=button aria-label="Reset filters to defaults">Reset to Defaults</a>
+    <div class=action-buttons>
+      <button type=submit class=apply>Apply Filters</button>
+      <a class=reset href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active" role=button aria-label="Reset filters to defaults">Reset to Defaults</a>
+    </div>
   </div>
 </form>
+<p class=filter-summary role=status>{{ active_summary }}</p>
 
 <p class=count>{{ total }} tickets matching your filters</p>
 {% if last_opened_id is not none %}
@@ -1353,7 +1406,8 @@ def _queue_render(**kwargs):
     token = ctx["csrf_token"]
     ctx.setdefault("csrf_token_json", json.dumps(token))
     ctx.setdefault("review_states", REVIEW_STATES)
-    ctx.setdefault("preset_urls", {d: filter_query_string(dict(cfg, days=d)) for d in (7, 14, 30, 60)})
+    ctx.setdefault("preset_urls", {d: filter_query_string(dict(cfg, days=d)) for d in (7, 14, 30, 60, 90)})
+    ctx.setdefault("active_summary", filter_summary_text(cfg))
     return render_template_string(QUEUE_HTML, **ctx)
 
 

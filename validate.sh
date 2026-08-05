@@ -427,6 +427,86 @@ with tempfile.TemporaryDirectory() as tmp:
 PY
 ok "mixed filter logic is correct (Prompt06)"
 
+# Prompt07 - filter panel polish: redesigned panel structure (three panel
+# regions, compact pill presets incl. 90d, active-filter summary) while filter
+# semantics and canonical URLs are unchanged. Isolated temp DB; network stays
+# blocked; offline only.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import json
+import os
+import re
+import tempfile
+import requests
+import app  # cwd is ROOT_DIR (validate.sh cd's there)
+
+def blocked(*args, **kwargs):
+    raise AssertionError("unexpected external HTTP")
+requests.get = blocked
+requests.post = blocked
+requests.put = blocked
+requests.patch = blocked
+requests.delete = blocked
+
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    app.init_db(os.environ["REVIEW_DB_PATH"])
+    client = app.app.test_client()
+    default = client.get("/queue").get_data(as_text=True)
+    # Jinja escapes & as &amp; in hrefs; normalize a copy for canonical-URL checks
+    # while keeping `default` intact for the reset-link (&amp;) assertion.
+    dflt = default.replace("&amp;", "&")
+
+    # 1. Exactly one controls form; GET /queue; novalidate.
+    forms = re.findall(r"<form([^>]*)>", default)
+    controls = [f for f in forms if "controls" in f and "method=get" in f]
+    assert len(controls) == 1, f"expected one controls form, got {len(controls)}"
+    assert "action=/queue" in controls[0] and "novalidate" in controls[0]
+
+    # 2. Three filter groups render as fieldsets with legends.
+    for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
+        assert f"<legend class=group-lbl>{legend}</legend>" in default, legend
+
+    # 3. New panel regions present.
+    for region in ("region-time", "region-groups", "region-actions"):
+        assert f'class="panel-region {region}"' in default, region
+
+    # 4. Apply (primary) and Reset (secondary) controls present; Reset exact URL.
+    assert ">Apply Filters</button>" in default
+    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in default
+
+    # 5. Presets render incl. 90d; the active preset carries a non-color
+    #    indicator: aria-current=page plus a check-mark glyph.
+    for d in ("7", "14", "30", "60", "90"):
+        assert f"days={d}&review_view=active" in dflt, f"preset {d}d missing"
+    active_preset = re.search(r'<a class=preset[^>]*days=60[^>]*>.*?</a>', dflt)
+    assert active_preset and "aria-current=page" in active_preset.group(0)
+    assert "preset-mark" in default
+
+    # 6. Active-filter summary renders and matches URL-derived state.
+    assert "Showing: Overdue + Missing Tags \u00b7 Last 60 days \u00b7 Active" in default
+    combo = client.get(
+        "/queue?overdue=0&responded=1&waiting=0&missing_tags=0&days=30&review_view=all"
+    ).get_data(as_text=True)
+    assert "Showing: Customer Responded \u00b7 Last 30 days \u00b7 All" in combo
+    all_off = client.get(
+        "/queue?overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    ).get_data(as_text=True)
+    assert "Showing: No ticket category selected" in all_off
+
+    # 7. Filter semantics unchanged (spot-check counts on real fixtures).
+    fx = json.load(open("fixtures/fixtures.json"))
+    pool = [t for page in fx["pages"] for t in page]
+    assert len(app.apply_queue_filters(pool, app.DEFAULT_FILTERS)) == 10  # overdue-only default
+    cfg = dict(app.DEFAULT_FILTERS); cfg.update({"responded": True})
+    assert len(app.apply_queue_filters(pool, cfg)) == 7  # Overdue + Responded intersection
+
+    # 8. Responsive CSS exists (mobile media query).
+    assert "@media (max-width:720px)" in default
+
+    print("filter panel: structure, regions, legends, pills (7-90d + active mark), summary, semantics, responsive CSS")
+PY
+ok "filter panel polish renders correctly (Prompt07)"
+
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"
 if [ -f "$KEY" ]; then

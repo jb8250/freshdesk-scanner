@@ -419,8 +419,10 @@ def test_mixed_ui_groups_and_helper_text(client):
     html = client.get("/queue").get_data(as_text=True)
     for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
         assert f"<legend class=group-lbl>{legend}</legend>" in html, legend
-    assert "Overdue is combined with the selected status." in html
-    assert "Selecting both statuses shows either status." in html
+    # Prompt 07 helper copy: describes how Overdue combines with status and
+    # that one or both statuses may be selected (replaces the Prompt 06 text).
+    assert "Works together with the selected status." in html
+    assert "Select one or both statuses." in html
 
 
 # ---------------------------------------------------------------------------
@@ -1181,7 +1183,7 @@ def test_all_categories_off_message(client):
 def test_days_presets_links(client):
     html = client.get("/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active").get_data(as_text=True)
     html = html.replace("&amp;", "&")  # Jinja autoescapes & in href attributes
-    for d in ("7", "14", "30", "60"):
+    for d in ("7", "14", "30", "60", "90"):
         assert f'class=preset href="/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days={d}&review_view=active"' in html
 
 
@@ -2631,3 +2633,226 @@ def test_filter_changes_do_not_alter_review_state(client):
     client.get("/queue?overdue=0&responded=1&waiting=0&missing_tags=0&days=7&review_view=completed")
     after = app.load_review_rows() if hasattr(app, "load_review_rows") else None
     assert before == after
+
+
+# =============================================================================
+# Prompt07 - Filter panel polish
+# =============================================================================
+
+
+def _queue_html(client, params=""):
+    return client.get("/queue" + (("?" + params) if params else "")).get_data(as_text=True)
+
+
+# --- Panel structure ---------------------------------------------------------
+
+
+def test_panel_single_controls_form_with_three_regions(client):
+    """The redesigned panel is a single filter form holding three labelled
+    regions (time range, filter groups, view + actions). No extra controls form."""
+    html = _queue_html(client)
+    form, forms = _controls_form(html)
+    assert form["attrs"].get("method", "").lower() == "get"
+    assert form["attrs"].get("action") == "/queue"
+    for region in ("region-time", "region-groups", "region-actions"):
+        assert f'class="panel-region {region}"' in html, region
+
+
+def test_panel_three_filter_groups_with_legends(client):
+    html = _queue_html(client)
+    for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
+        assert f"<legend class=group-lbl>{legend}</legend>" in html, legend
+
+
+def test_panel_time_review_and_action_regions_hold_correct_controls(client):
+    html = _queue_html(client)
+    assert 'name=days' in html
+    assert 'id=review_view name=review_view' in html
+    assert 'Apply Filters' in html and 'Reset to Defaults' in html
+
+
+def test_panel_apply_is_primary_and_reset_is_secondary(client):
+    html = _queue_html(client)
+    assert re.search(r'<button[^>]*type=?submit?[^>]*class=apply[^>]*>Apply Filters</button>', html)
+    assert re.search(r'<a[^>]*class=reset[^>]*role=button[^>]*>Reset to Defaults</a>', html)
+    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in html
+
+
+def test_panel_no_nested_forms(client):
+    html = _queue_html(client)
+    _, forms = _controls_form(html)
+    assert all(not f["nested"] for f in forms), "a <form> is nested inside another"
+
+
+# --- Presets -----------------------------------------------------------------
+
+
+def test_panel_presets_render_7_14_30_60_90(client):
+    html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active")
+    html = html.replace("&amp;", "&")
+    for d in ("7", "14", "30", "60", "90"):
+        assert f'class=preset href="/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days={d}&review_view=active"' in html, d
+
+
+def test_panel_active_preset_has_non_color_indicator(client):
+    """The active time preset is identified by more than background colour:
+    aria-current=page plus a check-mark glyph inside the preset pill."""
+    html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active")
+    m = re.search(r'<a class=preset[^>]*days=60[^>]*>.*?</a>', html)
+    assert m, "active 60d preset not found"
+    seg = m.group(0)
+    assert 'aria-current=page' in seg
+    assert 'preset-mark' in seg  # non-color indicator element
+
+
+def test_panel_custom_days_keeps_no_active_preset(client):
+    """A non-preset days value (e.g. 45) stays supported in the days input and
+    marks no preset as active (aria-current appears on none)."""
+    html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=1&days=45&review_view=active")
+    assert 'name=days min=1 max=365 value=45' in html
+    # No preset pill is marked active (aria-current=page only ever appears on
+    # preset links; the CSS rule `.preset[aria-current=page]` also contains the
+    # literal text, so scope the check to anchor tags only).
+    assert not re.search(r'<a class=preset[^>]*aria-current=page', html)
+
+
+def test_panel_presets_preserve_other_filter_values(client):
+    # With non-default primary/missing-tags state, each preset keeps those
+    # values and only changes the day. Canonical URL per preset.
+    html = _queue_html(client, "overdue=0&responded=1&waiting=1&missing_tags=0&days=7&review_view=all")
+    html = html.replace("&amp;", "&")
+    for d in ("7", "14", "30", "60", "90"):
+        assert f'class=preset href="/queue?overdue=0&responded=1&waiting=1&missing_tags=0&days={d}&review_view=all"' in html, d
+
+
+# --- Active-filter summary ---------------------------------------------------
+
+
+def test_summary_default(client):
+    html = _queue_html(client)
+    assert "Showing: Overdue + Missing Tags \u00b7 Last 60 days \u00b7 Active" in html
+
+
+def test_summary_overdue_only(client):
+    html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=0&days=60&review_view=active")
+    assert "Showing: Overdue \u00b7 Last 60 days \u00b7 Active" in html
+
+
+def test_summary_responded_only(client):
+    html = _queue_html(client, "overdue=0&responded=1&waiting=0&missing_tags=0&days=30&review_view=active")
+    assert "Showing: Customer Responded \u00b7 Last 30 days \u00b7 Active" in html
+
+
+def test_summary_waiting_only(client):
+    html = _queue_html(client, "overdue=0&responded=0&waiting=1&missing_tags=0&days=14&review_view=completed")
+    assert "Showing: Waiting on Customer \u00b7 Last 14 days \u00b7 Completed" in html
+
+
+def test_summary_combined_and_missing_tags_and_view(client):
+    html = _queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=7&review_view=all")
+    assert "Showing: Overdue + Customer Responded + Missing Tags \u00b7 Last 7 days \u00b7 All" in html
+
+
+def test_summary_both_statuses_union(client):
+    html = _queue_html(client, "overdue=0&responded=1&waiting=1&missing_tags=0&days=90&review_view=active")
+    assert "Showing: Customer Responded + Waiting on Customer \u00b7 Last 90 days \u00b7 Active" in html
+
+
+def test_summary_no_primary_filter(client):
+    html = _queue_html(client, "overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active")
+    assert "Showing: No ticket category selected" in html
+
+
+def test_summary_matches_url_derived_state(client):
+    cfg = filters_from_args(MultiDict([("overdue", "1"), ("responded", "1"),
+                                       ("waiting", "0"), ("missing_tags", "1"),
+                                       ("days", "14"), ("review_view", "completed")]))
+    want = app.filter_summary_text(cfg)
+    assert want == "Showing: Overdue + Customer Responded + Missing Tags \u00b7 Last 14 days \u00b7 Completed"
+    html = _queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=14&review_view=completed")
+    assert want in html
+
+
+# --- Accessibility -----------------------------------------------------------
+
+
+def test_panel_accessible_group_names(client):
+    html = _queue_html(client)
+    for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
+        assert f"<legend class=group-lbl>{legend}</legend>" in html
+    assert 'role=group aria-label="Quick time presets"' in html
+
+
+def test_panel_focus_visible_styles_present(client):
+    html = _queue_html(client)
+    for sel in (".preset:focus-visible", ".controls button[type=submit]:focus-visible",
+                ".controls a.reset:focus-visible", "input[type=checkbox]:focus-visible"):
+        assert sel in html, sel
+
+
+def test_panel_days_input_accessible_label(client):
+    html = _queue_html(client)
+    assert 'aria-label="Days back"' in html
+    assert 'name=days' in html
+
+
+def test_panel_review_view_accessible_label(client):
+    html = _queue_html(client)
+    assert re.search(r'<label[^>]*for=review_view>', html)
+
+
+def test_panel_checkbox_ids_unique_and_associated(client):
+    html = _queue_html(client)
+    form, _ = _controls_form(html)
+    boxes = [i for i in form["inputs"] if i.get("type") == "checkbox"]
+    names = [i.get("name") for i in boxes]
+    assert names == ["overdue", "responded", "waiting", "missing_tags"]
+    ids = [i.get("id") for i in boxes]
+    assert ids == ["filter-overdue", "filter-responded", "filter-waiting", "filter-missing"]
+    assert len(set(_all_ids(html))) == len(_all_ids(html)), "duplicate element IDs in page"
+
+
+# --- Responsive layout -------------------------------------------------------
+
+
+def test_panel_responsive_css_has_mobile_breakpoint(client):
+    html = _queue_html(client)
+    assert "@media (max-width:720px)" in html
+
+
+def test_panel_responsive_css_stacks_groups_and_wraps_controls(client):
+    html = _queue_html(client)
+    media = html.split("@media (max-width:720px)")[1]
+    # Mobile: groups stack vertically, actions stack, buttons wrap and share width.
+    assert ".region-groups{flex-direction:column}" in media
+    assert ".region-actions{flex-direction:column" in media
+    assert "flex-wrap:wrap" in media or "width:100%" in media
+
+
+def test_panel_group_uses_flex_not_fixed_width(client):
+    # Filter groups flex rather than carrying a rigid width that would overflow
+    # narrow screens. (The data <table> has its own overflow-x:auto wrapper.)
+    html = _queue_html(client)
+    assert "min-width:150px" in html and "flex:1 1" in html
+
+
+def test_panel_buttons_and_summary_can_wrap(client):
+    css = _queue_html(client)
+    assert ".action-buttons{display:inline-flex;gap:10px;flex-wrap:wrap" in css
+    assert ".filter-summary{" in css
+
+
+# --- Regression (semantics unchanged) ----------------------------------------
+
+
+def test_panel_semantics_unchanged_counts(client):
+    # Default overdue-only = 10 rows; overdue+responded intersection = 7 rows.
+    assert len(_ids(_queue_html(client))) == 10
+    combo = _ids(_queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=active"))
+    assert len(combo) == 7
+
+
+def test_panel_canonical_url_unchanged(client):
+    qs = filter_query_string(filters_from_args(MultiDict([])))
+    assert qs == "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+
