@@ -1,62 +1,109 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Freshdesk Scanner Validation ==="
-echo ""
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+PYTHON=".venv/bin/python"
+KEY="$HOME/.config/furtouch/freshdesk_api_key"
 
-# Python
-if ! command -v python3.11 &>/dev/null; then
-  echo "FAIL: python3.11 not found. Install via brew install python@3.11"
-  exit 1
-fi
-echo "OK: python3.11 $(python3.11 --version)"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { echo "OK: $*"; }
 
-# venv
-if [ ! -d .venv ]; then
-  echo "FAIL: .venv not found. Run: python3.11 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
-  exit 1
-fi
-echo "OK: .venv exists"
+echo "=== Freshdesk Scanner Offline Validation ==="
+command -v python3.11 >/dev/null || fail "python3.11 not found"
+PY311_VERSION="$(python3.11 -c 'import sys; print(sys.version_info[:2])')"
+[ "$PY311_VERSION" = "(3, 11)" ] || fail "python3.11 is not Python 3.11: $PY311_VERSION"
+ok "python3.11 available"
 
-# Flask installed
-if ! .venv/bin/python -c "import flask" 2>/dev/null; then
-  echo "FAIL: Flask not installed in venv. Run: pip install -r requirements.txt"
-  exit 1
-fi
-echo "OK: Flask installed"
+[ -x "$PYTHON" ] || fail ".venv/bin/python not found"
+ok "virtual environment exists"
 
-# Presidio + spacy
-if ! .venv/bin/python -c "from presidio_analyzer import AnalyzerEngine" 2>/dev/null; then
-  echo "FAIL: presidio-analyzer not installed. Run: pip install -r requirements.txt"
-  exit 1
-fi
-echo "OK: presidio-analyzer installed"
+"$PYTHON" - <<'PY'
+import flask, requests, pytest
+print("required imports: Flask, requests, pytest")
+PY
+ok "required scanner dependencies import"
 
-if ! .venv/bin/python -m spacy validate 2>/dev/null | grep -q "en_core_web_lg"; then
-  echo "FAIL: en_core_web_lg not found. Run: python -m spacy download en_core_web_lg"
-  exit 1
-fi
-echo "OK: en_core_web_lg downloaded"
+"$PYTHON" - <<'PY'
+import app
+assert "/queue" in {rule.rule for rule in app.app.url_map.iter_rules()}
+print("app.py import and /queue registration succeeded")
+PY
+ok "app.py imports and /queue is registered"
 
-# API key
-if [ ! -f ~/.config/furtouch/freshdesk_api_key ]; then
-  echo "FAIL: Freshdesk API key not found at ~/.config/furtouch/freshdesk_api_key"
-  echo "     Create it with: mkdir -p ~/.config/furtouch && nano ~/.config/furtouch/freshdesk_api_key && chmod 600 ~/.config/furtouch/freshdesk_api_key"
-  exit 1
-fi
-echo "OK: API key file exists at ~/.config/furtouch/freshdesk_api_key"
-
-# Permissions
-perms=$(stat -f "%Lp" ~/.config/furtouch/freshdesk_api_key 2>/dev/null || stat -c "%a" ~/.config/furtouch/freshdesk_api_key 2>/dev/null || echo "unknown")
-if [ "$perms" != "600" ]; then
-  echo "WARN: API key permissions are $perms, expected 600. Fix with: chmod 600 ~/.config/furtouch/freshdesk_api_key"
+if [ -f "$KEY" ]; then
+  perms="$(stat -f "%Lp" "$KEY" 2>/dev/null || stat -c "%a" "$KEY")"
+  [ "$perms" = "600" ] || fail "API-key file exists but permissions are $perms, expected 600"
+  ok "API-key file exists and permissions are 600 (contents not read)"
 else
-  echo "OK: API key permissions are 600"
+  echo "INFO: API-key file missing (contents not read; offline mode does not require it)"
 fi
 
-echo ""
-echo "=== All checks passed. To run the scanner: ==="
-echo "  source .venv/bin/activate"
-echo "  flask run --host 127.0.0.1 --port 5050"
-echo ""
-echo "Then open: http://127.0.0.1:5050/queue"
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import app
+assert app.is_offline()
+assert {rule.rule for rule in app.app.url_map.iter_rules()} == {"/queue"}
+response = app.app.test_client().get("/queue")
+assert response.status_code == 200
+text = response.get_data(as_text=True)
+assert "OFFLINE MODE" in text
+assert "mock/offline fixture data" in text
+print("offline mode renders /queue")
+PY
+ok "offline mode is available and /queue renders"
+
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import requests
+import app
+
+def blocked(*args, **kwargs):
+    raise AssertionError("unexpected network request")
+requests.get = blocked
+requests.post = blocked
+requests.put = blocked
+requests.patch = blocked
+requests.delete = blocked
+response = app.app.test_client().get("/queue")
+assert response.status_code == 200
+assert "OFFLINE MODE" in response.get_data(as_text=True)
+print("offline /queue made no HTTP requests")
+PY
+ok "offline mode does not make network requests"
+
+"$PYTHON" - <<'PY'
+import app
+try:
+    app.resolve_bind_host("0.0.0.0")
+except SystemExit:
+    print("unsafe external bind refused")
+else:
+    raise SystemExit("external bind was not refused")
+PY
+ok "unsafe external bind is refused"
+
+"$PYTHON" -m pytest
+ok "automated tests passed"
+
+if git ls-files | grep -E '(^|/)(\.env|freshdesk_api_key|.*\.key)$' >/dev/null; then
+  fail "secret-like file is tracked"
+fi
+if git ls-files | grep -E '(^|/)cache/|(^|/).*cache.*\.json$' >/dev/null; then
+  fail "cache file is tracked"
+fi
+if git ls-files | grep -E '(^|/).*\.env($|\.)' >/dev/null; then
+  fail ".env file is tracked"
+fi
+ok "no API key, cache, or .env file is tracked"
+
+if git status --short | grep -E '(^| )\.env|freshdesk_api_key|cache/' >/dev/null; then
+  fail "secret/cache artifact appears in working tree"
+fi
+ok "no secret or cache artifact appears in git status"
+
+echo "=== VALIDATION PASSED ==="
+echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"
+if [ -f "$KEY" ]; then
+  echo "API-key file: exists; permissions checked without reading contents"
+else
+  echo "API-key file: missing"
+fi

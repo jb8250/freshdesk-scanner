@@ -32,3 +32,8 @@ Thumbs.db
 cache/
 *.csv
 *.html
+
+# Test artifacts
+.pytest_cache/
+__pycache__/
+tests/__pycache__/

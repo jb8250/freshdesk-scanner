@@ -1,0 +1,128 @@
+{
+  "description": "Synthetic Freshdesk ticket fixtures for offline development and tests. All ids, subjects, dates, and values are fictional. No real customer data, names, emails, addresses, or ticket content.",
+  "pages": [
+    [
+      {
+        "id": 500001,
+        "subject": "Customer sent photo of damaged dresser drawer",
+        "status": 2,
+        "priority": 3,
+        "due_by": "2020-06-15T17:00:00Z",
+        "created_at": "2026-07-01T10:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500002,
+        "subject": "Re: video of wobbling table leg",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2035-01-01T12:00:00Z",
+        "created_at": "2026-07-02T11:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500003,
+        "subject": "Waiting on customer for photos of shelf damage",
+        "status": 6,
+        "priority": 2,
+        "due_by": "2026-07-10T17:00:00Z",
+        "created_at": "2026-07-03T09:30:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500004,
+        "subject": "Customer photo attached - replacement needed",
+        "status": 2,
+        "priority": 3,
+        "due_by": "2020-06-20T17:00:00Z",
+        "created_at": "2026-07-04T14:00:00Z",
+        "tags": ["warranty"],
+        "type": "Complaint"
+      },
+      {
+        "id": 500005,
+        "subject": "Closed: customer sent pictures of cabinet",
+        "status": 5,
+        "priority": 1,
+        "due_by": "2020-06-25T17:00:00Z",
+        "created_at": "2026-07-05T08:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500006,
+        "subject": "Vendor painted the topic area before delivery",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-06-30T17:00:00Z",
+        "created_at": "2026-07-06T16:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500007,
+        "subject": "Please see attached pic of the broken hinge",
+        "status": 2,
+        "priority": 3,
+        "due_by": "2020-07-01T17:00:00Z",
+        "created_at": "2026-07-07T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500008,
+        "subject": "Update on table delivery",
+        "status": 2,
+        "priority": 1,
+        "due_by": "2020-07-02T17:00:00Z",
+        "created_at": "2026-07-08T10:00:00Z",
+        "tags": [],
+        "type": "Question"
+      }
+    ],
+    [
+      {
+        "id": 500009,
+        "subject": "Customer provided video of the sagging shelf",
+        "status": 2,
+        "priority": 2,
+        "created_at": "2026-07-09T09:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500010,
+        "subject": "Photo of stain on mattress",
+        "status": 2,
+        "priority": 2,
+        "due_by": "not-a-date",
+        "created_at": "2026-07-10T15:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500011,
+        "subject": "Awaiting pictures of the damaged nightstand",
+        "status": 6,
+        "priority": 2,
+        "due_by": "2026-07-15T17:00:00Z",
+        "created_at": "2026-07-11T13:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500012,
+        "subject": "Invoice for pending order",
+        "status": 2,
+        "priority": 1,
+        "due_by": "2020-07-05T17:00:00Z",
+        "created_at": "2026-07-12T10:30:00Z",
+        "tags": [],
+        "type": "Question"
+      }
+    ]
+  ]
+}
