@@ -26,10 +26,12 @@ ok "required scanner dependencies import"
 
 "$PYTHON" - <<'PY'
 import app
-assert "/queue" in {rule.rule for rule in app.app.url_map.iter_rules()}
-print("app.py import and /queue registration succeeded")
+expected = {"/queue", "/queue/api/review", "/queue/api/opened"}
+rules = {rule.rule for rule in app.app.url_map.iter_rules()}
+assert expected <= rules, f"missing routes: {expected - rules}"
+print("app.py import and route registration succeeded")
 PY
-ok "app.py imports and /queue is registered"
+ok "app.py imports; /queue and local review endpoints are registered"
 
 if [ -f "$KEY" ]; then
   perms="$(stat -f "%Lp" "$KEY" 2>/dev/null || stat -c "%a" "$KEY")"
@@ -42,12 +44,12 @@ fi
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
 import app
 assert app.is_offline()
-assert {rule.rule for rule in app.app.url_map.iter_rules()} == {"/queue"}
 response = app.app.test_client().get("/queue")
 assert response.status_code == 200
 text = response.get_data(as_text=True)
 assert "OFFLINE MODE" in text
 assert "mock/offline fixture data" in text
+assert "matching your filters" in text
 print("offline mode renders /queue")
 PY
 ok "offline mode is available and /queue renders"
@@ -69,6 +71,25 @@ assert "OFFLINE MODE" in response.get_data(as_text=True)
 print("offline /queue made no HTTP requests")
 PY
 ok "offline mode does not make network requests"
+
+"$PYTHON" - <<'PY'
+import tempfile, os
+import app
+with tempfile.TemporaryDirectory() as tmp:
+    db_path = os.path.join(tmp, "sub", "review.sqlite3")
+    app.init_db(db_path)
+    assert os.path.exists(db_path), "database file was not created"
+    # Save and read a review result in the temporary database.
+    os.environ["REVIEW_DB_PATH"] = db_path
+    app.set_review_result(500001, "Resolved", reviewed_updated_at="2026-07-01T00:00:00Z")
+    app.mark_opened(500002)
+    rows = app.load_review_rows()
+    assert rows[500001]["review_result"] == "Resolved"
+    assert rows[500002]["review_result"] == "Opened / In Review"
+    assert rows[500001]["reviewed_updated_at"] == "2026-07-01T00:00:00Z"
+    print("SQLite review state saved and read in a temporary database")
+PY
+ok "SQLite database initializes and review state round-trips in a temp location"
 
 "$PYTHON" - <<'PY'
 import app
@@ -93,17 +114,20 @@ fi
 if git ls-files | grep -E '(^|/).*\.env($|\.)' >/dev/null; then
   fail ".env file is tracked"
 fi
-ok "no API key, cache, or .env file is tracked"
-
-if git status --short | grep -E '(^| )\.env|freshdesk_api_key|cache/' >/dev/null; then
-  fail "secret/cache artifact appears in working tree"
+if git ls-files | grep -E '(^|/)(data/|.*\.sqlite3?$)' >/dev/null; then
+  fail "SQLite database file is tracked"
 fi
-ok "no secret or cache artifact appears in git status"
+ok "no API key, cache, .env, or SQLite database is tracked"
+
+if git status --short | grep -E '(^| )\.env|freshdesk_api_key|cache/|(^| )data/' >/dev/null; then
+  fail "secret/cache/database artifact appears in working tree"
+fi
+ok "no secret, cache, or database artifact appears in git status"
 
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"
 if [ -f "$KEY" ]; then
   echo "API-key file: exists; permissions checked without reading contents"
 else
-  echo "API-key file: missing"
+  echo "API-key file: missing; offline mode does not require it"
 fi
