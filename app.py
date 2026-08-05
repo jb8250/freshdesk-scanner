@@ -277,10 +277,36 @@ def category_matches(t, category):
     return False
 
 
-def matches_any_category(t, config):
-    """OR across enabled category selectors. All three OFF -> no ticket can
-    match (the page shows the 'select at least one category' message)."""
-    return any(config[c] and category_matches(t, c) for c in ("overdue", "responded", "waiting"))
+def has_primary_filter(config):
+    """At least one of Overdue / Customer Responded / Waiting on Customer must
+    be selected. When all three are OFF no category restriction is in effect,
+    so no tickets are shown and the 'select a filter' message is displayed."""
+    return config["overdue"] or config["responded"] or config["waiting"]
+
+
+def matches_status_group(t, config):
+    """OR within the status group (Customer Responded / Waiting on Customer).
+    The two are mutually exclusive Freshdesk statuses: selecting exactly one
+    shows only that status, selecting both shows either. When neither is
+    selected the status group imposes no restriction (this is what allows
+    Overdue-only filtering)."""
+    responded_on = config.get("responded") and is_customer_responded(t)
+    waiting_on = config.get("waiting") and is_waiting_on_customer(t)
+    if not (config.get("responded") or config.get("waiting")):
+        return True  # no status restriction
+    return responded_on or waiting_on
+
+
+def matches_overdue(t, config):
+    """Overdue is a separate AND condition combined with the selected status
+    group. When Overdue is OFF it imposes no restriction."""
+    return (not config.get("overdue")) or is_overdue(t)
+
+
+def matches_missing_tags(t, config):
+    """Missing Tags is a separate AND condition. When OFF it imposes no
+    restriction."""
+    return (not config.get("missing_tags")) or has_missing_tags(t)
 
 
 def matches_days_window(t, config):
@@ -299,9 +325,11 @@ def matches_days_window(t, config):
 def passes_filters(t, config=None):
     """Business-rule filter used by the dashboard: status gate (the review
     queue only contains Customer Responded / Waiting on Customer tickets),
-    keyword gate, category OR, Missing Tags AND gate. Days-back window is
-    intentionally NOT part of this predicate (it is applied separately as an
-    AND gate at render time).
+    keyword gate, then the mixed filter model — at least one primary filter
+    selected (Overdue / Customer Responded / Waiting on Customer), the status
+    group ORs the two statuses, and Overdue and Missing Tags each AND in as
+    separate dimensions. Days-back window is intentionally NOT part of this
+    predicate (it is applied separately as an AND gate at render time).
 
     `config` is a filter dict from filters_from_args(); when omitted the
     documented defaults apply (Overdue ON, Customer Responded OFF, Waiting
@@ -312,9 +340,13 @@ def passes_filters(t, config=None):
     if not keyword_filter_hits(t.get("subject")):
         return False
     cfg = config or dict(DEFAULT_FILTERS)
-    if not matches_any_category(t, cfg):
+    if not has_primary_filter(cfg):
         return False
-    if cfg["missing_tags"] and not has_missing_tags(t):
+    if not matches_status_group(t, cfg):
+        return False
+    if not matches_overdue(t, cfg):
+        return False
+    if not matches_missing_tags(t, cfg):
         return False
     return True
 
@@ -968,6 +1000,9 @@ QUEUE_HTML = """\
  .controls a.preset{font-size:12px;color:#1565c0;margin-left:8px}
  .field{display:flex;align-items:center;gap:6px}
  .field .lbl{font-size:13px;color:#444;white-space:nowrap}
+ .filter-group{border:1px solid #e0e0e0;border-radius:6px;padding:7px 12px 9px;display:inline-flex;flex-direction:column;gap:6px;align-items:flex-start;margin:0}
+ .filter-group .group-lbl{font-size:11px;font-weight:600;color:#616161;text-transform:uppercase;letter-spacing:.4px;padding:0 3px}
+ .filter-group .field-hint{font-size:11px;color:#888;line-height:1.35}
  .count{font-size:13px;color:#555;margin-bottom:8px}
  .tablewrap{overflow-x:auto;background:#fff;border:1px solid #ddd;border-radius:8px}
  table{border-collapse:collapse;width:100%;font-size:13px;min-width:960px}
@@ -1023,10 +1058,23 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
       <span class=lbl>days</span>
       {% for d in [7, 14, 30, 60] %}<a class=preset href="/queue?{{ preset_urls[d] }}">{{ d }}d</a>{% endfor %}
     </span>
-    <span class=field><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></span>
-    <span class=field><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></span>
-    <span class=field><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></span>
-    <span class=field><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></span>
+  </div>
+  <div class=row>
+    <fieldset class=filter-group>
+      <legend class=group-lbl>Ticket conditions</legend>
+      <span class=field><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></span>
+      <span class=field-hint>Overdue is combined with the selected status.</span>
+    </fieldset>
+    <fieldset class=filter-group>
+      <legend class=group-lbl>Freshdesk status</legend>
+      <span class=field><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></span>
+      <span class=field><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></span>
+      <span class=field-hint>Selecting both statuses shows either status.</span>
+    </fieldset>
+    <fieldset class=filter-group>
+      <legend class=group-lbl>Additional filters</legend>
+      <span class=field><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></span>
+    </fieldset>
   </div>
   <div class=row>
     <span class=field><label for=review_view>Review view</label>
@@ -1047,7 +1095,7 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
   {% endif %}
 {% endif %}
 {% if all_categories_off %}
-<div class=empty>Select at least one ticket category to display results.</div>
+<div class=empty>Select Overdue or at least one status to display results.</div>
 {% elif tickets %}
 <div class=tablewrap>
 <table id=queue-table>

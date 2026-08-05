@@ -39,6 +39,7 @@ from app import (
     fmt_due,
     get_csrf_token,
     has_missing_tags,
+    has_primary_filter,
     init_db,
     is_customer_responded,
     is_offline,
@@ -48,8 +49,10 @@ from app import (
     last_opened_ticket_id,
     load_review_rows,
     mark_opened,
-    matches_any_category,
     matches_days_window,
+    matches_missing_tags,
+    matches_overdue,
+    matches_status_group,
     offline_paginate_tickets,
     paginate_tickets,
     parse_bool,
@@ -209,19 +212,28 @@ def test_filter_malformed_due_by_shown_only_under_customer_responded():
     assert passes_filters(t, cfg) is True
 
 
-# MODIFIED (behavior changed by the dashboard spec): Waiting on Customer is now
-# an explicit OR-category. Under the default config (waiting OFF) a waiting
-# ticket that is NOT overdue is hidden; with waiting ON it is shown.
+# Waiting on Customer is one member of the status group (OR with Customer
+# Responded), which ANDs with the Overdue condition. Under the default config
+# (Overdue ON, Waiting OFF) a waiting ticket that is NOT overdue is hidden;
+# with Waiting selected and Overdue OFF it is shown.
 def test_filter_waiting_on_customer_requires_waiting_category():
+    # MODIFIED (Prompt 06): Overdue (ON by default) now ANDs with the status
+    # group, so a Waiting ticket must ALSO be overdue when Overdue is ON.
+    # Previously Waiting and Overdue ORed, leaking non-overdue waiting tickets.
     t = _ticket(status=6, due_by="2035-01-01T12:00:00Z", subject="Waiting on customer for photos of shelf damage")
     assert passes_filters(t) is False  # waiting OFF and not overdue
-    cfg = dict(DEFAULT_FILTERS, waiting=True)
+    # Selecting only Waiting (Overdue OFF) shows this waiting ticket regardless of due date.
+    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=True)
     assert passes_filters(t, cfg) is True
+    # Default Overdue ON + Waiting ON is an intersection: waiting AND overdue.
+    cfg_overdue = dict(DEFAULT_FILTERS, waiting=True)
+    assert passes_filters(t, cfg_overdue) is False  # waiting but not overdue
+    assert passes_filters(_ticket(status=6, subject="Waiting on customer for photos of shelf damage"), cfg_overdue) is True  # waiting AND overdue
 
 
 def test_filter_overdue_waiting_ticket_matches_via_overdue():
-    # A waiting ticket with a past due_by matches the Overdue category even
-    # when the Waiting category is off (OR semantics).
+    # An overdue Waiting ticket still matches when only Overdue is on: the
+    # status group imposes no restriction when neither status is selected.
     t = _ticket(status=6, due_by="2020-06-15T17:00:00Z", subject="Waiting on customer for photos of shelf damage")
     assert passes_filters(t) is True
 
@@ -255,6 +267,160 @@ def test_filter_excludes_no_keyword_subject():
 def test_filter_excludes_vendor_and_topic_subjects():
     t = _ticket(subject="Vendor painted the topic area")
     assert passes_filters(t) is False
+
+
+# ---------------------------------------------------------------------------
+# Mixed filter model (Prompt 06): Overdue ANDs with the status group, the two
+# statuses OR within their group, Missing Tags ANDs, and no primary filter
+# selected shows no results. Previously all three controls ORed together,
+# which made Overdue + Customer Responded a union instead of an intersection.
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_overdue_only_shows_all_overdue():
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=False, waiting=False)
+    assert passes_filters(_ticket(), cfg) is True                       # overdue responded
+    assert passes_filters(_ticket(status=6), cfg) is True               # overdue waiting
+    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False  # not overdue
+
+
+def test_mixed_customer_responded_only_shows_all_responded():
+    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True, waiting=False)
+    assert passes_filters(_ticket(), cfg) is True                       # responded, overdue
+    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is True  # responded, not overdue
+    assert passes_filters(_ticket(status=6), cfg) is False              # waiting excluded
+
+
+def test_mixed_waiting_only_shows_all_waiting():
+    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=True)
+    assert passes_filters(_ticket(status=6), cfg) is True               # waiting, overdue
+    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is True
+    assert passes_filters(_ticket(status=2), cfg) is False              # responded excluded
+
+
+def test_mixed_overdue_plus_responded_is_intersection():
+    # Regression for Prompt 06: this combination previously ORed (union) and
+    # leaked Customer-Responded-only AND Overdue-only tickets into the list.
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False)
+    assert passes_filters(_ticket(), cfg) is True                       # overdue AND responded
+    assert passes_filters(_ticket(status=6), cfg) is False              # overdue waiting: not responded
+    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False  # responded, not overdue
+
+
+def test_mixed_overdue_plus_waiting_is_intersection():
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=False, waiting=True)
+    assert passes_filters(_ticket(status=6), cfg) is True               # overdue AND waiting
+    assert passes_filters(_ticket(), cfg) is False                      # responded: not waiting
+    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is False  # waiting, not overdue
+
+
+def test_mixed_responded_plus_waiting_is_status_union():
+    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True, waiting=True)
+    assert passes_filters(_ticket(status=2), cfg) is True               # responded
+    assert passes_filters(_ticket(status=6), cfg) is True               # waiting
+
+
+def test_mixed_overdue_plus_both_statuses_overdue_either_status():
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=True)
+    assert passes_filters(_ticket(), cfg) is True                       # overdue responded
+    assert passes_filters(_ticket(status=6), cfg) is True               # overdue waiting
+    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False  # not overdue
+    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is False
+
+
+def test_mixed_all_three_off_shows_no_tickets():
+    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
+    assert passes_filters(_ticket(), cfg) is False
+    assert passes_filters(_ticket(status=6), cfg) is False
+    assert has_primary_filter(cfg) is False
+
+
+def test_mixed_missing_tags_applies_with_and():
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False)
+    tagged = _ticket(tags=["warranty"])
+    assert passes_filters(_ticket(), cfg) is True        # missing tags: in
+    assert passes_filters(tagged, cfg) is False          # tagged: out, even though overdue+responded
+    cfg_off = dict(cfg, missing_tags=False)
+    assert passes_filters(tagged, cfg_off) is True       # Missing Tags OFF: no restriction
+
+
+def test_mixed_days_window_still_applies_with_and(monkeypatch):
+    monkeypatch.setattr(app, "now_utc", lambda: T_REF)
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False, days=60)
+    pool = [
+        _ticket(id=1, updated_at=_updated(5)),    # in window
+        _ticket(id=2, updated_at=_updated(90)),   # outside window: excluded
+    ]
+    out = apply_queue_filters(pool, cfg)
+    assert [t["id"] for t in out] == [1]
+
+
+def test_mixed_no_duplicate_rows_when_ticket_matches_both():
+    # A ticket matching overdue AND responded must appear exactly once even if
+    # the raw pool contains it twice (dedupe happens before filtering).
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False)
+    pool = [_ticket(id=1), _ticket(id=1)]
+    out = apply_queue_filters(pool, cfg)
+    assert [t["id"] for t in out] == [1]
+
+
+def test_mixed_unknown_url_values_fail_safely():
+    # Garbage values fall back to documented defaults (Overdue ON), so the
+    # dashboard never crashes and never silently widens to "show everything".
+    cfg = filters_from_args(MultiDict([("overdue", "x"), ("responded", "y"), ("waiting", "z")]))
+    assert cfg["overdue"] is True and cfg["responded"] is False and cfg["waiting"] is False
+    assert passes_filters(_ticket(), cfg) is True
+
+
+def test_mixed_filter_query_string_canonical():
+    # One value per parameter, canonical order, no duplicates — bookmarkable.
+    qs = filter_query_string(dict(
+        overdue=True, responded=True, waiting=True,
+        missing_tags=True, days=60, review_view="active",
+    ))
+    assert qs == "overdue=1&responded=1&waiting=1&missing_tags=1&days=60&review_view=active"
+
+
+def test_mixed_review_view_is_independent_and_gate(client, monkeypatch):
+    monkeypatch.setattr(app, "now_utc", lambda: T_REF)
+    set_review_result(500001, "Resolved")
+    base = "/queue?overdue=1&responded=1&waiting=0&missing_tags=1&days=60"
+    active = client.get(base + "&review_view=active").get_data(as_text=True)
+    completed = client.get(base + "&review_view=completed").get_data(as_text=True)
+    allv = client.get(base + "&review_view=all").get_data(as_text=True)
+    assert "500001" not in _ids(active)      # resolved ticket hidden in Active
+    assert "500001" in _ids(completed)       # visible in Completed
+    assert "500001" in _ids(allv)            # visible in All
+    # Mixed logic still intersects on the other rows in every view.
+    for html in (active, completed, allv):
+        assert "500003" not in _ids(html)    # waiting ticket never in overdue+responded view
+
+
+def test_mixed_review_post_redirect_preserves_mixed_filters(client, monkeypatch):
+    monkeypatch.setattr(app, "now_utc", lambda: T_REF)
+    token = _csrf(client)
+    before = client.get("/queue?overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=active")
+    assert "500007" in _ids(before.get_data(as_text=True))
+    resp = client.post("/queue/api/review", data={
+        "csrf_token": token, "ticket_id": "500007", "review_result": "Resolved",
+        "overdue": "1", "responded": "1", "waiting": "0",
+        "missing_tags": "1", "days": "60", "review_view": "active",
+    })
+    assert resp.status_code == 303
+    loc = resp.headers["Location"]
+    assert "overdue=1" in loc and "responded=1" in loc and "waiting=0" in loc
+    assert "missing_tags=1" in loc and "days=60" in loc and "review_view=active" in loc
+    after = client.get(loc).get_data(as_text=True)
+    assert "500007" not in _ids(after)       # resolved ticket left the active view
+    assert "500003" not in _ids(after)      # waiting ticket still excluded (intersection held)
+
+
+def test_mixed_ui_groups_and_helper_text(client):
+    html = client.get("/queue").get_data(as_text=True)
+    for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
+        assert f"<legend class=group-lbl>{legend}</legend>" in html, legend
+    assert "Overdue is combined with the selected status." in html
+    assert "Selecting both statuses shows either status." in html
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +559,31 @@ def test_category_matches():
     assert category_matches(_ticket(), "bogus") is False
 
 
-def test_matches_any_category_all_off():
+def test_has_primary_filter_all_off():
+    # MODIFIED (was test_matches_any_category_all_off): the OR-over-categories
+    # predicate that made Overdue+Responded a union was replaced by the mixed
+    # model. `has_primary_filter` is the new gate that refuses to show results
+    # when Overdue / Customer Responded / Waiting on Customer are all OFF.
     cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
-    assert matches_any_category(_ticket(), cfg) is False
+    assert has_primary_filter(cfg) is False
+    assert passes_filters(_ticket(), cfg) is False  # no results without any primary filter
 
 
-def test_matches_any_category_responded_only():
+def test_has_primary_filter_requires_at_least_one():
+    for key in ("overdue", "responded", "waiting"):
+        cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
+        cfg[key] = True
+        assert has_primary_filter(cfg) is True, key
+
+
+def test_matches_status_group_responded_only():
+    # MODIFIED (was test_matches_any_category_responded_only): the status group
+    # now ORs Customer Responded and Waiting on Customer as a distinct dimension
+    # from Overdue. Selecting only responded restricts to responded tickets,
+    # independent of the overdue flag.
     cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True, waiting=False)
-    assert matches_any_category(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is True
+    assert matches_status_group(_ticket(status=2), cfg) is True
+    assert matches_status_group(_ticket(status=6), cfg) is False
 
 
 def test_sla_unavailable():
@@ -985,8 +1168,12 @@ def test_apply_filters_link_preserves_all_params(client):
 
 
 def test_all_categories_off_message(client):
+    # MODIFIED: message wording updated to match the new mixed filter model —
+    # with Overdue, Customer Responded and Waiting on Customer all OFF there is
+    # no primary restriction, so the dashboard shows no results and explains
+    # that Overdue or at least one status must be selected.
     html = client.get("/queue?overdue=0&responded=0&waiting=0").get_data(as_text=True)
-    assert "Select at least one ticket category to display results." in html
+    assert "Select Overdue or at least one status to display results." in html
     assert "matching your filters" in html
     assert "0 tickets matching your filters" in html
 
@@ -1025,10 +1212,18 @@ def test_waiting_view_rows(client):
     assert ids == ["500003", "500011", "500018", "500024", "500025"]
 
 
-def test_overdue_plus_responded_union(client):
-    # OR: overdue tickets + customer-responded tickets (missing tags gate on)
+def test_overdue_plus_responded_is_intersection(client):
+    # MODIFIED (was test_overdue_plus_responded_union, Prompt 06): this combo
+    # used to OR and return every overdue OR responded ticket. It is now an
+    # AND: only tickets that are overdue AND customer-responded (with the
+    # Missing Tags gate on).
     ids = _ids(client.get("/queue?overdue=1&responded=1&waiting=0&missing_tags=1&days=60").get_data(as_text=True))
-    assert "500001" in ids and "500002" in ids and "500009" in ids
+    expected = ["500001", "500007", "500013", "500020", "500021", "500022", "500023"]
+    assert ids == expected
+    # Union leaks that used to appear in this view are now correctly excluded:
+    assert "500002" not in ids and "500009" not in ids  # responded but NOT overdue
+    assert "500017" not in ids                          # responded but tagged + not overdue
+    assert "500003" not in ids                          # waiting (not responded)
     assert "500004" not in ids  # tagged
 
 

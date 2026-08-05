@@ -298,7 +298,7 @@ with tempfile.TemporaryDirectory() as tmp:
     all_off = client.get(
         "/queue?overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
     ).get_data(as_text=True)
-    assert "Select at least one ticket category to display results." in all_off
+    assert "Select Overdue or at least one status to display results." in all_off
 
     # 5. Canonical output never duplicates a parameter, even under repeated input.
     qs_dup = app.filter_query_string(app.filters_from_args(
@@ -334,6 +334,98 @@ with tempfile.TemporaryDirectory() as tmp:
     print("filter controls: canonical URL, explicit 0/1, all-off, Reset defaults, redirect preservation, Last Opened survival")
 PY
 ok "filter controls produce canonical URLs and preserve review state"
+
+# Prompt06 - corrected mixed filter logic: Overdue ANDs with the status group
+# (Customer Responded / Waiting on Customer OR within the group), Missing
+# Tags ANDs, all primary filters OFF shows no results, no duplicate rows, and
+# no external HTTP. Uses an isolated temp REVIEW_DB so review state is inert.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import json
+import os
+import re
+import tempfile
+import requests
+import app  # cwd is ROOT_DIR (validate.sh cd's there)
+
+# Fail the run if any network call is attempted while rendering.
+def blocked(*args, **kwargs):
+    raise AssertionError("unexpected external HTTP")
+requests.get = blocked
+requests.post = blocked
+requests.put = blocked
+requests.patch = blocked
+requests.delete = blocked
+
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    app.init_db(os.environ["REVIEW_DB_PATH"])
+    client = app.app.test_client()
+    fx = json.load(open("fixtures/fixtures.json"))
+    pool = [t for page in fx["pages"] for t in page]
+
+    def expected(config):
+        return [t["id"] for t in app.apply_queue_filters(pool, config)]
+
+    def rendered(config):
+        qs = app.filter_query_string(config)
+        html = client.get("/queue?" + qs).get_data(as_text=True)
+        # Count only <tr> rows, not every element that echoes data-ticket-id.
+        ids = [int(x) for x in re.findall(r'<tr[^>]*data-ticket-id="(\d+)"', html)]
+        return ids, qs, html
+
+    def check(label, flags, display_name):
+        cfg = dict(app.DEFAULT_FILTERS)
+        cfg.update(flags)
+        exp = expected(cfg)
+        ids, qs, html = rendered(cfg)
+        assert exp == ids, f"{label}: expected {exp} got {ids}"
+        # No duplicate rows.
+        assert len(ids) == len(set(ids)), f"{label}: duplicate row"
+        # Every parameter appears exactly once in the canonical URL.
+        for key in ("overdue", "responded", "waiting", "missing_tags", "days", "review_view"):
+            assert qs.count(f"{key}=") == 1, f"{label}: non-canonical {key} in {qs}"
+        print(f"  PASS {label}: {len(ids)} ticket(s) {display_name}")
+        return set(exp)
+
+    # 1. Overdue only -> all overdue tickets in the supported queue (no status gate).
+    check("Overdue only (intersection baseline)", {"responded": False, "waiting": False},
+          "= all overdue in supported queue")
+    # 2. Overdue + Customer Responded is an INTERSECTION (not a union).
+    or_ids = check("Overdue + Responded (intersection)", {"responded": True, "waiting": False},
+                   "= overdue AND responded")
+    r_only = set(expected(dict(app.DEFAULT_FILTERS, overdue=False, responded=True, waiting=False)))
+    o_only = set(expected(dict(app.DEFAULT_FILTERS, responded=False, waiting=False)))
+    assert r_only & o_only == or_ids, "Overdue+Responded must be the overlap of Overdue-only and Responded-only sets (intersection), not their union"
+    # 3. Overdue + Waiting is an intersection.
+    check("Overdue + Waiting (intersection)", {"responded": False, "waiting": True},
+          "= overdue AND waiting")
+    # 4. Responded + Waiting is a union within the status group.
+    rw = set(expected(dict(app.DEFAULT_FILTERS, overdue=False, responded=True, waiting=True)))
+    w_only = set(expected(dict(app.DEFAULT_FILTERS, overdue=False, responded=False, waiting=True)))
+    assert rw == r_only | w_only, "Responded + Waiting must be the union of the two statuses (OR within the group)"
+    check("Responded + Waiting (status-union)", {"overdue": False, "responded": True, "waiting": True},
+          "= responded OR waiting")
+    # 5. All three primary filters OFF -> no results + explicit message.
+    cfg = dict(app.DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
+    assert expected(cfg) == [], "all primary filters OFF must show no tickets"
+    ids, qs, html = rendered(cfg)
+    assert ids == []
+    assert "Select Overdue or at least one status to display results." in html
+    print("  OK: all three OFF shows no tickets and the guidance message")
+    # 6. Missing Tags stays an AND gate: flipping it toggles the tagged ticket set.
+    on = set(expected(dict(app.DEFAULT_FILTERS)))
+    off = set(expected(dict(app.DEFAULT_FILTERS, missing_tags=False)))
+    assert on != off, "Missing Tags OFF must widen the result set (reinclude fully tagged tickets)"
+    assert on <= off, "Missing Tags ON must be a strict subset (AND) of OFF"
+    print("  OK: Missing Tags remains an AND (Missing Tags ON subset of OFF)")
+    # 7. No duplicate rows across a union-of-status config (apply is id-deduped).
+    cfg = dict(app.DEFAULT_FILTERS, overdue=True, responded=True, waiting=True)
+    ids, qs, html = rendered(cfg)
+    assert len(ids) == len(set(ids)) and expected(cfg) == ids
+    print("  OK: no duplicate rows under Overdue + both statuses")
+    print("mixed filter logic: intersection for Overdue+status, OR within status group, all-off message, Missing Tags AND")
+PY
+ok "mixed filter logic is correct (Prompt06)"
 
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"
