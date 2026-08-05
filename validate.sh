@@ -91,6 +91,50 @@ with tempfile.TemporaryDirectory() as tmp:
 PY
 ok "SQLite database initializes and review state round-trips in a temp location"
 
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import app
+
+html = app.app.test_client().get("/queue").get_data(as_text=True)
+# Root-cause regression (Prompt02): the unquoted `class=tid fd-link` was
+# parsed by the browser as class="tid" plus an empty attribute `fd-link`, so
+# the old `a.fd-link` JS selector matched nothing and clicks never sent
+# /queue/api/opened. The class must now be quoted so `fd-link` is a real class.
+assert 'class="tid fd-link"' in html, "ticket-number link class must be quoted"
+assert 'class="sbj fd-link"' in html, "subject link class must be quoted"
+# The click handler anchors on the reliable data-ticket-id identifier and
+# never blocks the native new-tab navigation (spec sections 4-5).
+assert "querySelectorAll('a[data-ticket-id]')" in html
+assert "preventDefault" not in html
+# Visible highlight marker + OPENED / IN REVIEW badge + save-failure toast
+# (spec sections 6-7).
+assert "tr.rv-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}" in html
+assert "OPENED / IN REVIEW" in html
+assert "showError" in html
+print("click-highlight markup, CSS marker, and JS wiring present")
+PY
+ok "click-highlight markup/CSS/JS wiring is present"
+
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import tempfile, os
+import app
+with tempfile.TemporaryDirectory() as tmp:
+    db_path = os.path.join(tmp, "review.sqlite3")
+    os.environ["REVIEW_DB_PATH"] = db_path
+    app.init_db(db_path)
+    # Fresh open -> Opened / In Review, with timestamps recorded.
+    assert app.mark_opened(500001) == "Opened / In Review"
+    # A deliberate state is preserved on re-open, while last-opened updates
+    # and no duplicate record is created (spec section 8).
+    app.set_review_result(500002, "Resolved")
+    assert app.mark_opened(500002) == "Resolved"
+    rows = app.load_review_rows()
+    assert rows[500002]["review_result"] == "Resolved"
+    assert rows[500002]["last_opened_at"] is not None
+    assert len(rows) == 2
+    print("mark_opened: fresh open -> Opened / In Review; deliberate states preserved")
+PY
+ok "clicked-ticket review state is saved locally and deliberate states are preserved"
+
 "$PYTHON" - <<'PY'
 import app
 try:

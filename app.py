@@ -506,9 +506,18 @@ def _state_row(ticket_id):
 
 
 def mark_opened(ticket_id):
-    """Record that a ticket link was opened: first_opened_at is set once,
-    last_opened_at always updates, and the result becomes Opened / In Review.
-    Pure local state — no Freshdesk interaction."""
+    """Record that a ticket link was opened. Pure local state — no Freshdesk
+    interaction.
+
+    Review-result rule (dashboard spec §8): an Unreviewed ticket becomes
+    "Opened / In Review"; an already-opened ticket stays opened; deliberate
+    states (Resolved, Not Applicable to Me, No Action Needed, Needs Follow-Up)
+    are PRESERVED — re-opening a link must never silently erase a deliberate
+    review result. first_opened_at is set once, last_opened_at always updates,
+    and no duplicate record is ever created.
+
+    Returns the effective review_result for the ticket after marking.
+    """
     now = iso_now()
     conn = _db_conn()
     try:
@@ -520,14 +529,22 @@ def mark_opened(ticket_id):
                 " VALUES (?,?,?,?,?,?,?,?,?)",
                 (ticket_id, "Opened / In Review", now, now, now, None, "", now, now),
             )
+            result = "Opened / In Review"
         else:
+            current = row["review_result"]
             first = row["first_opened_at"] or now
+            if not current or current == "Unreviewed":
+                result = "Opened / In Review"
+            else:
+                result = current  # preserve deliberate/completed states
+            changed = result != current
             conn.execute(
-                "UPDATE review_state SET review_result = 'Opened / In Review', first_opened_at = ?,"
+                "UPDATE review_state SET review_result = ?, first_opened_at = ?,"
                 " last_opened_at = ?, last_review_change_at = ?, modified_at = ? WHERE ticket_id = ?",
-                (first, now, now, now, ticket_id),
+                (result, first, now, now if changed else row["last_review_change_at"], now, ticket_id),
             )
         conn.commit()
+        return result
     finally:
         conn.close()
 
@@ -633,7 +650,10 @@ def ticket_badges(t, state_row, updated_flag):
     (screen readers and color-blind users get the text)."""
     badges = []
     result = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
-    badges.append(("review", result, "b-review " + REVIEW_CLASS.get(result, "rv-unreviewed")))
+    # Display text: the Opened state renders as the all-caps "OPENED / IN REVIEW"
+    # badge (spec §3.5/§7) while the select option value stays sentence case.
+    badge_text = "OPENED / IN REVIEW" if result == "Opened / In Review" else result
+    badges.append(("review", badge_text, "b-review " + REVIEW_CLASS.get(result, "rv-unreviewed")))
     if is_overdue(t):
         badges.append(("attr", "OVERDUE", "b-overdue"))
     if is_customer_responded(t):
@@ -855,11 +875,11 @@ def opened_api():
         return jsonify({"ok": False, "error": "unknown ticket id"}), 404
 
     try:
-        mark_opened(ticket_id)
+        result = mark_opened(ticket_id)
     except Exception as e:
         return jsonify({"ok": False, "error": f"database error: {e}"}), 500
 
-    return jsonify({"ok": True, "review_result": "Opened / In Review"})
+    return jsonify({"ok": True, "review_result": result})
 
 
 def resolve_bind_host(host):
@@ -906,6 +926,7 @@ QUEUE_HTML = """\
  th{background:#fafafa;font-size:12px;color:#666;white-space:nowrap}
  tr.rv-unreviewed{background:#fff}
  tr.rv-opened{background:#fff8e1}
+ tr.rv-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}
  tr.rv-resolved{background:#e8f5e9}
  tr.rv-na{background:#eeeeee}
  tr.rv-none{background:#e3f2fd}
@@ -917,12 +938,15 @@ QUEUE_HTML = """\
  .badges{display:flex;flex-wrap:wrap;gap:4px}
  .badge{font-size:11px;font-weight:bold;padding:2px 6px;border-radius:4px;white-space:nowrap;letter-spacing:.02em}
  .b-review{border:1px solid #bbb;color:#333;background:#fff}
+ .b-review.rv-opened{background:#fff8e1;border-color:#f9a825;color:#5d4037}
  .b-overdue{background:#d32f2f;color:#fff}
  .b-responded{background:#f9a825;color:#222}
  .b-waiting{background:#7b1fa2;color:#fff}
  .b-missing{background:#757575;color:#fff}
  .b-sla{background:#e65100;color:#fff}
  .b-updated{background:#00838f;color:#fff}
+ .toast{position:fixed;right:16px;bottom:16px;max-width:340px;background:#fdecea;border:1px solid #d66;color:#8a1f1f;padding:10px 14px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:99}
+ .toast.hidden{display:none}
  .meta{color:#666;white-space:nowrap}
  .empty{color:#666;padding:24px;text-align:center;font-size:14px}
  .rvform{margin:0}
@@ -977,8 +1001,8 @@ QUEUE_HTML = """\
 </tr>
 {% for t in tickets %}
 <tr class="{{ t.row_class }}">
-  <td><a class=tid fd-link href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td>
-  <td><a class=sbj fd-link href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td>
+  <td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td>
+  <td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td>
   <td>{{ t.status_label }}</td>
   <td><div class=badges>{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td>
   <td>
@@ -1014,24 +1038,60 @@ QUEUE_HTML = """\
 
 <script>
 var CSRF_TOKEN = {{ csrf_token_json | safe }};
-document.querySelectorAll('a.fd-link').forEach(function (a) {
+var REVIEW_CLASS = {
+  'Unreviewed': 'rv-unreviewed',
+  'Opened / In Review': 'rv-opened',
+  'Resolved': 'rv-resolved',
+  'Not Applicable to Me': 'rv-na',
+  'No Action Needed': 'rv-none',
+  'Needs Follow-Up': 'rv-followup'
+};
+function badgeText(result) { return result === 'Opened / In Review' ? 'OPENED / IN REVIEW' : result; }
+var toastEl = null;
+function showError(msg) {
+  if (!toastEl) {
+    toastEl = document.createElement('div');
+    toastEl.className = 'toast hidden';
+    toastEl.setAttribute('role', 'status');
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = msg;
+  toastEl.classList.remove('hidden');
+  clearTimeout(showError._t);
+  showError._t = setTimeout(function () { toastEl.classList.add('hidden'); }, 6000);
+}
+// Anchor on the reliable data-ticket-id identifier (spec section 4). Covers
+// both the ticket-number and subject links. The default navigation is never
+// prevented: the Freshdesk ticket always opens in a new tab synchronously,
+// and the local state request runs in the background (spec section 5).
+document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
   a.addEventListener('click', function () {
     var tid = this.getAttribute('data-ticket-id');
     if (!tid) { return; }
+    var row = this.closest('tr');
     fetch('/queue/api/opened', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
       body: JSON.stringify({ticket_id: tid})
     }).then(function (r) { return r.json(); }).then(function (d) {
-      if (d && d.ok) {
-        // Confirmed saved: highlight the row and show the review badge.
-        var row = a.closest('tr');
-        if (row) { row.className = 'rv-opened'; }
-        var badge = a.closest('tr').querySelector('.b-review');
-        if (badge) { badge.textContent = 'Opened / In Review'; }
+      if (d && d.ok && d.review_result) {
+        // Confirmed saved: highlight the row and update badge + selector.
+        var cls = REVIEW_CLASS[d.review_result] || 'rv-unreviewed';
+        if (row) {
+          var extra = [];
+          row.classList.forEach(function (c) { if (c.indexOf('rv-') !== 0) { extra.push(c); } });
+          row.className = extra.concat([cls]).join(' ');
+        }
+        var badge = row ? row.querySelector('.b-review') : null;
+        if (badge) { badge.className = 'badge b-review ' + cls; badge.textContent = badgeText(d.review_result); }
+        var sel = row ? row.querySelector('select[name=review_result]') : null;
+        if (sel && sel.querySelector('option[value="' + d.review_result + '"]')) { sel.value = d.review_result; }
+      } else {
+        showError('Could not save Opened / In Review state for #' + tid + ' (not saved).');
       }
-      // Failure: the link already opened in the new tab; we claim nothing.
-    }).catch(function () {});
+    }).catch(function () {
+      showError('Could not save Opened / In Review state for #' + tid + ' (not saved).');
+    });
   });
 });
 setTimeout(function(){ location.reload(); }, 300000); // auto-refresh every 5 min

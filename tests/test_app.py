@@ -1445,17 +1445,157 @@ def test_opened_badge_updates_on_render(client):
 
 def test_ticket_links_render_safe_and_accessible(client):
     html = client.get("/queue").get_data(as_text=True)
-    m = re.search(r'<a class=tid fd-link href="([^"]+)" target=_blank rel="([^"]+)" data-ticket-id="500021" aria-label="([^"]+)"', html)
+    m = re.search(r'<a class="tid fd-link" href="([^"]+)" target=_blank rel="([^"]+)" data-ticket-id="500021" aria-label="([^"]+)"', html)
     assert m
     url, rel, label = m.group(1), m.group(2), m.group(3)
     assert url == "https://broadriverretail-help.freshdesk.com/a/tickets/500021"
     assert "noopener" in rel
     assert "Open ticket #500021 in Freshdesk" in label
-    m2 = re.search(r'<a class=sbj fd-link href="([^"]+)" target=_blank rel="([^"]+)" data-ticket-id="500021" aria-label="([^"]+)"', html)
+    m2 = re.search(r'<a class="sbj fd-link" href="([^"]+)" target=_blank rel="([^"]+)" data-ticket-id="500021" aria-label="([^"]+)"', html)
     assert m2
     assert m2.group(1) == url
     assert "noopener" in m2.group(2)
     assert "Open subject of ticket #500021" in m2.group(3)
+
+
+# ===========================================================================
+# Prompt02 — Click highlight fix
+# ===========================================================================
+
+
+def test_ticket_links_have_quoted_fd_link_classes(client):
+    # Regression guard for the Prompt02 root cause. The unquoted
+    # `class=tid fd-link` was parsed by the browser as class="tid" plus a
+    # separate empty attribute named `fd-link`, so the old `a.fd-link` JS
+    # selector matched nothing and clicks never sent /queue/api/opened — the
+    # ticket was never highlighted. Quoting makes `fd-link` a real class.
+    html = client.get("/queue").get_data(as_text=True)
+    assert 'class="tid fd-link"' in html
+    assert 'class="sbj fd-link"' in html
+
+
+def test_click_js_anchors_on_data_ticket_id(client):
+    # Spec §4: the click handler must use a reliable DOM identifier
+    # (data-ticket-id) and must never prevent the native new-tab navigation
+    # (spec §5), so the external ticket always opens.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "querySelectorAll('a[data-ticket-id]')" in html
+    assert "preventDefault" not in html
+
+
+def test_click_js_updates_row_badge_and_selector(client):
+    # Spec §3/§4: a successful save updates the row state class, the
+    # OPENED / IN REVIEW badge, and the review-result selector to match the
+    # effective result returned by the server.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "REVIEW_CLASS" in html
+    assert "OPENED / IN REVIEW" in html
+    assert "select[name=review_result]" in html
+    assert "badgeText" in html
+
+
+def test_click_js_shows_error_on_save_failure(client):
+    # Spec §6: a visible error message is shown if the local save fails, and
+    # the claim "Opened / In Review saved" is never made unless it was.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "showError" in html
+    assert "Could not save Opened / In Review state" in html
+
+
+def test_click_highlight_css_has_visible_marker(client):
+    # Spec §7: pale yellow row background + a visible left-edge marker +
+    # a distinct OPENED / IN REVIEW badge, with readable text contrast.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "tr.rv-opened{background:#fff8e1}" in html
+    assert "tr.rv-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}" in html
+    assert ".b-review.rv-opened{background:#fff8e1;border-color:#f9a825;color:#5d4037}" in html
+
+
+def test_opened_badge_renders_uppercase_and_highlighted(client):
+    tok = _csrf(client)
+    client.post("/queue/api/opened", json={"ticket_id": "500021"}, headers={"X-CSRF-Token": tok})
+    html = client.get("/queue").get_data(as_text=True)
+    assert 'class="badge b-review rv-opened">OPENED / IN REVIEW' in html
+    assert '<tr class="rv-opened">' in html
+
+
+def test_mark_opened_preserves_deliberate_states():
+    for result in ("Resolved", "Not Applicable to Me", "No Action Needed", "Needs Follow-Up"):
+        set_review_result(500002, result)
+        effective = mark_opened(500002)
+        rows = load_review_rows()
+        assert rows[500002]["review_result"] == result  # preserved, not wiped
+        assert effective == result
+        assert rows[500002]["last_opened_at"] is not None
+        conn = app._db_conn()
+        conn.execute("DELETE FROM review_state WHERE ticket_id = ?", (500002,))
+        conn.commit()
+        conn.close()
+
+
+def test_mark_opened_unreviewed_row_becomes_opened():
+    set_review_result(500001, "Unreviewed")
+    effective = mark_opened(500001)
+    rows = load_review_rows()
+    assert effective == "Opened / In Review"
+    assert rows[500001]["review_result"] == "Opened / In Review"
+
+
+def test_mark_opened_updates_last_opened_when_preserving(monkeypatch):
+    t0 = "2026-08-01T00:00:00+00:00"
+    t1 = "2026-08-02T00:00:00+00:00"
+    calls = {"n": 0}
+
+    def fake_iso():
+        calls["n"] += 1
+        return t0 if calls["n"] <= 1 else t1
+
+    set_review_result(500002, "Resolved")  # real clock (before patch)
+    monkeypatch.setattr(app, "iso_now", fake_iso)
+    mark_opened(500002)  # t0
+    mark_opened(500002)  # t1
+    rows = load_review_rows()
+    assert rows[500002]["review_result"] == "Resolved"  # preserved
+    assert rows[500002]["first_opened_at"] == t0
+    assert rows[500002]["last_opened_at"] == t1  # last-opened still advances
+
+
+def test_mark_opened_returns_effective_result():
+    assert mark_opened(500003) == "Opened / In Review"
+    set_review_result(500003, "Needs Follow-Up")
+    assert mark_opened(500003) == "Needs Follow-Up"
+
+
+def test_opened_endpoint_preserves_deliberate_state(client):
+    set_review_result(500021, "Resolved")
+    tok = _csrf(client)
+    r = client.post("/queue/api/opened", json={"ticket_id": "500021"}, headers={"X-CSRF-Token": tok})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["ok"] is True
+    assert data["review_result"] == "Resolved"
+    rows = load_review_rows()
+    assert rows[500021]["review_result"] == "Resolved"
+    assert rows[500021]["last_opened_at"]
+
+
+def test_opened_endpoint_reports_effective_result(client):
+    tok = _csrf(client)
+    r = client.post("/queue/api/opened", json={"ticket_id": "500021"}, headers={"X-CSRF-Token": tok})
+    assert r.status_code == 200
+    assert r.get_json()["review_result"] == "Opened / In Review"
+
+
+def test_opened_state_persists_across_clients(client):
+    tok = _csrf(client)
+    client.post("/queue/api/opened", json={"ticket_id": "500021"}, headers={"X-CSRF-Token": tok})
+    # A second client reads the same isolated review DB — the highlight and
+    # badge survive a fresh request (equivalent to a page reload).
+    client2 = app.app.test_client()
+    html = client2.get("/queue").get_data(as_text=True)
+    assert 'value="Opened / In Review" selected' in html
+    assert 'class="badge b-review rv-opened">OPENED / IN REVIEW' in html
+    assert '<tr class="rv-opened">' in html
 
 
 # ===========================================================================
