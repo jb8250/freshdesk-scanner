@@ -1016,17 +1016,17 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
 <div class="banner err" role=alert>{{ error }}</div>
 {% endif %}
 
-<form class=controls method=get action=/queue>
+<form class="controls" method=get action=/queue novalidate>
   <div class=row>
     <span class=field><span class=lbl>Tickets updated in the last</span>
       <input type=number name=days min=1 max=365 value={{ config.days }} aria-label="Days back">
       <span class=lbl>days</span>
       {% for d in [7, 14, 30, 60] %}<a class=preset href="/queue?{{ preset_urls[d] }}">{{ d }}d</a>{% endfor %}
     </span>
-    <span class=field><label><input type=checkbox name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></span>
-    <span class=field><label><input type=checkbox name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></span>
-    <span class=field><label><input type=checkbox name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></span>
-    <span class=field><label><input type=checkbox name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></span>
+    <span class=field><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></span>
+    <span class=field><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></span>
+    <span class=field><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></span>
+    <span class=field><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></span>
   </div>
   <div class=row>
     <span class=field><label for=review_view>Review view</label>
@@ -1034,7 +1034,7 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
         {% for v in ['active','completed','all'] %}<option value={{ v }} {{ 'selected' if config.review_view == v }}>{% if v == 'active' %}Active{% elif v == 'completed' %}Completed{% else %}All{% endif %}</option>{% endfor %}
       </select></span>
     <button type=submit>Apply Filters</button>
-    <a class="controls button reset" href=/queue role=button aria-label="Reset filters to defaults">Reset to Defaults</a>
+    <a class="controls button reset" href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active" role=button aria-label="Reset filters to defaults">Reset to Defaults</a>
   </div>
 </form>
 
@@ -1232,6 +1232,63 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     });
   });
 });
+// Filter controls: canonicalize on submit (Prompt05). Native HTML checkbox
+// GET forms omit *unchecked* fields entirely, so turning OFF a default-ON
+// category (Overdue, Missing Tags) submitted no parameter and the backend's
+// documented default re-checked it. On submit we prevent default navigation
+// and rebuild one canonical query string from the live control state so every
+// parameter (overdue, responded, waiting, missing_tags, days, review_view)
+// appears exactly once with an explicit 0/1 / validated value. This fires for
+// mouse click, keyboard activation, and Enter in the days field alike.
+(function () {
+  var form = document.querySelector('form.controls');
+  if (!form) { return; }
+  function normDays(raw) {
+    var v = String(raw == null ? '' : raw).trim();
+    if (!/^[0-9]+$/.test(v)) { return 60; }
+    var n = parseInt(v, 10);
+    return (n >= 1 && n <= 365) ? n : 60;
+  }
+  function normView(v) { return (v === 'completed' || v === 'all') ? v : 'active'; }
+  form.addEventListener('submit', function (e) {
+    try {
+      var params = {};
+      ['overdue', 'responded', 'waiting', 'missing_tags'].forEach(function (n) {
+        var el = form.querySelector('input[name="' + n + '"]');
+        params[n] = el && el.checked ? '1' : '0';
+      });
+      var daysEl = form.querySelector('input[name=days]');
+      params['days'] = String(normDays(daysEl ? daysEl.value : null));
+      var viewEl = form.querySelector('select[name=review_view]');
+      params['review_view'] = normView(viewEl ? viewEl.value : 'active');
+      var parts = [];
+      ['overdue', 'responded', 'waiting', 'missing_tags', 'days', 'review_view'].forEach(function (k) {
+        parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+      });
+      e.preventDefault();
+      window.location.href = '/queue?' + parts.join('&');
+    } catch (err) {
+      // On any unexpected error, fall back to native submission.
+    }
+  });
+  // Browser back/forward (and bfcache restore) may re-apply stale values to
+  // the controls even though the server re-rendered from the current URL
+  // (e.g. the days box showing its previous typed value while the URL says
+  // 60). Re-derive every control from the canonical URL on every pageshow so
+  // the rendered controls always reflect the address-bar state.
+  function syncControlsFromURL() {
+    var q = new URLSearchParams(window.location.search);
+    ['overdue', 'responded', 'waiting', 'missing_tags'].forEach(function (n) {
+      var el = form.querySelector('input[name="' + n + '"]');
+      if (el) { el.checked = (q.get(n) === '1'); }
+    });
+    var daysEl = form.querySelector('input[name=days]');
+    if (daysEl) { daysEl.value = String(normDays(q.get('days'))); }
+    var viewEl = form.querySelector('select[name=review_view]');
+    if (viewEl) { viewEl.value = normView(q.get('review_view')); }
+  }
+  window.addEventListener('pageshow', function () { syncControlsFromURL(); });
+})();
 setTimeout(function(){ location.reload(); }, 300000); // auto-refresh every 5 min
 </script>
 </body></html>

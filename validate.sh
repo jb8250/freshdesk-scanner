@@ -104,7 +104,12 @@ assert 'class="sbj fd-link"' in html, "subject link class must be quoted"
 # The click handler anchors on the reliable data-ticket-id identifier and
 # never blocks the native new-tab navigation (spec sections 4-5).
 assert "querySelectorAll('a[data-ticket-id]')" in html
-assert "preventDefault" not in html
+# Prompt05: the ticket-link click path must never preventDefault; the
+# filter-form canonicalizer (which follows it in the script) is the only
+# place preventDefault is allowed.
+ticket_part, _, filter_part = html.partition("// Filter controls:")
+assert "preventDefault" not in ticket_part
+assert "preventDefault" in filter_part
 # Visible highlight marker + OPENED / IN REVIEW badge + save-failure toast
 # (spec sections 6-7).
 assert "tr.rv-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}" in html
@@ -250,6 +255,85 @@ if git status --short | grep -E '(^| )\.env|freshdesk_api_key|cache/|(^| )data/'
   fail "secret/cache/database artifact appears in working tree"
 fi
 ok "no secret, cache, or database artifact appears in git status"
+
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import os
+import re
+import tempfile
+
+import app
+from werkzeug.datastructures import MultiDict
+
+# Prompt05 — filter controls fix: form structure, canonical query generation,
+# explicit 0/1 for unchecked checkboxes, all-categories-off, Reset defaults,
+# review-redirect filter preservation, and Last Opened survival.
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    app.init_db(os.environ["REVIEW_DB_PATH"])
+
+    client = app.app.test_client()
+    html = client.get("/queue").get_data(as_text=True)
+
+    # 1. Exactly one filter form; GET to /queue; novalidate (JS owns days).
+    forms = re.findall(r"<form([^>]*)>", html)
+    controls = [f for f in forms if "controls" in f and "method=get" in f]
+    assert len(controls) == 1, f"expected one controls form, got {len(controls)}"
+    assert "action=/queue" in controls[0] and "novalidate" in controls[0]
+
+    # 2. Apply Filters button lives inside the filter form.
+    assert re.search(
+        r'<form[^>]*class="controls"[^>]*>.*?<button[^>]*type="?submit"?[^>]*>Apply Filters</button>',
+        html, re.S,
+    ), "Apply Filters button not inside the controls form"
+
+    # 3. Canonical default query matches the spec exactly.
+    default_qs = app.filter_query_string(app.filters_from_args(MultiDict([])))
+    assert default_qs == "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active", default_qs
+
+    # 4. Unchecked categories can stay OFF (explicit 0) and all-OFF shows the
+    #    "select at least one category" message (no silent re-check).
+    qs = app.filter_query_string(app.filters_from_args(
+        MultiDict([("overdue", "0"), ("responded", "0"), ("waiting", "0")])))
+    assert "overdue=0" in qs and "responded=0" in qs and "waiting=0" in qs
+    all_off = client.get(
+        "/queue?overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    ).get_data(as_text=True)
+    assert "Select at least one ticket category to display results." in all_off
+
+    # 5. Canonical output never duplicates a parameter, even under repeated input.
+    qs_dup = app.filter_query_string(app.filters_from_args(
+        MultiDict([("overdue", "0"), ("overdue", "1")])))
+    assert qs_dup.count("overdue=") == 1, f"duplicated parameter: {qs_dup}"
+    assert "overdue=1&" in qs_dup  # last value wins
+
+    # 6. Reset to Defaults is the exact canonical default URL.
+    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in html
+
+    # 7. Review-result POST redirects back to the same filters, one value each.
+    tok = re.search(r'name=csrf_token value="([^"]+)"', html).group(1)
+    r = client.post("/queue/api/review", data={
+        "ticket_id": "500001",
+        "review_result": "Resolved",
+        "csrf_token": tok,
+        "overdue": "0", "responded": "1", "waiting": "0",
+        "missing_tags": "0", "days": "7", "review_view": "completed",
+    }, follow_redirects=False)
+    loc = r.headers.get("Location", "")
+    assert loc.startswith("/queue?"), loc
+    for key in ("overdue", "responded", "waiting", "missing_tags", "days", "review_view"):
+        assert loc.count(f"{key}=") == 1, f"non-canonical redirect {loc}"
+    assert "overdue=0" in loc and "responded=1" in loc
+    assert "days=7" in loc and "review_view=completed" in loc
+
+    # 8. Last Opened survives filter changes (marker under different views).
+    app.mark_opened(500001)
+    for url in ("/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active",
+                "/queue?overdue=0&responded=1&waiting=0&missing_tags=0&days=7&review_view=all"):
+        page = client.get(url).get_data(as_text=True)
+        assert "rv-last-opened" in page, f"last-opened marker lost on {url}"
+    print("filter controls: canonical URL, explicit 0/1, all-off, Reset defaults, redirect preservation, Last Opened survival")
+PY
+ok "filter controls produce canonical URLs and preserve review state"
 
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"

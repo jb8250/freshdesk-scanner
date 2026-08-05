@@ -16,9 +16,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
 import pytest
 import requests
+from werkzeug.datastructures import MultiDict
 
 import app
 from app import (
@@ -847,7 +849,10 @@ def test_refresh_link_does_not_bypass_cache(monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     resp = app.app.test_client().get("/queue")
     text = resp.get_data(as_text=True)
-    assert 'href=/queue' in text
+    # MODIFIED (Prompt05): the Reset link now carries the full canonical
+    # default query, so a bare `href=/queue` no longer exists. The filter form
+    # still submits to /queue (its action), which is what this asserts.
+    assert 'action=/queue' in text
     assert 'refresh' not in text.lower() or True  # no cache-busting param added
     assert "?refresh=" not in text and "cache=0" not in text
 
@@ -1480,9 +1485,15 @@ def test_click_js_anchors_on_data_ticket_id(client):
     # Spec §4: the click handler must use a reliable DOM identifier
     # (data-ticket-id) and must never prevent the native new-tab navigation
     # (spec §5), so the external ticket always opens.
+    # MODIFIED (Prompt05): a preventDefault now exists for the filter-form
+    # canonicalizer (explicit 0/1 for unchecked checkboxes). It is scoped to
+    # that block; the ticket-link click path, which precedes it in the script,
+    # still never calls preventDefault.
     html = client.get("/queue").get_data(as_text=True)
     assert "querySelectorAll('a[data-ticket-id]')" in html
-    assert "preventDefault" not in html
+    ticket_part, _, filter_part = html.partition("// Filter controls:")
+    assert "preventDefault" not in ticket_part  # ticket links still open natively
+    assert "preventDefault" in filter_part      # only the filter form canonicalizes
 
 
 def test_click_js_updates_row_badge_and_selector(client):
@@ -2152,3 +2163,276 @@ def test_badge_texts_still_present(client):
     assert ">CUSTOMER RESPONDED" in html
     assert ">WAITING ON CUSTOMER" in html
     assert ">LAST OPENED" not in html  # no marker in a fresh session
+
+
+# ===========================================================================
+# Prompt05 — Filter controls fix
+# ===========================================================================
+
+
+class _FormParser(HTMLParser):
+    """Parses rendered HTML into form structures so tests assert real DOM
+    shape (containment, nesting, control membership) instead of relying only
+    on substring checks. HTMLParser mirrors how a browser builds the DOM for
+    the (well-formed) template output: inputs/buttons/selects are attributed
+    to the form that is open when they appear, and nested forms are flagged.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.forms = []  # {'attrs','inputs','buttons','selects','text','nested'}
+        self._open_forms = 0
+        self._cur = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            self._cur = {
+                "attrs": attrs,
+                "inputs": [],
+                "buttons": [],
+                "selects": [],
+                "text": "",
+                "nested": self._open_forms > 0,
+            }
+            self.forms.append(self._cur)
+            self._open_forms += 1
+        elif self._cur is not None and self._open_forms:
+            if tag == "input":
+                self._cur["inputs"].append(attrs)
+            elif tag == "button":
+                self._cur["buttons"].append(attrs)
+            elif tag == "select":
+                self._cur["selects"].append(attrs)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "input" and self._cur is not None and self._open_forms:
+            self._cur["inputs"].append(dict(attrs))
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self._open_forms -= 1
+            self._cur = None
+
+    def handle_data(self, data):
+        if self._cur is not None and self._open_forms:
+            self._cur["text"] += data
+
+
+def _form_parser_for(html):
+    p = _FormParser()
+    p.feed(html)
+    return p
+
+
+def _controls_form(html):
+    forms = _form_parser_for(html).forms
+    controls = [f for f in forms if "controls" in f["attrs"].get("class", "")]
+    assert len(controls) == 1, f"expected exactly one controls form, got {len(controls)}"
+    return controls[0], forms
+
+
+class _IdCollector(HTMLParser):
+    """Collects every element `id` attribute exactly as the browser sees it
+    (handles quoted and unquoted attribute syntax) so uniqueness can be
+    asserted without substring ambiguity."""
+
+    def __init__(self):
+        super().__init__()
+        self.ids = []
+
+    def _tag(self, tag, attrs):
+        for k, v in attrs:
+            if k == "id" and v:
+                self.ids.append(v)
+
+    def handle_starttag(self, tag, attrs):
+        self._tag(tag, attrs)
+
+    def handle_startendtag(self, tag, attrs):
+        self._tag(tag, attrs)
+
+
+def _all_ids(html):
+    p = _IdCollector()
+    p.feed(html)
+    return p.ids
+
+
+# --- Form structure ---------------------------------------------------------
+
+
+def test_filter_form_exactly_one_controls_form(client):
+    html = client.get("/queue").get_data(as_text=True)
+    form, forms = _controls_form(html)
+    assert form["attrs"].get("method", "").lower() == "get"
+    assert form["attrs"].get("action") == "/queue"
+    assert "novalidate" in form["attrs"]  # JS owns days validation
+
+
+def test_pageshow_resyncs_controls_from_url(client):
+    # Back/forward navigation (bfcache / browser form-state restoration) can
+    # re-apply stale values to the controls even though the server re-rendered
+    # from the current URL. The canonicalizer must re-derive control state
+    # from location.search on pageshow so controls, URL, and results always
+    # agree after history navigation (verified live: back from days=7 showed
+    # input "7" on a days=60 URL before this handler; now it shows "60").
+    html = client.get("/queue").get_data(as_text=True)
+    assert "pageshow" in html
+    assert "syncControlsFromURL" in html
+    assert "location.search" in html
+
+
+def test_apply_filters_button_inside_filter_form(client):
+    html = client.get("/queue").get_data(as_text=True)
+    form, _ = _controls_form(html)
+    submit = [b for b in form["buttons"] if b.get("type") == "submit"]
+    assert submit, "Apply Filters submit button missing from filter form"
+    assert "Apply Filters" in form["text"]
+
+
+def test_no_nested_forms_break_filter_form(client):
+    html = client.get("/queue").get_data(as_text=True)
+    _, forms = _controls_form(html)
+    assert all(not f["nested"] for f in forms), "a <form> is nested inside another"
+
+
+def test_filter_checkboxes_unique_ids_and_correct_names(client):
+    html = client.get("/queue").get_data(as_text=True)
+    form, _ = _controls_form(html)
+    boxes = [i for i in form["inputs"] if i.get("type") == "checkbox"]
+    names = [i.get("name") for i in boxes]
+    assert names == ["overdue", "responded", "waiting", "missing_tags"]
+    ids = [i.get("id") for i in boxes]
+    assert ids == ["filter-overdue", "filter-responded", "filter-waiting", "filter-missing"]
+    assert all(i.get("value") == "1" for i in boxes)
+    all_ids = _all_ids(html)
+    assert len(all_ids) == len(set(all_ids)), "duplicate element IDs in page"
+    for i in ids:
+        assert all_ids.count(i) == 1
+
+
+def test_filter_labels_are_unique_and_associated(client):
+    html = client.get("/queue").get_data(as_text=True)
+    # Every checkbox is wrapped by its own <label> (implicit association).
+    for name in ("overdue", "responded", "waiting", "missing_tags"):
+        m = re.search(rf"<label[^>]*for=filter-[^>]*>\s*<input[^>]*name={name}[^>]*>\s*[^<]+</label>", html)
+        assert m, f"checkbox {name} lacks an associated <label>"
+    assert 'aria-label="Days back"' in html  # days input has an accessible label
+    assert re.search(r'<label[^>]*for=review_view>', html)  # select label present
+
+
+def test_days_input_belongs_to_filter_form(client):
+    html = client.get("/queue").get_data(as_text=True)
+    form, _ = _controls_form(html)
+    days = [i for i in form["inputs"] if i.get("name") == "days"]
+    assert days, "days input missing from filter form"
+    assert days[0].get("type") == "number"
+    assert days[0].get("min") == "1" and days[0].get("max") == "365"
+
+
+def test_review_view_control_belongs_to_filter_form(client):
+    html = client.get("/queue").get_data(as_text=True)
+    form, _ = _controls_form(html)
+    sel = [s for s in form["selects"] if s.get("name") == "review_view"]
+    assert sel, "review_view select missing from filter form"
+    for opt in ("active", "completed", "all"):
+        assert f"<option value={opt}" in html
+
+
+def test_browser_parsed_dom_contains_expected_controls(client):
+    html = client.get("/queue").get_data(as_text=True)
+    form, forms = _controls_form(html)
+    names = {i.get("name") for i in form["inputs"]}
+    assert {"overdue", "responded", "waiting", "missing_tags", "days"} <= names
+    # The per-row review forms are siblings of the filter form, never inside.
+    rvforms = [f for f in forms if f["attrs"].get("action") == "/queue/api/review"]
+    assert rvforms, "no review-result forms rendered"
+    assert all(f["attrs"].get("method", "").lower() == "post" for f in rvforms)
+
+
+# --- Canonical query generation --------------------------------------------
+
+
+def test_canonical_query_explicit_1_for_checked_0_for_unchecked():
+    qs = filter_query_string(filters_from_args(MultiDict([])))
+    assert qs == "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+
+
+def test_canonical_query_all_three_categories_off():
+    qs = filter_query_string(filters_from_args(MultiDict([
+        ("overdue", "0"), ("responded", "0"), ("waiting", "0"),
+    ])))
+    assert qs == "overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+
+
+def test_canonical_query_no_duplicate_parameters():
+    # Even when the same key arrives multiple times, the canonical URL emits
+    # it exactly once (last value wins; no Overdue=0&overdue=1 ambiguity).
+    qs = filter_query_string(filters_from_args(MultiDict([
+        ("overdue", "0"), ("overdue", "1"), ("responded", "1"), ("responded", "0"),
+    ])))
+    assert qs.count("overdue=") == 1 and qs.count("responded=") == 1
+    assert "overdue=1&" in qs and "responded=0&" in qs
+
+
+def test_canonical_query_all_six_params_exactly_once():
+    qs = filter_query_string(filters_from_args(MultiDict([("days", "30")])))
+    for key in ("overdue", "responded", "waiting", "missing_tags", "days", "review_view"):
+        assert qs.count(f"{key}=") == 1, f"{key} must appear exactly once: {qs}"
+    assert qs.endswith("review_view=active")
+
+
+def test_canonical_query_unknown_boolean_falls_back():
+    # Unknown boolean values fall back to the documented default safely.
+    cfg = filters_from_args(MultiDict([("overdue", "banana"), ("responded", "yes")]))
+    assert cfg["overdue"] is DEFAULT_FILTERS["overdue"]
+    assert cfg["responded"] is True  # parse_bool accepts 'yes'
+
+
+def test_canonical_query_invalid_review_view_falls_back_to_active():
+    cfg = filters_from_args(MultiDict([("review_view", "wat")]))
+    assert cfg["review_view"] == "active"
+
+
+def test_canonical_query_invalid_days_falls_back_to_60():
+    for bad in ("", "0", "-1", "1.5", "abc", "366"):
+        assert parse_days(bad) == 60, f"parse_days({bad!r}) should fall back to 60"
+    assert parse_days("1") == 1 and parse_days("365") == 365
+
+
+# --- Reset / persistence ----------------------------------------------------
+
+
+def test_reset_link_is_exact_canonical_default_url(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in html
+
+
+def test_reset_keeps_review_data_and_last_opened(client):
+    _open(client, 500001)
+    from app import set_review_result
+    set_review_result("500003", "Resolved")
+    # review_view=all shows every local review state, so the resolved row is
+    # visible and the last-opened marker on 500001 survives the canonical URL.
+    html = client.get("/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=all").get_data(as_text=True)
+    assert "rv-last-opened" in _row_for(html, 500001).split(">", 1)[0]
+    row3 = _row_for(html, 500003)
+    assert row3 is not None
+    assert "rv-resolved" in row3.split(">", 1)[0]
+
+
+def test_missing_url_parameters_use_defaults(client):
+    html = client.get("/queue").get_data(as_text=True)
+    # bare /queue behaves exactly like the canonical default state
+    assert _ids(html) == _ids(client.get(
+        "/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    ).get_data(as_text=True))
+
+
+def test_filter_changes_do_not_alter_review_state(client):
+    # Changing filters must never write review state (GET-only).
+    before = app.load_review_rows() if hasattr(app, "load_review_rows") else None
+    client.get("/queue?overdue=0&responded=1&waiting=0&missing_tags=0&days=7&review_view=completed")
+    after = app.load_review_rows() if hasattr(app, "load_review_rows") else None
+    assert before == after
