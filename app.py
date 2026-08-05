@@ -950,6 +950,7 @@ QUEUE_HTML = """\
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Freshdesk Review Queue</title>
 <style>
+ :root{--fd-customer-responded:#09218D;--fd-customer-responded-text:#FFFFFF;--fd-waiting-customer:#E9AE3D;--fd-waiting-customer-text:#1A1A1A;--fd-last-opened:#6A1B9A;--fd-last-opened-text:#FFFFFF}
  body{font-family:system-ui,Arial,sans-serif;max-width:1100px;margin:auto;padding:16px;background:#f5f5f5;color:#222}
  h1{font-size:22px;margin:0 0 4px}
  .sub{color:#666;font-size:13px;margin-bottom:16px}
@@ -979,9 +980,9 @@ QUEUE_HTML = """\
  tr.rv-na{background:#eeeeee}
  tr.rv-none{background:#e3f2fd}
  tr.rv-followup{background:#fff3e0}
-tr.rv-last-opened{outline:3px solid #0d47a1;outline-offset:-3px}
-tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}
-.b-last-opened{background:#0d47a1;color:#fff}
+tr.rv-last-opened{outline:3px solid var(--fd-last-opened);outline-offset:-3px}
+tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
+.b-last-opened{background:var(--fd-last-opened);color:var(--fd-last-opened-text)}
  a.tid{font-weight:bold;color:#1565c0;text-decoration:none}
  a.tid:hover{text-decoration:underline}
  a.sbj{color:#222;text-decoration:none}
@@ -991,8 +992,8 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}
  .b-review{border:1px solid #bbb;color:#333;background:#fff}
  .b-review.rv-opened{background:#fff8e1;border-color:#f9a825;color:#5d4037}
  .b-overdue{background:#d32f2f;color:#fff}
- .b-responded{background:#f9a825;color:#222}
- .b-waiting{background:#7b1fa2;color:#fff}
+ .b-responded{background:var(--fd-customer-responded);color:var(--fd-customer-responded-text)}
+ .b-waiting{background:var(--fd-waiting-customer);color:var(--fd-waiting-customer-text)}
  .b-missing{background:#757575;color:#fff}
  .b-sla{background:#e65100;color:#fff}
  .b-updated{background:#00838f;color:#fff}

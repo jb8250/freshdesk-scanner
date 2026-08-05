@@ -138,17 +138,18 @@ ok "clicked-ticket review state is saved locally and deliberate states are prese
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
 import re
 import app
-# Last-Opened focus marker (Prompt03): server-side wiring, distinct dark-blue
+# Last-Opened focus marker (Prompt03): server-side wiring, distinct purple
 # styling, confirmed-only DOM move, and the jump control / hidden-by-filters
 # message. All strings below also exist as JS comments, so assert on the
 # rendered CSS/HTML/JS constructs, not bare marker words.
 r = app.app.test_client().get("/queue")
 assert r.status_code == 200
 html = r.get_data(as_text=True)
-# Distinct dark-blue focus styling, off the yellow/orange review family.
-assert "tr.rv-last-opened{outline:3px solid #0d47a1" in html
-assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}" in html
-assert ".b-last-opened{background:#0d47a1;color:#fff}" in html
+# Distinct purple focus styling (Prompt04), off the yellow/orange review family
+# and off the royal-blue Customer Responded badge.
+assert "tr.rv-last-opened{outline:3px solid var(--fd-last-opened)" in html
+assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}" in html
+assert ".b-last-opened{background:var(--fd-last-opened);color:var(--fd-last-opened-text)}" in html
 # Rows carry a semantic data-ticket-id focus anchor.
 assert re.search(r'data-ticket-id="5000\d\d"', html)
 # JS: marker moves only on a confirmed save, stripping the old row first.
@@ -161,6 +162,25 @@ assert re.search(r"scrollIntoView\(\{behavior: 'smooth', block: 'center'\}\)", h
 print("last-opened focus markup, distinct CSS, jump control, and confirmed-only JS wiring present")
 PY
 ok "last-opened focus markup/CSS/JS wiring is present"
+
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import app
+# Prompt04 badge colors: Freshdesk royal blue / gold via central CSS variables,
+# LAST OPENED kept distinct (purple), review highlight untouched.
+r = app.app.test_client().get("/queue")
+html = r.get_data(as_text=True)
+assert "--fd-customer-responded:#09218D" in html
+assert "--fd-customer-responded-text:#FFFFFF" in html
+assert "--fd-waiting-customer:#E9AE3D" in html
+assert "--fd-waiting-customer-text:#1A1A1A" in html
+assert "--fd-last-opened:#6A1B9A" in html
+assert ".b-responded{background:var(--fd-customer-responded);color:var(--fd-customer-responded-text)}" in html
+assert ".b-waiting{background:var(--fd-waiting-customer);color:var(--fd-waiting-customer-text)}" in html
+assert ">CUSTOMER RESPONDED" in html
+assert ">WAITING ON CUSTOMER" in html
+print("badge colors: royal-blue Customer Responded, gold Waiting on Customer, distinct purple LAST OPENED")
+PY
+ok "status badge colors match Freshdesk and LAST OPENED stays distinct"
 
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
 import tempfile, os

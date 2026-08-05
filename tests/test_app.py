@@ -1873,9 +1873,9 @@ def test_opened_and_last_opened_displayed_together(client):
 
 def test_followup_class_is_distinct_from_last_opened(client):
     html = client.get("/queue").get_data(as_text=True)
-    # two separate CSS rules, distinct dark-blue focus styling (spec section 4).
+    # two separate CSS rules, distinct purple focus styling (spec section 4).
     assert "tr.rv-followup{background:#fff3e0}" in html
-    assert "tr.rv-last-opened{outline:3px solid #0d47a1" in html
+    assert "tr.rv-last-opened{outline:3px solid var(--fd-last-opened)" in html
 
 
 def test_changing_review_result_preserves_marker(client):
@@ -2072,18 +2072,21 @@ def test_js_toggles_jump_and_hidden_message_on_move(client):
 
 # --- styling / a11y ---------------------------------------------------------
 
-def test_last_opened_css_distinct_blue(client):
+def test_last_opened_css_distinct_purple(client):
     html = client.get("/queue").get_data(as_text=True)
-    assert "tr.rv-last-opened{outline:3px solid #0d47a1" in html
-    assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #0d47a1}" in html
-    assert ".b-last-opened{background:#0d47a1;color:#fff}" in html
+    assert "--fd-last-opened:#6A1B9A" in html
+    assert "--fd-last-opened-text:#FFFFFF" in html
+    assert "tr.rv-last-opened{outline:3px solid var(--fd-last-opened)" in html
+    assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}" in html
+    assert ".b-last-opened{background:var(--fd-last-opened);color:var(--fd-last-opened-text)}" in html
 
 
 def test_focus_marker_never_uses_review_colors(client):
-    # The focus indicator is dark blue (#0d47a1) — never the yellow/orange of
-    # the review highlight (#fff8e1 / #f9a825), so the two are distinguishable.
+    # The focus indicator is distinct purple (var --fd-last-opened) — never the
+    # yellow/orange of the review highlight (#fff8e1 / #f9a825), so the two are
+    # distinguishable.
     html = client.get("/queue").get_data(as_text=True)
-    assert "#0d47a1" in html
+    assert "var(--fd-last-opened)" in html
     for forbidden in ("rv-last-opened{background:#fff8e1}",
                       "rv-last-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}"):
         assert forbidden not in html
@@ -2094,3 +2097,58 @@ def test_marker_row_keeps_semantic_row_anchor(client):
     html = client.get("/queue").get_data(as_text=True)
     row = _row_for(html, 500001)
     assert 'data-ticket-id="500001"' in row.split('>', 1)[0]
+
+
+# --- Prompt 04: Freshdesk badge colors --------------------------------------
+
+def test_customer_responded_badge_uses_royal_blue_and_white_text(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert "--fd-customer-responded:#09218D" in html
+    assert "--fd-customer-responded-text:#FFFFFF" in html
+    assert ".b-responded{background:var(--fd-customer-responded);color:var(--fd-customer-responded-text)}" in html
+
+
+def test_waiting_on_customer_badge_uses_gold_and_dark_text(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert "--fd-waiting-customer:#E9AE3D" in html
+    assert "--fd-waiting-customer-text:#1A1A1A" in html
+    assert ".b-waiting{background:var(--fd-waiting-customer);color:var(--fd-waiting-customer-text)}" in html
+
+
+def test_last_opened_badge_treatment_differs_from_customer_responded(client):
+    # The LAST OPENED focus must NOT reuse the royal-blue #09218D treatment.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "--fd-last-opened:#6A1B9A" in html
+    assert ".b-responded{background:var(--fd-customer-responded)" in html
+    assert ".b-last-opened{background:var(--fd-last-opened)" in html
+    assert "--fd-last-opened:#6A1B9A" != "--fd-customer-responded:#09218D"
+
+
+def test_customer_responded_and_last_opened_coexist(client):
+    _open(client, 500001)  # 500001 carries the CUSTOMER RESPONDED attribute
+    html = client.get("/queue").get_data(as_text=True)
+    row = _row_for(html, 500001)
+    assert "rv-last-opened" in row.split('>', 1)[0]
+    assert ">LAST OPENED" in row
+    assert "b-responded" in row and ">CUSTOMER RESPONDED" in row
+    # Both badges are present on one row, with different background variables.
+    assert ".b-last-opened{background:var(--fd-last-opened)" in html
+    assert ".b-responded{background:var(--fd-customer-responded)" in html
+
+
+def test_waiting_on_customer_and_last_opened_coexist(client):
+    _open(client, 500003)  # 500003 carries the WAITING ON CUSTOMER attribute
+    html = client.get("/queue").get_data(as_text=True)
+    row = _row_for(html, 500003)
+    assert "rv-last-opened" in row.split('>', 1)[0]
+    assert ">LAST OPENED" in row
+    assert "b-waiting" in row and ">WAITING ON CUSTOMER" in row
+    assert ".b-last-opened{background:var(--fd-last-opened)" in html
+    assert ".b-waiting{background:var(--fd-waiting-customer)" in html
+
+
+def test_badge_texts_still_present(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert ">CUSTOMER RESPONDED" in html
+    assert ">WAITING ON CUSTOMER" in html
+    assert ">LAST OPENED" not in html  # no marker in a fresh session
