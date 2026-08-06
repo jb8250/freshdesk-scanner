@@ -507,6 +507,49 @@ with tempfile.TemporaryDirectory() as tmp:
 PY
 ok "filter panel polish renders correctly (Prompt07)"
 
+# Prompt08 - Closed Ticket Housekeeping foundation. Offline-only; request
+# functions are replaced before rendering so any external HTTP is a hard fail.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+from datetime import date
+import requests
+import app
+
+def blocked(*args, **kwargs):
+    raise AssertionError("external HTTP blocked")
+for name in ("get", "post", "put", "patch", "delete"):
+    setattr(requests, name, blocked)
+
+assert (app.CLOSED_STATUS, app.SEARCH_PAGE_SIZE, app.SEARCH_MAX_PAGE, app.SEARCH_MAX_RESULTS) == (5, 30, 10, 300)
+assert "tag:null" in app.closed_query_string(date(2026,1,1), date(2026,1,2), True)
+assert "tag:null" not in app.closed_query_string(date(2026,1,1), date(2026,1,2), False)
+def rows(n, day="2026-01-01"):
+    return [{"id":900000+i,"subject":"synthetic","status":5,"closed_at":day+"T12:00:00Z","tags":[]} for i in range(n)]
+def transport(items):
+    def page(window, missing, number):
+        got=[x for x in items if window.start <= date.fromisoformat(x["closed_at"][:10]) <= window.end]
+        return {"total":len(got),"results":got[(number-1)*30:number*30]}
+    return page
+fit=app.retrieve_closed_tickets(date(2026,1,1),date(2026,1,1),True,transport(rows(300)))
+assert fit.complete and fit.unique_ticket_count == 300 and max(p for _,p in fit.pages_requested) == 10
+split_rows=rows(151,"2026-01-01")+rows(150,"2026-01-02")
+for i,row in enumerate(split_rows): row["id"]=910000+i
+split=app.retrieve_closed_tickets(date(2026,1,1),date(2026,1,2),True,transport(split_rows))
+assert split.complete and split.unique_ticket_count == 301 and len(split.windows_planned) == 3
+single=app.retrieve_closed_tickets(date(2026,1,1),date(2026,1,1),True,transport(rows(301)))
+assert not single.complete and "More than 300" in single.errors[0]
+client=app.app.test_client()
+closed=client.get("/closed").get_data(as_text=True)
+queue=client.get("/queue").get_data(as_text=True)
+for text in ("Closed Ticket Housekeeping","OFFLINE MODE — Synthetic fixture data only","Missing Tags Only","aria-current=page"):
+    assert text in closed, text
+assert 'href="/closed"' in queue and 'aria-current="page">Review Queue' in queue
+assert 'target=_blank rel="noopener noreferrer"' in closed
+assert "review_result" not in closed
+assert ".top-nav" in app.CLOSED_HTML and "overflow-x:hidden" in app.CLOSED_HTML
+print("Prompt08 closed foundation checks: OK")
+PY
+ok "closed ticket housekeeping foundation renders safely (Prompt08)"
+
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"
 if [ -f "$KEY" ]; then

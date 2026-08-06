@@ -1048,10 +1048,10 @@ def test_refresh_link_does_not_bypass_cache(monkeypatch):
 
 
 def test_only_expected_routes_registered():
-    """MODIFIED: the dashboard adds two local review endpoints alongside
-    /queue. No other routes may exist (still no Mohawk/blend/upload)."""
+    """MODIFIED (Prompt08): closed housekeeping is a separate GET-only page;
+    queue review endpoints remain the only local write surface."""
     rules = {r.rule for r in app.app.url_map.iter_rules()}
-    assert rules == {"/queue", "/queue/api/review", "/queue/api/opened"}, f"unexpected routes: {rules}"
+    assert rules == {"/queue", "/closed", "/queue/api/review", "/queue/api/opened"}, f"unexpected routes: {rules}"
 
 
 def test_no_mohawk_or_upload_routes():

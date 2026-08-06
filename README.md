@@ -36,6 +36,18 @@ The page displays an `OFFLINE MODE` banner and synthetic fixture data. If fixtur
 
 The fixture file is `fixtures/fixtures.json`. It contains fake data only and must not be replaced with production data.
 
+## Closed Ticket Housekeeping
+
+`/closed` is a separate, **offline-only** foundation for finding synthetic closed tickets that may need tag housekeeping. Open `http://127.0.0.1:5050/closed` while `FRESHDESK_OFFLINE=1` is set.
+
+- Defaults: last 60 days and Missing Tags Only enabled (`/closed?days=60&missing_tags=1`).
+- The documented future retrieval strategy is Freshdesk Filter Tickets search: status `5` (Closed), optional `tag:null`, and an inclusive `closed_at` date range.
+- Search is limited to 30 results/page and 10 pages (300 results/query). The offline planner splits an over-limit calendar range deterministically, deduplicates ticket IDs, and reports completeness.
+- A single calendar date with over 300 results is explicitly incomplete; it is never presented as complete.
+- This milestone has no Freshdesk HTTP adapter, no Freshdesk writes, and no tag editing. A future live **read-only** pilot must validate the contract before any live retrieval is introduced.
+
+The public API contract used by this foundation is recorded in `docs/closed_housekeeping_api_contract.md`.
+
 ## Tests and validation
 
 ```bash

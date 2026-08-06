@@ -27,7 +27,10 @@ import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from math import ceil
+from typing import Callable, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -115,6 +118,19 @@ SCAN_STATUSES = [2, 6]  # Customer responded + Waiting on customer
 
 STATUS_LABELS = {2: "Customer responded", 3: "Pending", 4: "Resolved", 5: "Closed", 6: "Waiting on customer", 1: "Open"}
 PRIORITY_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
+
+# Freshdesk Filter Tickets API v2 contract, documented in
+# docs/closed_housekeeping_api_contract.md. This closed-housekeeping foundation
+# deliberately has no live HTTP adapter: all retrieval is fake/injectable.
+CLOSED_STATUS = 5
+SEARCH_PAGE_SIZE = 30
+SEARCH_MAX_PAGE = 10
+SEARCH_MAX_RESULTS = SEARCH_PAGE_SIZE * SEARCH_MAX_PAGE
+CLOSED_MAX_SPLIT_DEPTH = 20
+CLOSED_MAX_WINDOWS = 512
+CLOSED_DEFAULT_DAYS = 60
+CLOSED_MIN_DAYS = 1
+CLOSED_MAX_DAYS = 3650
 
 # ---------------------------------------------------------------------------
 # Dashboard filter configuration (URL-backed, documented defaults)
@@ -806,6 +822,195 @@ def fmt_due(due_str):
 
 
 # ---------------------------------------------------------------------------
+# Closed-ticket housekeeping: offline-only search simulation
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ClosedWindow:
+    start: date
+    end: date
+    depth: int = 0
+
+
+@dataclass
+class ClosedRetrieval:
+    tickets: list = field(default_factory=list)
+    complete: bool = True
+    warnings: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+    windows_planned: list = field(default_factory=list)
+    windows_completed: list = field(default_factory=list)
+    pages_requested: list = field(default_factory=list)
+    reported_total_sum: int = 0
+    unique_ticket_count: int = 0
+    duplicate_count: int = 0
+    date_range: tuple = None
+    missing_tags_only: bool = True
+    source_mode: str = "offline-synthetic"
+
+
+def parse_closed_days(value) -> int:
+    """Canonical positive integer day count; invalid values fail safely to 60."""
+    try:
+        if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value or "")):
+            raise ValueError
+        days = int(value)
+        if not CLOSED_MIN_DAYS <= days <= CLOSED_MAX_DAYS:
+            raise ValueError
+        return days
+    except (TypeError, ValueError):
+        return CLOSED_DEFAULT_DAYS
+
+
+def closed_filters_from_args(args):
+    # A hidden form field supplies 0 when the checkbox is unchecked; use the
+    # final value so checked 1 wins when Werkzeug exposes both values.
+    values = args.getlist("missing_tags") if hasattr(args, "getlist") else []
+    raw_missing = values[-1] if values else args.get("missing_tags", "1")
+    return {
+        "days": parse_closed_days(args.get("days", CLOSED_DEFAULT_DAYS)),
+        "missing_tags": parse_bool(raw_missing),
+    }
+
+
+def closed_query_string(start: date, end: date, missing_tags_only: bool) -> str:
+    """Build a fixed, quoted Freshdesk search query from validated dates only."""
+    if not isinstance(start, date) or not isinstance(end, date) or start > end:
+        raise ValueError("Closed date range is invalid.")
+    clauses = ["status:5"]
+    if missing_tags_only:
+        clauses.append("tag:null")
+    clauses += [f"closed_at:>'{start.isoformat()}'", f"closed_at:<'{end.isoformat()}'"]
+    return '"' + " AND ".join(clauses) + '"'
+
+
+def closed_search_url_params(start: date, end: date, missing_tags_only: bool, page: int):
+    if not isinstance(page, int) or not 1 <= page <= SEARCH_MAX_PAGE:
+        raise ValueError("Search page must be between 1 and 10.")
+    return urlencode({"query": closed_query_string(start, end, missing_tags_only), "page": page})
+
+
+def split_closed_window(window: ClosedWindow):
+    """Calendar midpoint split with one inclusive boundary overlap."""
+    if window.start >= window.end:
+        return None
+    midpoint = window.start + timedelta(days=(window.end - window.start).days // 2)
+    # Calendar ranges are partitioned, not overlapped, to guarantee a >300
+    # two-day range can reduce. Deduplication still protects against an API
+    # returning boundary duplicates in a future live transport.
+    return (ClosedWindow(window.start, midpoint, window.depth + 1),
+            ClosedWindow(midpoint + timedelta(days=1), window.end, window.depth + 1))
+
+
+def _closed_at_date(ticket):
+    raw = ticket.get("closed_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _synthetic_closed_tickets():
+    """Synthetic-only fixture corpus. Large cases are generated deterministically."""
+    base = [
+        {"id": 810001, "subject": "Synthetic closed untagged", "status": 5, "closed_at": "2026-08-04T09:00:00Z", "tags": []},
+        {"id": 810002, "subject": "Synthetic closed tagged", "status": 5, "closed_at": "2026-08-03T10:00:00Z", "tags": ["parts"]},
+        {"id": 810003, "subject": "Synthetic closed same timestamp low", "status": 5, "closed_at": "2026-08-02T10:00:00Z", "tags": []},
+        {"id": 810004, "subject": "Synthetic closed same timestamp high", "status": 5, "closed_at": "2026-08-02T10:00:00Z", "tags": []},
+        {"id": 810005, "subject": "Synthetic resolved excluded", "status": 4, "closed_at": "2026-08-01T10:00:00Z", "tags": []},
+        {"id": 810006, "subject": "Synthetic missing date", "status": 5, "tags": []},
+        {"id": 810007, "subject": "Synthetic malformed date", "status": 5, "closed_at": "not-a-date", "tags": []},
+        {"id": 810008, "subject": "Synthetic outside range", "status": 5, "closed_at": "2025-01-01T10:00:00Z", "tags": []},
+    ]
+    # 301 tickets across two dates proves planner splitting without a 300-row file.
+    for i in range(301):
+        # Spread across 301 calendar dates so a >300 range splits cleanly;
+        # custom fake transports cover the unsplittable single-day case.
+        day = date(2025, 10, 8) + timedelta(days=i)
+        base.append({"id": 820000 + i, "subject": f"Synthetic split ticket {i}", "status": 5,
+                     "closed_at": f"{day.isoformat()}T12:00:00Z", "tags": []})
+    return base
+
+
+def synthetic_closed_search_page(window: ClosedWindow, missing_tags_only: bool, page: int):
+    """Injectable GET-like page reader. It has no network or credential path."""
+    if page > SEARCH_MAX_PAGE:
+        raise ValueError("Synthetic transport refuses page 11.")
+    matches = []
+    for ticket in _synthetic_closed_tickets():
+        closed = _closed_at_date(ticket)
+        if ticket.get("status") != CLOSED_STATUS or closed is None:
+            continue
+        if missing_tags_only and ticket.get("tags"):
+            continue
+        if window.start <= closed <= window.end:
+            matches.append(ticket)
+    # Deliberate duplicate across pages/windows to exercise deduplication.
+    matches.sort(key=lambda t: t["id"])
+    start = (page - 1) * SEARCH_PAGE_SIZE
+    return {"total": len(matches), "results": matches[start:start + SEARCH_PAGE_SIZE]}
+
+
+def retrieve_closed_tickets(start: date, end: date, missing_tags_only: bool,
+                             search_page: Callable = synthetic_closed_search_page):
+    """Deterministic search planning. The transport returns dict(total, results)."""
+    result = ClosedRetrieval(date_range=(start, end), missing_tags_only=missing_tags_only)
+    pending = [ClosedWindow(start, end)]
+    seen = {}
+    while pending:
+        if len(result.windows_planned) >= CLOSED_MAX_WINDOWS:
+            result.complete = False; result.errors.append("Maximum date-window count reached."); break
+        window = pending.pop(0); result.windows_planned.append(window)
+        try:
+            first = search_page(window, missing_tags_only, 1)
+            if not isinstance(first, dict) or not isinstance(first.get("total"), int) or not isinstance(first.get("results"), list):
+                raise ValueError("Malformed search response: expected integer total and results list.")
+            total = first["total"]
+            if total < 0: raise ValueError("Malformed search response: negative total.")
+            result.reported_total_sum += total
+            if total > SEARCH_MAX_RESULTS:
+                children = split_closed_window(window)
+                if children is None:
+                    result.complete = False; result.errors.append("More than 300 matching tickets were closed on one date. This range cannot be fully retrieved through the Search Tickets page limit.")
+                    continue
+                if window.depth >= CLOSED_MAX_SPLIT_DEPTH:
+                    result.complete = False; result.errors.append("Maximum date-window split depth reached."); continue
+                pending[0:0] = children
+                continue
+            pages = ceil(total / SEARCH_PAGE_SIZE)
+            responses = [first]
+            result.pages_requested.append((window, 1))
+            for page in range(2, pages + 1):
+                result.pages_requested.append((window, page))
+                response = search_page(window, missing_tags_only, page)
+                if not isinstance(response, dict) or response.get("total") != total or not isinstance(response.get("results"), list):
+                    raise ValueError("Malformed or inconsistent search page response.")
+                responses.append(response)
+            received = [t for response in responses for t in response["results"]]
+            if len(received) < total:
+                raise ValueError("Search page ended before the reported total was retrieved.")
+            for ticket in received:
+                if not isinstance(ticket, dict) or not isinstance(ticket.get("id"), int):
+                    raise ValueError("Malformed ticket in search response.")
+                ticket_date = _closed_at_date(ticket)
+                if ticket.get("status") != CLOSED_STATUS or ticket_date is None or not window.start <= ticket_date <= window.end:
+                    result.complete = False; result.warnings.append("Ignored malformed or out-of-contract ticket from synthetic response."); continue
+                if missing_tags_only and ticket.get("tags"):
+                    continue
+                if ticket["id"] in seen: result.duplicate_count += 1
+                seen[ticket["id"]] = ticket
+            result.windows_completed.append(window)
+        except Exception as exc:
+            result.complete = False
+            result.errors.append(str(exc))
+    result.tickets = sorted(seen.values(), key=lambda t: (_closed_at_date(t), t["id"]), reverse=True)
+    result.unique_ticket_count = len(result.tickets)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -815,6 +1020,25 @@ def _queue_error_page(message, offline):
         tickets=[], total=0, offline=offline, cache_age=None,
         error=message, config=dict(DEFAULT_FILTERS), all_categories_off=False,
     )
+
+
+@app.route("/closed")
+def closed_housekeeping():
+    """Offline-only closed-ticket page. It cannot use the queue's live path."""
+    if not is_offline():
+        return _closed_render(error="Closed Ticket Housekeeping is offline-only in this milestone.", result=None,
+                              config=closed_filters_from_args(request.args)), 503
+    config = closed_filters_from_args(request.args)
+    # Local date is intentionally used for display range. Search predicates use
+    # explicit YYYY-MM-DD calendar dates; see the UTC caveat in the contract doc.
+    end = now_utc().date()
+    start = end - timedelta(days=config["days"] - 1)
+    try:
+        result = retrieve_closed_tickets(start, end, config["missing_tags"])
+        return _closed_render(result=result, config=config, error=None)
+    except Exception:
+        return _closed_render(result=None, config=config,
+                              error="Closed synthetic retrieval failed safely. No live fallback was attempted."), 500
 
 
 @app.route("/queue")
@@ -1088,6 +1312,7 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
  .rvform select{padding:4px 6px;font-size:12px;border:1px solid #bbb;border-radius:4px;max-width:150px}
  .foot{color:#999;font-size:11px;margin-top:10px}
 </style></head><body>
+<nav class="top-nav" aria-label="Dashboard pages"><a href="/queue" aria-current="page">Review Queue</a><a href="/closed">Closed Ticket Housekeeping</a></nav>
 <h1>Freshdesk Review Queue</h1>
 <div class=sub>{% if offline %}<strong>OFFLINE MODE</strong> — using mock/offline fixture data. No network access.{% else %}Live mode — read-only ticket list.{% endif %}
 {% if cache_age is not none %} · cache {{ cache_age }}s old{% endif %}</div>
@@ -1394,6 +1619,35 @@ setTimeout(function(){ location.reload(); }, 300000); // auto-refresh every 5 mi
 </script>
 </body></html>
 """
+
+
+CLOSED_HTML = """\
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Closed Ticket Housekeeping</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#202124;background:#f6f8fa}body{margin:auto;max-width:1120px;padding:18px;overflow-x:hidden}.top-nav{display:flex;gap:8px;border-bottom:1px solid #d0d7de;padding-bottom:12px}.top-nav a{padding:8px 10px;border-radius:5px;color:#1f5faa;text-decoration:none}.top-nav a[aria-current=page]{background:#1f5faa;color:#fff;font-weight:700}h1{margin-bottom:4px}.sub,.offline-banner{padding:10px 12px;border-radius:5px}.offline-banner{background:#fff3cd;border:1px solid #d6b864;margin:16px 0}.controls{display:flex;gap:14px;align-items:end;flex-wrap:wrap;background:#fff;border:1px solid #d0d7de;padding:14px;border-radius:7px}.presets{display:flex;gap:6px;flex-wrap:wrap}.presets a{padding:5px 8px;border:1px solid #9ab;border-radius:12px;text-decoration:none}.presets a[aria-current=page]{font-weight:700;background:#def}.actions{display:flex;gap:8px}button,.reset{padding:8px 10px;border:1px solid #456;border-radius:4px;background:#1f5faa;color:#fff;text-decoration:none}.reset{background:#fff;color:#234}.summary{font-weight:700}.complete{color:#176b35}.incomplete,.error{color:#8a1f1f;background:#fdecea;padding:10px;border-radius:5px}table{border-collapse:collapse;width:100%;background:#fff}th,td{padding:9px;text-align:left;border-bottom:1px solid #ddd;vertical-align:top}.badge{border-radius:9px;padding:2px 7px;font-size:.85em;background:#555;color:#fff}.missing{background:#8a1f1f}.tablewrap{overflow-x:auto}@media(max-width:500px){body{padding:10px}.controls{align-items:stretch}.actions{width:100%}.actions>*{flex:1;text-align:center}.top-nav{font-size:.9rem}}
+</style></head><body>
+<nav class=top-nav aria-label="Dashboard pages"><a href="/queue">Review Queue</a><a href="/closed" aria-current=page>Closed Ticket Housekeeping</a></nav>
+<h1>Closed Ticket Housekeeping</h1>
+<p class=sub>Find closed tickets that may need housekeeping, such as tickets with no tags.</p>
+<div class=offline-banner role=status><strong>OFFLINE MODE — Synthetic fixture data only</strong></div>
+<form class=controls method=get action=/closed novalidate>
+<label>Closed in last <input type=number name=days min=1 max=3650 value="{{ config.days }}" aria-label="Closed in last days"> days</label>
+<div class=presets role=group aria-label="Closed date presets">{% for d in [30,60,90,180,365] %}<a href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}</a>{% endfor %}</div>
+<input type=hidden name=missing_tags value=0><label><input type=checkbox name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags Only</label>
+<div class=actions><button type=submit>Apply Filters</button><a class=reset href="/closed?days=60&amp;missing_tags=1">Reset to Defaults</a></div>
+</form>
+{% if error %}<div class=error role=alert>{{ error }}</div>{% elif result %}
+<p class=summary>{{ result.unique_ticket_count }} unique closed tickets found · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
+{% for text in result.warnings %}<div class=incomplete role=status>{{ text }}</div>{% endfor %}{% for text in result.errors %}<div class=incomplete role=alert>{{ text }}</div>{% endfor %}
+{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th>Ticket ID</th><th>Subject</th><th>Status</th><th>Closed date</th><th>Current tags</th><th>Housekeeping</th><th>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr><td>{{t.id}}</td><td>{{t.subject}}</td><td><span class=badge>Closed</span></td><td>{{t.closed_at}}</td><td>{% if t.tags %}{{t.tags|join(', ')}}{% else %}No tags{% endif %}</td><td>{% if not t.tags %}<span class="badge missing">Missing Tags</span>{% endif %}</td><td><a href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p>No matching closed tickets were found.</p>{% endif %}
+{% endif %}</body></html>
+"""
+
+
+def _closed_render(**kwargs):
+    return render_template_string(CLOSED_HTML, offline=True, **kwargs)
 
 
 def _queue_render(**kwargs):
