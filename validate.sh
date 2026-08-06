@@ -545,10 +545,94 @@ for text in ("Closed Ticket Housekeeping","OFFLINE MODE — Synthetic fixture da
 assert 'href="/closed"' in queue and 'aria-current="page">Review Queue' in queue
 assert 'target=_blank rel="noopener noreferrer"' in closed
 assert "review_result" not in closed
-assert ".top-nav" in app.CLOSED_HTML and "overflow-x:hidden" in app.CLOSED_HTML
+assert ".top-nav" in app._SHARED_CSS and ".top-link" in app._SHARED_CSS
+assert "{{ shared_css|safe }}" in app.CLOSED_HTML
+assert "overflow-x:hidden" not in app.CLOSED_HTML
 print("Prompt08 closed foundation checks: OK")
 PY
 ok "closed ticket housekeeping foundation renders safely (Prompt08)"
+
+# Prompt09 - closed page theme alignment: shared application shell + nav.
+# Offline-only; network blocked so any external HTTP is a hard fail. Verifies
+# nav spacing/focus/aria-current on both pages, the shared theme, unchanged
+# queue + closed behavior, responsive CSS, and no page-level overflow.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import os
+import re
+import requests
+import app  # cwd is ROOT_DIR (validate.sh cd's there)
+
+def blocked(*args, **kwargs):
+    raise AssertionError("external HTTP blocked")
+for name in ("get", "post", "put", "patch", "delete"):
+    setattr(requests, name, blocked)
+
+client = app.app.test_client()
+queue = client.get("/queue").get_data(as_text=True)
+closed = client.get("/closed").get_data(as_text=True)
+
+def two_links(html):
+    return re.findall(r'<a class="top-link"[^>]*>.*?</a>', html)
+
+# 1. Shared navigation on both pages: exactly 2 links, correct spacing classes,
+#    correct destinations, correct aria-current per page, no separator char.
+for page, html in (("queue", queue), ("closed", closed)):
+    links = two_links(html)
+    assert len(links) == 2, f"{page}: expected 2 nav links, got {len(links)}"
+    assert set(re.findall(r'href="(/queue|/closed)"', html)) == {"/queue", "/closed"}
+active = re.search(r'<a class="top-link" href="([^"]+)" aria-current="page">', queue).group(1)
+assert active == "/queue", active
+active = re.search(r'<a class="top-link" href="([^"]+)" aria-current="page">', closed).group(1)
+assert active == "/closed", active
+assert ".top-nav" in app._SHARED_CSS and "gap:" in app._SHARED_CSS
+
+# 2. Shared theme on both pages (single app stylesheet, queue design tokens).
+for html in (queue, closed):
+    assert "background:#f5f5f5" in html and "max-width:1100px" in html
+    assert "#1a73e8" in html          # queue accent
+    assert "#1f5faa" not in html      # legacy closed accent absent
+    assert "#f6f8fa" not in html      # legacy closed bg absent
+    assert "@media (max-width:720px)" in html  # responsive CSS shared
+
+# 3. Queue functionality unchanged.
+assert "action=/queue" in queue and "Apply Filters" in queue and "Reset to Defaults" in queue
+assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in queue
+assert "Showing: Overdue + Missing Tags" in queue
+tok = re.search(r'name=csrf_token value="([^"]+)"', queue).group(1)
+r = client.post("/queue/api/review", data={
+    "csrf_token": tok, "ticket_id": "500001", "review_result": "Resolved",
+    "overdue": "0", "responded": "1", "waiting": "0",
+    "missing_tags": "0", "days": "7", "review_view": "completed",
+}, follow_redirects=False)
+loc = r.headers.get("Location", "")
+assert loc.startswith("/queue?"), loc
+assert loc.count("days=") == 1 and loc.count("review_view=") == 1, loc
+
+# 4. Closed functionality unchanged: columns, presets 30-365, offline refusal,
+#    missing-tags toggle, canonical URL/Enter-submit preserved.
+for col in ("Ticket ID", "Subject", "Status", "Closed date", "Current tags",
+            "Housekeeping", "Freshdesk ticket"):
+    assert col in closed, col
+for d in ("30", "60", "90", "180", "365"):
+    assert f"/closed?days={d}" in closed, f"preset {d}d missing"
+assert "OFFLINE MODE — Synthetic fixture data only" in closed
+assert "Missing Tags Only" in closed
+assert 'method=get action=/closed' in closed
+# days validation: out-of-range / non-numeric fails safely to the default (60),
+# in-range values round-trip (max is 3650).
+assert app.parse_closed_days("999999") == app.CLOSED_DEFAULT_DAYS
+assert app.parse_closed_days("0") == app.CLOSED_DEFAULT_DAYS
+assert app.parse_closed_days("abc") == app.CLOSED_DEFAULT_DAYS
+assert app.parse_closed_days("365") == 365
+assert app.parse_closed_days("3650") == 3650
+
+# 5. No page-level overflow: shared body max-width + table-local scroller only.
+assert "overflow-x:hidden" not in app.CLOSED_HTML
+assert "tablewrap" in closed
+
+print("Prompt09 theme/nav checks: OK")
+PY
+ok "closed page aligns with the queue theme and navigation is corrected (Prompt09)"
 
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"

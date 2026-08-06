@@ -1226,11 +1226,12 @@ def resolve_bind_host(host):
 # Dashboard template
 # ---------------------------------------------------------------------------
 
-QUEUE_HTML = """\
-<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>Freshdesk Review Queue</title>
-<style>
+# Shared application theme (design source of truth = the /queue theme).
+# Both QUEUE_HTML and CLOSED_HTML reference this single stylesheet so the two
+# pages share body background, content width, typography, navigation, panels,
+# buttons, form controls, tables, badges, links, focus-visible and responsive
+# breakpoints. Navigation is rendered by _nav_html(current).
+_SHARED_CSS = """
  :root{--fd-customer-responded:#09218D;--fd-customer-responded-text:#FFFFFF;--fd-waiting-customer:#E9AE3D;--fd-waiting-customer-text:#1A1A1A;--fd-last-opened:#6A1B9A;--fd-last-opened-text:#FFFFFF}
  body{font-family:system-ui,Arial,sans-serif;max-width:1100px;margin:auto;padding:16px;background:#f5f5f5;color:#222}
  h1{font-size:22px;margin:0 0 4px}
@@ -1265,7 +1266,7 @@ QUEUE_HTML = """\
  .view-field{display:inline-flex;align-items:center;gap:8px}
  .view-field label{font-size:13px;color:#444;white-space:nowrap}
  .controls select{padding:7px 10px;font-size:13px;border:1px solid #bdbdbd;border-radius:6px;background:#fff}
- .controls select:focus-visible{outline:2px solid #1a73e8;outline-offset:1px}
+ .controls select:focus-visible{outline:2px solid #1a73e8;outline-offset:2px}
  .action-buttons{display:inline-flex;gap:10px;flex-wrap:wrap;align-items:center}
  .controls button[type=submit]{padding:8px 18px;font-size:13px;font-weight:600;border:1px solid #1565c0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer}
  .controls button[type=submit]:hover{background:#1664d0}
@@ -1287,9 +1288,9 @@ QUEUE_HTML = """\
  tr.rv-na{background:#eeeeee}
  tr.rv-none{background:#e3f2fd}
  tr.rv-followup{background:#fff3e0}
-tr.rv-last-opened{outline:3px solid var(--fd-last-opened);outline-offset:-3px}
-tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
-.b-last-opened{background:var(--fd-last-opened);color:var(--fd-last-opened-text)}
+ tr.rv-last-opened{outline:3px solid var(--fd-last-opened);outline-offset:-3px}
+ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
+ .b-last-opened{background:var(--fd-last-opened);color:var(--fd-last-opened-text)}
  a.tid{font-weight:bold;color:#1565c0;text-decoration:none}
  a.tid:hover{text-decoration:underline}
  a.sbj{color:#222;text-decoration:none}
@@ -1304,6 +1305,7 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
  .b-missing{background:#757575;color:#fff}
  .b-sla{background:#e65100;color:#fff}
  .b-updated{background:#00838f;color:#fff}
+ .b-closed{background:#00838f;color:#fff}
  .toast{position:fixed;right:16px;bottom:16px;max-width:340px;background:#fdecea;border:1px solid #d66;color:#8a1f1f;padding:10px 14px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:99}
  .toast.hidden{display:none}
  .meta{color:#666;white-space:nowrap}
@@ -1311,9 +1313,41 @@ tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}
  .rvform{margin:0}
  .rvform select{padding:4px 6px;font-size:12px;border:1px solid #bbb;border-radius:4px;max-width:150px}
  .foot{color:#999;font-size:11px;margin-top:10px}
-</style></head><body>
-<nav class="top-nav" aria-label="Dashboard pages"><a href="/queue" aria-current="page">Review Queue</a><a href="/closed">Closed Ticket Housekeeping</a></nav>
+ .top-nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 18px;padding:0 0 12px;border-bottom:1px solid #d0d7de}
+ .top-link{display:inline-block;padding:7px 14px;font-size:13px;font-weight:600;color:#3c4043;background:#fff;border:1px solid #c6c9cf;border-radius:999px;text-decoration:none;white-space:nowrap}
+ .top-link:hover{border-color:#9aa0a6;background:#f1f3f4;color:#202124}
+ .top-link[aria-current=page]{background:#1a73e8;border-color:#1565c0;color:#fff}
+ .top-link:focus-visible{outline:2px solid #1a73e8;outline-offset:2px}
+ @media (max-width:500px){.top-nav{gap:6px}.top-link{white-space:normal;text-align:center;flex:1 1 auto}}
+"""
+
+
+def _nav_html(current):
+    """Shared top navigation (pill/tab style matching the queue theme).
+
+    Renders the two dashboard links with the active page marked via
+    aria-current=page. The .top-nav/.top-link rules live in _SHARED_CSS, so the
+    two links are visibly spaced (flex + gap) instead of running together.
+    """
+    def link(href, label, active):
+        attr = ' aria-current="page"' if active else ""
+        return '<a class="top-link" href="%s"%s>%s</a>' % (href, attr, label)
+    return (
+        '<nav class="top-nav" aria-label="Dashboard pages">'
+        + link("/queue", "Review Queue", current == "queue")
+        + link("/closed", "Closed Ticket Housekeeping", current == "closed")
+        + "</nav>"
+    )
+
+
+QUEUE_HTML = """\
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Freshdesk Review Queue</title>
+<style>{{ shared_css|safe }}</style></head><body>
+{{ nav|safe }}
 <h1>Freshdesk Review Queue</h1>
+
 <div class=sub>{% if offline %}<strong>OFFLINE MODE</strong> — using mock/offline fixture data. No network access.{% else %}Live mode — read-only ticket list.{% endif %}
 {% if cache_age is not none %} · cache {{ cache_age }}s old{% endif %}</div>
 
@@ -1625,29 +1659,51 @@ CLOSED_HTML = """\
 <!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Closed Ticket Housekeeping</title>
-<style>
-:root{font-family:system-ui,sans-serif;color:#202124;background:#f6f8fa}body{margin:auto;max-width:1120px;padding:18px;overflow-x:hidden}.top-nav{display:flex;gap:8px;border-bottom:1px solid #d0d7de;padding-bottom:12px}.top-nav a{padding:8px 10px;border-radius:5px;color:#1f5faa;text-decoration:none}.top-nav a[aria-current=page]{background:#1f5faa;color:#fff;font-weight:700}h1{margin-bottom:4px}.sub,.offline-banner{padding:10px 12px;border-radius:5px}.offline-banner{background:#fff3cd;border:1px solid #d6b864;margin:16px 0}.controls{display:flex;gap:14px;align-items:end;flex-wrap:wrap;background:#fff;border:1px solid #d0d7de;padding:14px;border-radius:7px}.presets{display:flex;gap:6px;flex-wrap:wrap}.presets a{padding:5px 8px;border:1px solid #9ab;border-radius:12px;text-decoration:none}.presets a[aria-current=page]{font-weight:700;background:#def}.actions{display:flex;gap:8px}button,.reset{padding:8px 10px;border:1px solid #456;border-radius:4px;background:#1f5faa;color:#fff;text-decoration:none}.reset{background:#fff;color:#234}.summary{font-weight:700}.complete{color:#176b35}.incomplete,.error{color:#8a1f1f;background:#fdecea;padding:10px;border-radius:5px}table{border-collapse:collapse;width:100%;background:#fff}th,td{padding:9px;text-align:left;border-bottom:1px solid #ddd;vertical-align:top}.badge{border-radius:9px;padding:2px 7px;font-size:.85em;background:#555;color:#fff}.missing{background:#8a1f1f}.tablewrap{overflow-x:auto}@media(max-width:500px){body{padding:10px}.controls{align-items:stretch}.actions{width:100%}.actions>*{flex:1;text-align:center}.top-nav{font-size:.9rem}}
+<style>{{ shared_css|safe }}
+ .complete{color:#176b35;font-weight:700}
+ .incomplete{color:#8a1f1f;background:#fdecea;border:1px solid #d66;border-radius:6px;padding:8px 12px;font-size:13px;margin:8px 0}
+ .closed-empty{color:#666;padding:24px 0;text-align:center;font-size:14px}
 </style></head><body>
-<nav class=top-nav aria-label="Dashboard pages"><a href="/queue">Review Queue</a><a href="/closed" aria-current=page>Closed Ticket Housekeeping</a></nav>
+{{ nav|safe }}
 <h1>Closed Ticket Housekeeping</h1>
 <p class=sub>Find closed tickets that may need housekeeping, such as tickets with no tags.</p>
-<div class=offline-banner role=status><strong>OFFLINE MODE — Synthetic fixture data only</strong></div>
-<form class=controls method=get action=/closed novalidate>
-<label>Closed in last <input type=number name=days min=1 max=3650 value="{{ config.days }}" aria-label="Closed in last days"> days</label>
-<div class=presets role=group aria-label="Closed date presets">{% for d in [30,60,90,180,365] %}<a href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}</a>{% endfor %}</div>
-<input type=hidden name=missing_tags value=0><label><input type=checkbox name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags Only</label>
-<div class=actions><button type=submit>Apply Filters</button><a class=reset href="/closed?days=60&amp;missing_tags=1">Reset to Defaults</a></div>
+<div class="banner" role=status><strong>OFFLINE MODE — Synthetic fixture data only</strong></div>
+<form class="controls" method=get action=/closed novalidate>
+  <div class="panel-region region-time">
+    <span class="days-field field"><span class=lbl>Closed in the last</span>
+      <input type=number name=days min=1 max=3650 value="{{ config.days }}" aria-label="Closed in last days">
+      <span class=lbl>days</span>
+    </span>
+    <div class=preset-group role=group aria-label="Closed date presets">
+      {% for d in [30, 60, 90, 180, 365] %}<a class=preset href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}d</a>{% endfor %}
+    </div>
+  </div>
+  <div class="panel-region region-groups">
+    <fieldset class=filter-group>
+      <legend class=group-lbl>Tags</legend>
+      <div class=field><label for=closed-missing><input type=hidden name=missing_tags value=0><input type=checkbox id=closed-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags Only</label></div>
+      <p class=field-hint>Show only closed tickets that have no tags.</p>
+    </fieldset>
+  </div>
+  <div class="panel-region region-actions">
+    <div class=action-buttons>
+      <button type=submit class=apply>Apply Filters</button>
+      <a class=reset href="/closed?days=60&amp;missing_tags=1" role=button aria-label="Reset to defaults">Reset to Defaults</a>
+    </div>
+  </div>
 </form>
-{% if error %}<div class=error role=alert>{{ error }}</div>{% elif result %}
-<p class=summary>{{ result.unique_ticket_count }} unique closed tickets found · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
+{% if error %}<div class="banner err" role=alert>{{ error }}</div>{% elif result %}
+<p class="filter-summary" role=status>{{ result.unique_ticket_count }} unique closed tickets found · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
 {% for text in result.warnings %}<div class=incomplete role=status>{{ text }}</div>{% endfor %}{% for text in result.errors %}<div class=incomplete role=alert>{{ text }}</div>{% endfor %}
-{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th>Ticket ID</th><th>Subject</th><th>Status</th><th>Closed date</th><th>Current tags</th><th>Housekeeping</th><th>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr><td>{{t.id}}</td><td>{{t.subject}}</td><td><span class=badge>Closed</span></td><td>{{t.closed_at}}</td><td>{% if t.tags %}{{t.tags|join(', ')}}{% else %}No tags{% endif %}</td><td>{% if not t.tags %}<span class="badge missing">Missing Tags</span>{% endif %}</td><td><a href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p>No matching closed tickets were found.</p>{% endif %}
+{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th scope=col>Ticket ID</th><th scope=col>Subject</th><th scope=col>Status</th><th scope=col>Closed date</th><th scope=col>Current tags</th><th scope=col>Housekeeping</th><th scope=col>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr><td><a class=tid href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open ticket #{{t.id}} in Freshdesk (new tab)">#{{t.id}}</a></td><td><a class=sbj href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open subject of ticket #{{t.id}} in Freshdesk (new tab)">{{t.subject}}</a></td><td>{% if t.status %}<span class="badge b-closed">{{t.status}}</span>{% else %}<span class="badge b-closed">Closed</span>{% endif %}</td><td>{{t.closed_at}}</td><td>{% if t.tags %}{{t.tags|join(', ')}}{% else %}<span class=meta>No tags</span>{% endif %}</td><td>{% if not t.tags %}<span class="badge b-missing">Missing Tags</span>{% else %}<span class=meta>—</span>{% endif %}</td><td><a href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class=closed-empty>No matching closed tickets were found.</p>{% endif %}
 {% endif %}</body></html>
 """
 
 
 def _closed_render(**kwargs):
-    return render_template_string(CLOSED_HTML, offline=True, **kwargs)
+    return render_template_string(
+        CLOSED_HTML, offline=True, shared_css=_SHARED_CSS,
+        nav=_nav_html("closed"), **kwargs)
 
 
 def _queue_render(**kwargs):
@@ -1655,6 +1711,8 @@ def _queue_render(**kwargs):
     ctx = dict(kwargs)
     cfg = ctx.get("config") or dict(DEFAULT_FILTERS)
     ctx.setdefault("config", cfg)
+    ctx.setdefault("shared_css", _SHARED_CSS)
+    ctx.setdefault("nav", _nav_html("queue"))
     ctx.setdefault("csrf_token", get_csrf_token())
     ctx.setdefault("flash", None)
     token = ctx["csrf_token"]

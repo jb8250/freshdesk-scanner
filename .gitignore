@@ -38,3 +38,6 @@ data/
 .pytest_cache/
 __pycache__/
 tests/__pycache__/
+
+# Browser smoke-test screenshots + scripts (Prompt09)
+artifacts/
