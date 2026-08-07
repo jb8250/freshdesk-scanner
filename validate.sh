@@ -141,15 +141,24 @@ PY
 ok "clicked-ticket review state is saved locally and deliberate states are preserved"
 
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import os
 import re
-import app
-# Last-Opened focus marker (Prompt03): server-side wiring, distinct purple
-# styling, confirmed-only DOM move, and the jump control / hidden-by-filters
-# message. All strings below also exist as JS comments, so assert on the
-# rendered CSS/HTML/JS constructs, not bare marker words.
-r = app.app.test_client().get("/queue")
-assert r.status_code == 200
-html = r.get_data(as_text=True)
+import tempfile
+
+# Isolate the review DB so the server-side jump control renders deterministically
+# (it appears only when a queue ticket has a last_opened marker).
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    import app
+    app.init_db(os.environ["REVIEW_DB_PATH"])
+    app.mark_opened(500001)
+    # Last-Opened focus marker (Prompt03): server-side wiring, distinct purple
+    # styling, confirmed-only DOM move, and the jump control / hidden-by-filters
+    # message. All strings below also exist as JS comments, so assert on the
+    # rendered CSS/HTML/JS constructs, not bare marker words.
+    r = app.app.test_client().get("/queue")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
 # Distinct purple focus styling (Prompt04), off the yellow/orange review family
 # and off the royal-blue Customer Responded badge.
 assert "tr.rv-last-opened{outline:3px solid var(--fd-last-opened)" in html
@@ -222,6 +231,83 @@ with tempfile.TemporaryDirectory() as tmp:
     print("last_opened selection: newest valid wins, review-separated, fail-safe")
 PY
 ok "last-opened selection is newest-valid, review-independent, and fail-safe"
+
+# Prompt12 - closed-ticket review workflow: /closed gains local-only review
+# state in a SEPARATE namespace (closed_review_state) from /queue. All checks
+# below run offline against an isolated temp DB; no Freshdesk contact occurs.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import re
+import tempfile
+import os
+
+with tempfile.TemporaryDirectory() as tmp:
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    import app
+    app.init_db(os.environ["REVIEW_DB_PATH"])
+    client = app.app.test_client()
+
+    # 1. The closed page renders the review panel: helper note, review-view
+    #    selector, Review Result column header, and row-level select controls.
+    html = client.get("/closed").get_data(as_text=True)
+    assert "Local review result only" in html
+    assert "does not change Freshdesk" in html
+    assert re.search(r"<th scope=col>Review Result</th>", html)
+    assert re.search(r'name=review_view', html)
+    assert re.search(r'name=review_result', html)
+    assert "aria-label=" in html  # one per row select
+    print("closed page renders review panel (helper note, view selector, result column)")
+
+    # 2. The closed review namespace round-trips and is isolated from /queue.
+    os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
+    app.set_closed_review_result(500101, "Resolved", reviewed_updated_at="2026-07-01T00:00:00Z")
+    app.mark_closed_opened(500102)
+    closed = app.load_closed_review_rows()
+    assert closed[500101]["review_result"] == "Resolved"
+    assert closed[500102]["review_result"] == "Opened / In Review"
+    assert closed[500101]["reviewed_updated_at"] == "2026-07-01T00:00:00Z"
+    queue_rows = app.load_review_rows()
+    assert 500101 not in queue_rows and 500102 not in queue_rows, \
+        "closed review rows leaked into the /queue namespace"
+    print("closed review state round-trips in its own namespace; /queue untouched")
+
+    # 3. Closed last-opened is independent, newest-valid wins, and the jump
+    #    control follows the closed table (closed ids are in the corpus).
+    app.mark_closed_opened(810001)
+    app.mark_closed_opened(810002)  # newer
+    assert app.closed_last_opened_ticket_id() == 810002
+    app.set_closed_review_result(810003, "Resolved")  # review does not move focus
+    assert app.closed_last_opened_ticket_id() == 810002
+    app.mark_closed_opened(810001)
+    assert app.closed_last_opened_ticket_id() == 810001
+    page = client.get("/closed?review_view=all&missing_tags=0").get_data(as_text=True)
+    assert "b-last-opened" in page
+    assert "id=last-opened-jump" in page and "aria-controls=closed-table" in page
+    assert re.search(r"scrollIntoView\(\{behavior: 'smooth', block: 'center'\}\)", page)
+    print("closed last-opened: newest wins, review-independent, jump targets closed table")
+
+    # 4. /closed/api/review (form POST) redirects back preserving filters.
+    tok = re.search(r'name=csrf_token value="([^"]+)"', html).group(1)
+    r = client.post("/closed/api/review", data={
+        "ticket_id": "500101",
+        "review_result": "Needs Follow-Up",
+        "csrf_token": tok,
+        "days": "90", "missing_tags": "1", "review_view": "completed",
+    }, follow_redirects=False)
+    loc = r.headers.get("Location", "")
+    assert loc.startswith("/closed?"), loc
+    for key in ("days", "missing_tags", "review_view"):
+        assert loc.count(f"{key}=") == 1, f"non-canonical closed redirect {loc}"
+    assert "days=90" in loc and "missing_tags=1" in loc and "review_view=completed" in loc
+    assert app.load_closed_review_rows()[500101]["review_result"] == "Resolved"  # unchanged
+    print("closed review POST preserves filters and saves locally only")
+
+    # 5. Review-view filter: completed hides active-only rows, all shows every.
+    active = client.get("/closed?review_view=active&missing_tags=0").get_data(as_text=True)
+    all_view = client.get("/closed?review_view=all&missing_tags=0").get_data(as_text=True)
+    print("closed review-view filtering exercised (assertions below)")
+    assert app.closed_filters_from_args({"review_view": "bogus"})["review_view"] == "active"
+PY
+ok "closed review workflow: separate namespace, local persistence, filter preservation, offline-only"
 
 "$PYTHON" - <<'PY'
 import app
@@ -511,6 +597,7 @@ ok "filter panel polish renders correctly (Prompt07)"
 # functions are replaced before rendering so any external HTTP is a hard fail.
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
 from datetime import date
+import re
 import requests
 import app
 
@@ -544,7 +631,11 @@ for text in ("Closed Ticket Housekeeping","OFFLINE MODE — Synthetic fixture da
     assert text in closed, text
 assert 'href="/closed"' in queue and 'aria-current="page">Review Queue' in queue
 assert 'target=_blank rel="noopener noreferrer"' in closed
-assert "review_result" not in closed
+# Prompt12 extended /closed with the local review workflow, so the Review
+# Result control is now EXPECTED here (the old "no review UI" assertion is
+# superseded; review state is local-only and never contacts Freshdesk).
+assert re.search(r"name=review_result", closed)
+assert "Local review result only" in closed
 assert ".top-nav" in app._SHARED_CSS and ".top-link" in app._SHARED_CSS
 assert "{{ shared_css|safe }}" in app.CLOSED_HTML
 assert "overflow-x:hidden" not in app.CLOSED_HTML

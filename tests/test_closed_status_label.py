@@ -85,7 +85,7 @@ def test_closed_badge_uses_shared_styling():
 
 def test_every_closed_row_uses_label_not_numeric():
     html = _html()
-    rows = re.findall(r'<td><a class=tid.*?</tr>', html)
+    rows = re.findall(r'<td><a class="?tid.*?</tr>', html)
     assert rows
     for row in rows:
         assert '<span class="badge b-closed">Closed</span>' in row

@@ -545,15 +545,40 @@ CREATE TABLE IF NOT EXISTS review_state (
 );
 """
 
+# Separate namespace for closed-ticket housekeeping reviews (Prompt 12). The
+# /closed page must never read or write /queue review_state rows. Columns mirror
+# review_state plus a closed_at snapshot of the source ticket.
+CLOSED_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS closed_review_state (
+    ticket_id           INTEGER PRIMARY KEY,
+    review_result       TEXT    NOT NULL DEFAULT 'Unreviewed',
+    first_opened_at     TEXT,
+    last_opened_at      TEXT,
+    last_review_change_at TEXT,
+    reviewed_updated_at TEXT,
+    closed_at_snapshot  TEXT,
+    note                TEXT    NOT NULL DEFAULT '',
+    created_at          TEXT    NOT NULL,
+    modified_at         TEXT    NOT NULL
+);
+"""
+
+# Tables the local-review SQL may target. The queue table and the closed table
+# stay fully separate; only the SQL layer is shared (parameterized statements
+# are always value-bound, and the table name comes from this fixed allowlist).
+_REVIEW_TABLES = ("review_state", "closed_review_state")
+
 
 def get_db_path():
     return os.environ.get("REVIEW_DB_PATH") or os.path.join(BASE_DIR, "data", "review_state.sqlite3")
 
 
 def init_db(path=None):
-    """Create the review-state database (and parent dir) if missing. Used by
-    tests and validate.sh with a temporary path; callers never need a live
-    database for offline development."""
+    """Create the review-state databases (and parent dir) if missing. Both
+    namespaces (queue review_state and closed_review_state) live in the same
+    SQLite file; each table is created idempotently. Used by tests and
+    validate.sh with a temporary path; callers never need a live database for
+    offline development."""
     db_path = path or get_db_path()
     parent = os.path.dirname(db_path)
     if parent:
@@ -561,6 +586,7 @@ def init_db(path=None):
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(SCHEMA_SQL)
+        conn.execute(CLOSED_SCHEMA_SQL)
         conn.commit()
     finally:
         conn.close()
@@ -575,12 +601,13 @@ def _db_conn():
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute(SCHEMA_SQL)
+    conn.execute(CLOSED_SCHEMA_SQL)
     conn.commit()
     return conn
 
 
 def load_review_rows():
-    """Return {ticket_id: row-dict} for every stored review state."""
+    """Return {ticket_id: row-dict} for every stored queue review state."""
     conn = _db_conn()
     try:
         rows = conn.execute("SELECT * FROM review_state").fetchall()
@@ -589,12 +616,24 @@ def load_review_rows():
         conn.close()
 
 
-def last_opened_ticket_id():
-    """Ticket id of the single most recently opened ticket, or None.
+def load_closed_review_rows():
+    """Return {ticket_id: row-dict} for every stored closed-ticket review
+    state. This is the /closed page's own namespace — queue review_state rows
+    are never read here."""
+    conn = _db_conn()
+    try:
+        rows = conn.execute("SELECT * FROM closed_review_state").fetchall()
+        return {r["ticket_id"]: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+
+def _last_opened_base(table: str):
+    """Shared Last Opened selection over one table (queue or closed).
 
     The Last Opened focus marker is derived from the newest valid
-    `last_opened_at` across review_state rows (spec §3/§6) — never from the
-    review result, so a ticket can be e.g. "Resolved + Last Opened" at the
+    `last_opened_at` across the table's rows (spec §3/§6) — never from the
+    review result, so a ticket can be e.g. \"Resolved + Last Opened\" at the
     same time. Selection is deterministic:
 
     - every stored last_opened_at is parsed as UTC; missing, empty, or
@@ -608,7 +647,7 @@ def last_opened_ticket_id():
     conn = _db_conn()
     try:
         rows = conn.execute(
-            "SELECT ticket_id, last_opened_at FROM review_state"
+            f"SELECT ticket_id, last_opened_at FROM {table}"
         ).fetchall()
     finally:
         conn.close()
@@ -625,20 +664,33 @@ def last_opened_ticket_id():
     return best[1] if best else None
 
 
-def _state_row(ticket_id):
+def last_opened_ticket_id():
+    """Ticket id of the single most recently opened QUEUE ticket, or None."""
+    return _last_opened_base("review_state")
+
+
+def closed_last_opened_ticket_id():
+    """Ticket id of the single most recently opened CLOSED ticket, or None."""
+    return _last_opened_base("closed_review_state")
+
+
+def _state_row(table: str, ticket_id):
     conn = _db_conn()
     try:
-        return conn.execute("SELECT * FROM review_state WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        return conn.execute(
+            f"SELECT * FROM {table} WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
     finally:
         conn.close()
 
 
-def mark_opened(ticket_id):
+def _mark_opened(table: str, ticket_id):
     """Record that a ticket link was opened. Pure local state — no Freshdesk
-    interaction.
+    interaction. Shared by the /queue and /closed pages; each page passes its
+    own table so the namespaces never mix.
 
     Review-result rule (dashboard spec §8): an Unreviewed ticket becomes
-    "Opened / In Review"; an already-opened ticket stays opened; deliberate
+    \"Opened / In Review\"; an already-opened ticket stays opened; deliberate
     states (Resolved, Not Applicable to Me, No Action Needed, Needs Follow-Up)
     are PRESERVED — re-opening a link must never silently erase a deliberate
     review result. first_opened_at is set once, last_opened_at always updates,
@@ -649,10 +701,12 @@ def mark_opened(ticket_id):
     now = iso_now()
     conn = _db_conn()
     try:
-        row = conn.execute("SELECT * FROM review_state WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO review_state (ticket_id, review_result, first_opened_at, last_opened_at,"
+                f"INSERT INTO {table} (ticket_id, review_result, first_opened_at, last_opened_at,"
                 " last_review_change_at, reviewed_updated_at, note, created_at, modified_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",
                 (ticket_id, "Opened / In Review", now, now, now, None, "", now, now),
@@ -667,7 +721,7 @@ def mark_opened(ticket_id):
                 result = current  # preserve deliberate/completed states
             changed = result != current
             conn.execute(
-                "UPDATE review_state SET review_result = ?, first_opened_at = ?,"
+                f"UPDATE {table} SET review_result = ?, first_opened_at = ?,"
                 " last_opened_at = ?, last_review_change_at = ?, modified_at = ? WHERE ticket_id = ?",
                 (result, first, now, now if changed else row["last_review_change_at"], now, ticket_id),
             )
@@ -677,19 +731,31 @@ def mark_opened(ticket_id):
         conn.close()
 
 
-def set_review_result(ticket_id, result, reviewed_updated_at=None):
-    """Save a local review result. `reviewed_updated_at` snapshots the ticket's
-    updated_at at review time for the Reviewed states; for Unreviewed / Opened
-    the snapshot is cleared so no stale flag can linger."""
+def mark_opened(ticket_id):
+    """Record that a QUEUE ticket link was opened (queue namespace)."""
+    return _mark_opened("review_state", ticket_id)
+
+
+def mark_closed_opened(ticket_id):
+    """Record that a CLOSED ticket link was opened (closed namespace)."""
+    return _mark_opened("closed_review_state", ticket_id)
+
+
+def _set_review_result(table: str, ticket_id, result, reviewed_updated_at=None):
+    """Shared local review-result save. `reviewed_updated_at` snapshots the
+    ticket's updated_at at review time for the Reviewed states; for Unreviewed
+    / Opened the snapshot is cleared so no stale flag can linger."""
+    if table not in _REVIEW_TABLES:
+        raise ValueError(f"unknown review table: {table!r}")
     if result not in REVIEW_STATES:
         raise ValueError(f"unknown review result: {result!r}")
     now = iso_now()
     conn = _db_conn()
     try:
-        row = conn.execute("SELECT * FROM review_state WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        row = conn.execute(f"SELECT * FROM {table} WHERE ticket_id = ?", (ticket_id,)).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO review_state (ticket_id, review_result, first_opened_at, last_opened_at,"
+                f"INSERT INTO {table} (ticket_id, review_result, first_opened_at, last_opened_at,"
                 " last_review_change_at, reviewed_updated_at, note, created_at, modified_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",
                 (ticket_id, result, None, None, now,
@@ -697,7 +763,7 @@ def set_review_result(ticket_id, result, reviewed_updated_at=None):
             )
         else:
             conn.execute(
-                "UPDATE review_state SET review_result = ?, last_review_change_at = ?,"
+                f"UPDATE {table} SET review_result = ?, last_review_change_at = ?,"
                 " reviewed_updated_at = ?, modified_at = ? WHERE ticket_id = ?",
                 (result, now,
                  reviewed_updated_at if result in REVIEWED_STATES else None,
@@ -706,6 +772,16 @@ def set_review_result(ticket_id, result, reviewed_updated_at=None):
         conn.commit()
     finally:
         conn.close()
+
+
+def set_review_result(ticket_id, result, reviewed_updated_at=None):
+    """Save a local QUEUE review result (queue namespace)."""
+    _set_review_result("review_state", ticket_id, result, reviewed_updated_at)
+
+
+def set_closed_review_result(ticket_id, result, reviewed_updated_at=None):
+    """Save a local CLOSED review result (closed namespace)."""
+    _set_review_result("closed_review_state", ticket_id, result, reviewed_updated_at)
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +819,25 @@ def review_view_includes(state_row, updated_flag, view):
     result = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
     if updated_flag:
         return view == "active"
+    if view == "active":
+        return result in ACTIVE_STATES
+    return result in COMPLETED_STATES
+
+
+def closed_review_view_includes(state_row, view):
+    """Closed-housekeeping review view membership (local only).
+
+    Active:    Unreviewed, Opened / In Review, Needs Follow-Up.
+    Completed: Resolved, Not Applicable to Me, No Action Needed.
+    All:       every local closed review state.
+
+    Always reflects the CLOSED review namespace (Prompt 12). The queue's
+    "UPDATED SINCE REVIEW" bounce-back does not apply here: /closed shows
+    housekeeping review state only, without the queue's updated_at flag.
+    """
+    if view == "all":
+        return True
+    result = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
     if view == "active":
         return result in ACTIVE_STATES
     return result in COMPLETED_STATES
@@ -889,6 +984,7 @@ def closed_filters_from_args(args):
     return {
         "days": parse_closed_days(args.get("days", CLOSED_DEFAULT_DAYS)),
         "missing_tags": parse_bool(raw_missing),
+        "review_view": parse_review_view(args.get("review_view")),
     }
 
 
@@ -901,6 +997,17 @@ def closed_query_string(start: date, end: date, missing_tags_only: bool) -> str:
         clauses.append("tag:null")
     clauses += [f"closed_at:>'{start.isoformat()}'", f"closed_at:<'{end.isoformat()}'"]
     return '"' + " AND ".join(clauses) + '"'
+
+
+def closed_page_url(config) -> str:
+    """Canonical /closed URL preserving days + missing_tags + review_view.
+
+    The review_view is a local dashboard filter only (it never appears in the
+    Freshdesk search query); keeping it here makes every /closed URL
+    bookmarkable and filter-preserving, exactly like /queue.
+    """
+    missing = "1" if config.get("missing_tags") else "0"
+    return f"/closed?days={config.get('days', CLOSED_DEFAULT_DAYS)}&missing_tags={missing}&review_view={config.get('review_view', 'active')}"
 
 
 def closed_search_url_params(start: date, end: date, missing_tags_only: bool, page: int):
@@ -1054,10 +1161,142 @@ def closed_housekeeping():
     start = end - timedelta(days=config["days"] - 1)
     try:
         result = retrieve_closed_tickets(start, end, config["missing_tags"])
-        return _closed_render(result=result, config=config, error=None)
     except Exception:
         return _closed_render(result=None, config=config,
                               error="Closed synthetic retrieval failed safely. No live fallback was attempted."), 500
+
+    # Closed-housekeeping local review state (Prompt 12) — separate namespace
+    # from /queue (closed_review_state table), applied after retrieval so the
+    # retrieval metadata (windows/pages/dupes/sorting) stays intact.
+    closed_rows = load_closed_review_rows()
+    closed_last_opened = closed_last_opened_ticket_id()
+    reviewed = []
+    for t in result.tickets:
+        tid = t["id"]
+        state_row = closed_rows.get(tid)
+        result_state = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
+        if not closed_review_view_includes(state_row, config["review_view"]):
+            continue
+        row_class = REVIEW_CLASS.get(result_state, "rv-unreviewed")
+        is_last_opened = closed_last_opened is not None and tid == closed_last_opened
+        if is_last_opened:
+            row_class += " rv-last-opened"
+        badges = []
+        badge_text = "OPENED / IN REVIEW" if result_state == "Opened / In Review" else result_state
+        badges.append(("review", badge_text, "b-review " + REVIEW_CLASS.get(result_state, "rv-unreviewed")))
+        if is_last_opened:
+            badges.append(("focus", "LAST OPENED", "b-last-opened"))
+        if not t.get("tags"):
+            badges.append(("attr", "MISSING TAGS", "b-missing"))
+        reviewed.append({
+            "id": tid,
+            "url": ticket_url(tid),
+            "subject": t.get("subject", ""),
+            "status": t.get("status"),
+            "closed_at": t.get("closed_at", ""),
+            "tags": t.get("tags") or [],
+            "result": result_state,
+            "row_class": row_class,
+            "last_opened": is_last_opened,
+            "badges": badges,
+        })
+    result.tickets = reviewed
+    flash_msg = session.pop("flash", None)
+    return _closed_render(
+        result=result, config=config, error=None, view_count=len(reviewed),
+        csrf_token=get_csrf_token(), flash=flash_msg,
+        review_states=REVIEW_STATES,
+        closed_last_opened=closed_last_opened,
+        last_opened_rendered=any(r["last_opened"] for r in reviewed),
+    )
+
+
+@app.route("/closed/api/review", methods=["POST"])
+def closed_review_api():
+    """Save a local closed-housekeeping review result (form POST). Redirects
+    back to the exact /closed view the user was on, preserving days,
+    missing_tags, and review_view. Never changes Freshdesk."""
+    if not is_offline():
+        return _closed_render(error="Closed Ticket Housekeeping is offline-only in this milestone.",
+                              result=None, config=dict(closed_filters_from_args(request.form))), 503
+    config = closed_filters_from_args(request.form)
+
+    def back_to_closed(msg, ok):
+        session["flash"] = ("ok" if ok else "err", msg)
+        return redirect(closed_page_url(config), code=303)
+
+    if not csrf_valid(request.form.get("csrf_token")):
+        return back_to_closed("Review not saved: invalid security token. Reload the page and try again.", False)
+
+    raw_ticket_id = request.form.get("ticket_id")
+    if raw_ticket_id is None or str(raw_ticket_id).strip() == "":
+        return back_to_closed("Review not saved: missing ticket ID.", False)
+    try:
+        ticket_id = int(raw_ticket_id)
+    except (TypeError, ValueError):
+        return back_to_closed("Review not saved: invalid ticket ID.", False)
+
+    result = request.form.get("review_result")
+    if result not in REVIEW_STATES:
+        return back_to_closed("Review not saved: unknown review result.", False)
+
+    # The ticket must belong to the closed corpus. No live lookup is ever
+    # attempted (offline mode), so an unknown id is rejected without network.
+    if not closed_ticket_known(ticket_id):
+        return back_to_closed(f"Review not saved: unknown ticket #{ticket_id}.", False)
+
+    try:
+        set_closed_review_result(ticket_id, result)
+    except Exception as e:
+        return back_to_closed(f"Review not saved: database error ({e}).", False)
+
+    return back_to_closed(f"Review saved for #{ticket_id}: {result}.", True)
+
+
+@app.route("/closed/api/opened", methods=["POST"])
+def closed_opened_api():
+    """Record that a closed ticket link was opened (JSON). Same contract as the
+    queue's opened endpoint: the click handler never prevents the new tab, so
+    the Freshdesk ticket always opens even if recording fails; the UI only
+    claims the save when this endpoint returns ok. Local state only."""
+    if not is_offline():
+        return jsonify({"ok": False, "error": "offline-only endpoint"}), 503
+    token = request.headers.get("X-CSRF-Token") or (request.get_json(silent=True) or {}).get("csrf_token")
+    if not csrf_valid(token):
+        return jsonify({"ok": False, "error": "invalid security token"}), 403
+
+    body = request.get_json(silent=True) or {}
+    raw_ticket_id = body.get("ticket_id")
+    if raw_ticket_id is None:
+        return jsonify({"ok": False, "error": "missing ticket_id"}), 400
+    try:
+        ticket_id = int(raw_ticket_id)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid ticket_id"}), 400
+
+    if not closed_ticket_known(ticket_id):
+        return jsonify({"ok": False, "error": "unknown ticket id"}), 404
+
+    try:
+        result = mark_closed_opened(ticket_id)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"database error: {e}"}), 500
+
+    return jsonify({
+        "ok": True,
+        "review_result": result,
+        "last_opened_id": closed_last_opened_ticket_id(),
+    })
+
+
+def closed_ticket_known(ticket_id):
+    """True when the ticket id belongs to the synthetic closed corpus (status 5).
+    Used by the closed review endpoints to reject unknown tickets safely
+    without any live-server or network interaction."""
+    return any(
+        t.get("status") == CLOSED_STATUS and t.get("id") == ticket_id
+        for t in _synthetic_closed_tickets()
+    )
 
 
 @app.route("/queue")
@@ -1682,10 +1921,12 @@ CLOSED_HTML = """\
  .complete{color:#176b35;font-weight:700}
  .incomplete{color:#8a1f1f;background:#fdecea;border:1px solid #d66;border-radius:6px;padding:8px 12px;font-size:13px;margin:8px 0}
  .closed-empty{color:#666;padding:24px 0;text-align:center;font-size:14px}
+ .review-note{color:#666;font-size:12px;margin-top:10px}
 </style></head><body>
 {{ nav|safe }}
 <h1>Closed Ticket Housekeeping</h1>
 <p class=sub>Find closed tickets that may need housekeeping, such as tickets with no tags.</p>
+{% if flash %}<div class="banner {{ 'ok' if flash[0] == 'ok' else 'err' }}" role=status>{{ flash[1] }}</div>{% endif %}
 <div class="banner" role=status><strong>OFFLINE MODE — Synthetic fixture data only</strong></div>
 <form class="controls" method=get action=/closed novalidate>
   <div class="panel-region region-time">
@@ -1694,7 +1935,7 @@ CLOSED_HTML = """\
       <span class=lbl>days</span>
     </span>
     <div class=preset-group role=group aria-label="Closed date presets">
-      {% for d in [30, 60, 90, 180, 365] %}<a class=preset href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}d</a>{% endfor %}
+      {% for d in [30, 60, 90, 180, 365] %}<a class=preset href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}&amp;review_view={{ config.review_view }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}d</a>{% endfor %}
     </div>
   </div>
   <div class="panel-region region-groups">
@@ -1703,26 +1944,219 @@ CLOSED_HTML = """\
       <div class=field><label for=closed-missing><input type=hidden name=missing_tags value=0><input type=checkbox id=closed-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags Only</label></div>
       <p class=field-hint>Show only closed tickets that have no tags.</p>
     </fieldset>
+    <fieldset class=filter-group>
+      <legend class=group-lbl>Review view</legend>
+      <div class=field><label for=closed-review-view><select id=closed-review-view name=review_view>
+        {% for v in ['active','completed','all'] %}<option value="{{ v }}" {{ 'selected' if config.review_view == v }}>{% if v == 'active' %}Active{% elif v == 'completed' %}Completed{% else %}All{% endif %}</option>{% endfor %}
+      </select></label></div>
+      <p class=field-hint>Active: Unreviewed · Opened / In Review · Needs Follow-Up · Completed: Resolved · N-A · No Action</p>
+    </fieldset>
   </div>
   <div class="panel-region region-actions">
     <div class=action-buttons>
       <button type=submit class=apply>Apply Filters</button>
-      <a class=reset href="/closed?days=60&amp;missing_tags=1" role=button aria-label="Reset to defaults">Reset to Defaults</a>
+      <a class=reset href="/closed?days=60&amp;missing_tags=1&amp;review_view=active" role=button aria-label="Reset to defaults">Reset to Defaults</a>
     </div>
   </div>
 </form>
+<p class=review-note>Local review result only — does not change Freshdesk.</p>
 {% if error %}<div class="banner err" role=alert>{{ error }}</div>{% elif result %}
-<p class="filter-summary" role=status>{{ result.unique_ticket_count }} unique closed tickets found · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
+<p class="filter-summary" role=status>{{ view_count }} of {{ result.unique_ticket_count }} unique closed tickets in {{ config.review_view }} view · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
 {% for text in result.warnings %}<div class=incomplete role=status>{{ text }}</div>{% endfor %}{% for text in result.errors %}<div class=incomplete role=alert>{{ text }}</div>{% endfor %}
-{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th scope=col>Ticket ID</th><th scope=col>Subject</th><th scope=col>Status</th><th scope=col>Closed date</th><th scope=col>Current tags</th><th scope=col>Housekeeping</th><th scope=col>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr><td><a class=tid href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open ticket #{{t.id}} in Freshdesk (new tab)">#{{t.id}}</a></td><td><a class=sbj href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open subject of ticket #{{t.id}} in Freshdesk (new tab)">{{t.subject}}</a></td><td><span class="badge b-closed">{{ status_label(t.status) }}</span></td><td>{{t.closed_at}}</td><td>{% if t.tags %}{{t.tags|join(', ')}}{% else %}<span class=meta>No tags</span>{% endif %}</td><td>{% if not t.tags %}<span class="badge b-missing">Missing Tags</span>{% else %}<span class=meta>—</span>{% endif %}</td><td><a href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class=closed-empty>No matching closed tickets were found.</p>{% endif %}
+{% if closed_last_opened is not none %}{% if last_opened_rendered %}<p class=last-opened-bar><button type=button id=last-opened-jump aria-controls=closed-table>Jump to Last Opened</button></p>{% else %}<div class="banner" id=last-opened-hidden role=status>Last opened ticket is hidden by the current filters.</div>{% endif %}{% endif %}
+{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th scope=col>Ticket ID</th><th scope=col>Subject</th><th scope=col>Status</th><th scope=col>Closed date</th><th scope=col>Current tags</th><th scope=col>Housekeeping</th><th scope=col>Review Result</th><th scope=col>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td><td><span class="badge b-closed">{{ status_label(t.status) }}</span></td><td>{{ t.closed_at }}</td><td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<span class=meta>No tags</span>{% endif %}</td><td><div class=badges>{% for kind, text, cls in t.badges if kind == 'attr' %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td><td><div class=badges>{% for kind, text, cls in t.badges if kind != 'attr' %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td><td><a href="{{ t.url }}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
+<script>
+var CSRF_TOKEN = {{ csrf_token_json | safe }};
+var REVIEW_CLASS = {
+  'Unreviewed': 'rv-unreviewed',
+  'Opened / In Review': 'rv-opened',
+  'Resolved': 'rv-resolved',
+  'Not Applicable to Me': 'rv-na',
+  'No Action Needed': 'rv-none',
+  'Needs Follow-Up': 'rv-followup'
+};
+function badgeText(result) { return result === 'Opened / In Review' ? 'OPENED / IN REVIEW' : result; }
+var toastEl = null;
+function showError(msg) {
+  if (!toastEl) {
+    toastEl = document.createElement('div');
+    toastEl.className = 'toast hidden';
+    toastEl.setAttribute('role', 'status');
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = msg;
+  toastEl.classList.remove('hidden');
+  clearTimeout(showError._t);
+  showError._t = setTimeout(function () { toastEl.classList.add('hidden'); }, 6000);
+}
+// The Last Opened focus marker is derived server-side from the newest valid
+// closed_last_opened_at and reported back by /closed/api/opened as
+// last_opened_id. On a confirmed save we move the marker in the DOM without
+// reloading (same mechanics as the /queue page; ids are per-page so both can
+// coexist).
+function moveLastOpened(newId) {
+  if (typeof newId === 'undefined' || newId === null) { return; }
+  ensureLastOpenedChrome();
+  document.querySelectorAll('.b-last-opened').forEach(function (b) {
+    b.parentNode.removeChild(b);
+  });
+  document.querySelectorAll('tr.rv-last-opened').forEach(function (r) {
+    r.classList.remove('rv-last-opened');
+  });
+  var target = document.querySelector('tr[data-ticket-id="' + newId + '"]');
+  var bar = document.querySelector('.last-opened-bar');
+  var hidden = document.getElementById('last-opened-hidden');
+  if (target) {
+    target.classList.add('rv-last-opened');
+    var badges = target.querySelector('.badges');
+    if (badges) {
+      var span = document.createElement('span');
+      span.className = 'badge b-last-opened';
+      span.textContent = 'LAST OPENED';
+      badges.appendChild(span);
+    }
+    if (bar) { bar.style.display = ''; }
+    if (hidden) { hidden.style.display = 'none'; }
+  } else {
+    if (bar) { bar.style.display = 'none'; }
+    if (hidden) { hidden.style.display = ''; }
+  }
+}
+function jumpToLastOpened() {
+  var row = document.querySelector('tr.rv-last-opened');
+  if (!row) { return; }
+  row.scrollIntoView({behavior: 'smooth', block: 'center'});
+  row.setAttribute('tabindex', '-1');
+  row.focus({preventScroll: true});
+  setTimeout(function () { row.removeAttribute('tabindex'); }, 1500);
+}
+function ensureLastOpenedChrome() {
+  if (!document.querySelector('.last-opened-bar')) {
+    var bar = document.createElement('p');
+    bar.className = 'last-opened-bar';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'last-opened-jump';
+    btn.setAttribute('aria-controls', 'closed-table');
+    btn.textContent = 'Jump to Last Opened';
+    bar.appendChild(btn);
+    var anchor = document.querySelector('.tablewrap') || document.body;
+    anchor.parentNode.insertBefore(bar, anchor);
+  }
+  if (!document.getElementById('last-opened-hidden')) {
+    var div = document.createElement('div');
+    div.className = 'banner';
+    div.id = 'last-opened-hidden';
+    div.setAttribute('role', 'status');
+    div.textContent = 'Last opened ticket is hidden by the current filters.';
+    var divAnchor = document.querySelector('.tablewrap') || document.body;
+    divAnchor.parentNode.insertBefore(div, divAnchor);
+  }
+}
+document.addEventListener('click', function (e) {
+  if (e.target && e.target.id === 'last-opened-jump') { jumpToLastOpened(); }
+});
+// Ticket-number and subject links both carry data-ticket-id. Default
+// navigation is never prevented: the Freshdesk tab opens synchronously and the
+// local state request runs in the background.
+document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
+  a.addEventListener('click', function () {
+    var tid = this.getAttribute('data-ticket-id');
+    if (!tid) { return; }
+    var row = this.closest('tr');
+    fetch('/closed/api/opened', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN},
+      body: JSON.stringify({ticket_id: tid})
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d && d.ok && d.review_result) {
+        var cls = REVIEW_CLASS[d.review_result] || 'rv-unreviewed';
+        if (row) {
+          var extra = [];
+          row.classList.forEach(function (c) { if (c.indexOf('rv-') !== 0) { extra.push(c); } });
+          row.className = extra.concat([cls]).join(' ');
+        }
+        var badge = row ? row.querySelector('.b-review') : null;
+        if (badge) { badge.className = 'badge b-review ' + cls; badge.textContent = badgeText(d.review_result); }
+        var sel = row ? row.querySelector('select[name=review_result]') : null;
+        if (sel && sel.querySelector('option[value="' + d.review_result + '"]')) { sel.value = d.review_result; }
+        moveLastOpened(d.last_opened_id);
+      } else {
+        showError('Could not save Opened / In Review state for #' + tid + ' (not saved).');
+      }
+    }).catch(function () {
+      showError('Could not save Opened / In Review state for #' + tid + ' (not saved).');
+    });
+  });
+});
+// Filter controls: canonicalize on submit. The closed form carries days +
+// missing_tags + review_view; unchecked checkboxes would be omitted by native
+// GET submission, so rebuild one canonical query string from live state.
+(function () {
+  var form = document.querySelector('form.controls');
+  if (!form) { return; }
+  function normDays(raw) {
+    var v = String(raw == null ? '' : raw).trim();
+    if (!/^[0-9]+$/.test(v)) { return 60; }
+    var n = parseInt(v, 10);
+    return (n >= 1 && n <= 3650) ? n : 60;
+  }
+  function normView(v) { return (v === 'completed' || v === 'all') ? v : 'active'; }
+  form.addEventListener('submit', function (e) {
+    try {
+      var params = {};
+      var chk = form.querySelector('input[name=missing_tags]');
+      params['missing_tags'] = chk && chk.checked ? '1' : '0';
+      var daysEl = form.querySelector('input[name=days]');
+      params['days'] = String(normDays(daysEl ? daysEl.value : null));
+      var viewEl = form.querySelector('select[name=review_view]');
+      params['review_view'] = normView(viewEl ? viewEl.value : 'active');
+      var parts = [];
+      ['missing_tags', 'days', 'review_view'].forEach(function (k) {
+        parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+      });
+      e.preventDefault();
+      window.location.href = '/closed?' + parts.join('&');
+    } catch (err) {
+      // On any unexpected error, fall back to native submission.
+    }
+  });
+  function syncControlsFromURL() {
+    var q = new URLSearchParams(window.location.search);
+    var mt = q.get('missing_tags') !== '0';
+    var mtEl = form.querySelector('input[name=missing_tags][value=1]');
+    if (mtEl) { mtEl.checked = mt; }
+    var d = q.get('days');
+    var daysEl = form.querySelector('input[name=days]');
+    if (daysEl) { daysEl.value = (/^[0-9]+$/.test(d || '') && parseInt(d, 10) >= 1) ? d : 60; }
+    var v = q.get('review_view');
+    var viewEl = form.querySelector('select[name=review_view]');
+    if (viewEl) { viewEl.value = (v === 'completed' || v === 'all') ? v : 'active'; }
+  }
+  window.addEventListener('pageshow', function () {
+    try { syncControlsFromURL(); } catch (err) {}
+  });
+})();
+</script>
 {% endif %}</body></html>
 """
 
 
 def _closed_render(**kwargs):
-    return render_template_string(
-        CLOSED_HTML, offline=True, shared_css=_SHARED_CSS,
-        nav=_nav_html("closed"), status_label=status_label, **kwargs)
+    """Render CLOSED_HTML with the shared context merged in."""
+    ctx = dict(kwargs)
+    ctx.setdefault("offline", True)
+    ctx.setdefault("shared_css", _SHARED_CSS)
+    ctx.setdefault("nav", _nav_html("closed"))
+    ctx.setdefault("status_label", status_label)
+    ctx.setdefault("csrf_token", get_csrf_token())
+    ctx.setdefault("csrf_token_json", json.dumps(ctx["csrf_token"]))
+    ctx.setdefault("review_states", REVIEW_STATES)
+    ctx.setdefault("flash", None)
+    ctx.setdefault("view_count", 0)
+    ctx.setdefault("closed_last_opened", None)
+    ctx.setdefault("last_opened_rendered", False)
+    return render_template_string(CLOSED_HTML, **ctx)
 
 
 def _queue_render(**kwargs):

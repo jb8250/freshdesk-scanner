@@ -1048,10 +1048,13 @@ def test_refresh_link_does_not_bypass_cache(monkeypatch):
 
 
 def test_only_expected_routes_registered():
-    """MODIFIED (Prompt08): closed housekeeping is a separate GET-only page;
-    queue review endpoints remain the only local write surface."""
+    """MODIFIED (Prompt08, Prompt12): closed housekeeping is a separate page;
+    closed review write endpoints (Prompt12) are local-only POST routes, added
+    to the expected surface alongside the queue review endpoints."""
     rules = {r.rule for r in app.app.url_map.iter_rules()}
-    assert rules == {"/queue", "/closed", "/queue/api/review", "/queue/api/opened"}, f"unexpected routes: {rules}"
+    assert rules == {"/queue", "/closed",
+                     "/queue/api/review", "/queue/api/opened",
+                     "/closed/api/review", "/closed/api/opened"}, f"unexpected routes: {rules}"
 
 
 def test_no_mohawk_or_upload_routes():

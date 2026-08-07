@@ -166,8 +166,10 @@ def test_offline_render_no_key_no_network(client, monkeypatch):
     for path in ("/queue", "/closed"):
         resp = client.get(path)
         assert resp.status_code == 200, path
-    # No Freshdesk write route exists for either page; /closed is GET-only.
+    # No Freshdesk write route exists for either page; /closed and its local
+    # review endpoints are offline-only POST routes, never touching Freshdesk.
     methods = {r.rule: sorted((r.methods or set()) - {"HEAD", "OPTIONS"})
                for r in app.app.url_map.iter_rules()}
     assert methods["/closed"] == ["GET"]
-    assert all(not r.rule.startswith("/closed/api") for r in app.app.url_map.iter_rules())
+    assert methods["/closed/api/review"] == ["POST"]
+    assert methods["/closed/api/opened"] == ["POST"]

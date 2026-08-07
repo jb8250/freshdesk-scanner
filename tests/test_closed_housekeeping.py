@@ -127,7 +127,9 @@ def test_closed_route_offline_default_and_controls(monkeypatch):
     for text in ("Closed Ticket Housekeeping", "OFFLINE MODE — Synthetic fixture data only", 'aria-current=page', 'href="/queue"', 'value="60"', "Missing Tags Only", "Reset to Defaults"):
         assert text in html
     assert 'target=_blank rel="noopener noreferrer"' in html
-    assert "review_result" not in html
+    # Prompt12: local review workflow is part of the closed page.
+    assert "review_result" in html
+    assert "Local review result only — does not change Freshdesk." in html
 
 
 def test_closed_route_invalid_and_toggle(monkeypatch):
