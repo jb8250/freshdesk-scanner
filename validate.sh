@@ -247,15 +247,25 @@ with tempfile.TemporaryDirectory() as tmp:
     client = app.app.test_client()
 
     # 1. The closed page renders the review panel: helper note, review-view
-    #    selector, Review Result column header, and row-level select controls.
+    #    selector, and row-level select controls. Prompt 13 aligned the
+    #    results table with /queue: compact Ticket | Subject | Review header
+    #    (no separate "Review Result" column any more — the select lives in
+    #    the Review column), metadata badges consolidated under the subject.
     html = client.get("/closed").get_data(as_text=True)
     assert "Local review result only" in html
     assert "does not change Freshdesk" in html
-    assert re.search(r"<th scope=col>Review Result</th>", html)
+    assert re.search(
+        r"<table id=closed-table>.*?<th scope=col>Ticket</th>"
+        r"<th scope=col>Subject</th><th scope=col>Review</th></tr>", html, re.S)
+    assert "<thead>" not in html, "closed table must use the queue's bare <tr> header"
+    assert ">Open ticket<" not in html, "no duplicate Freshdesk link column"
+    assert re.search(r">5<", html) is None, "raw status 5 must never be rendered"
+    assert "badge b-closed" in html and "badge b-date" in html and "badge b-review" in html
+    assert 'class="closed-tags"' in html
     assert re.search(r'name=review_view', html)
     assert re.search(r'name=review_result', html)
     assert "aria-label=" in html  # one per row select
-    print("closed page renders review panel (helper note, view selector, result column)")
+    print("closed table uses queue-style layout (Ticket|Subject|Review + metadata badges); select controls in place")
 
     # 2. The closed review namespace round-trips and is isolated from /queue.
     os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
@@ -699,11 +709,18 @@ loc = r.headers.get("Location", "")
 assert loc.startswith("/queue?"), loc
 assert loc.count("days=") == 1 and loc.count("review_view=") == 1, loc
 
-# 4. Closed functionality unchanged: columns, presets 30-365, offline refusal,
-#    missing-tags toggle, canonical URL/Enter-submit preserved.
-for col in ("Ticket ID", "Subject", "Status", "Closed date", "Current tags",
-            "Housekeeping", "Freshdesk ticket"):
-    assert col in closed, col
+# 4. Closed functionality unchanged: queue-style table layout (Prompt 13),
+#    presets 30-365, offline refusal, missing-tags toggle, canonical
+#    URL/Enter-submit preserved. The old wide columns (Ticket ID, Status,
+#    Closed date, Current tags, Housekeeping, Freshdesk ticket) are gone —
+#    the queue-aligned Ticket | Subject | Review header carries the same
+#    facts as badges/metadata in the Subject cell.
+assert "Closed Ticket Housekeeping" in closed
+assert re.search(r"<th scope=col>Ticket</th><th scope=col>Subject</th>"
+                 r"<th scope=col>Review</th></tr>", closed)
+assert "badge b-closed" in closed and "badge b-date" in closed
+assert "badge b-review" in closed and "badge b-missing" in closed
+assert "No tags" in closed  # untagged rows still labelled
 for d in ("30", "60", "90", "180", "365"):
     assert f"/closed?days={d}" in closed, f"preset {d}d missing"
 assert "OFFLINE MODE — Synthetic fixture data only" in closed

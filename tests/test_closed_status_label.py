@@ -70,11 +70,15 @@ def test_closed_table_status_cells_show_closed():
 
 
 def test_closed_table_never_shows_raw_5_in_status():
+    # Prompt 13 moved the b-closed badge out of its own column into the
+    # Subject cell's badge cluster, so the selector no longer scopes to a
+    # dedicated <td>. The guarantee is unchanged: the status badge reads
+    # "Closed", never the raw integer 5, and no raw 5 is rendered.
     html = _html()
-    status_cells = re.findall(r'<td><span class="badge b-closed">([^<]*)</span></td>', html)
-    assert status_cells
-    for cell in status_cells:
-        assert cell != "5"
+    status_badges = re.findall(r'<span class="badge b-closed">([^<]*)</span>', html)
+    assert status_badges
+    assert all(badge != "5" for badge in status_badges)
+    assert re.search(r">5<", html) is None, "raw status 5 must never be visible"
 
 
 def test_closed_badge_uses_shared_styling():

@@ -1148,6 +1148,18 @@ def _queue_error_page(message, offline):
     )
 
 
+def closed_display(value: str) -> str:
+    """ISO-8601 closed_at -> compact 'YYYY-MM-DD HH:MM' for the queue-style badge.
+
+    Presentation-only: the raw ISO value stays available in the ticket dict
+    (``closed_at``); this just makes the badge compact and scannable the way
+    /queue renders its date columns.
+    """
+    if not value:
+        return ""
+    return (value.replace("T", " ").replace("Z", "").rstrip())[:16]
+
+
 @app.route("/closed")
 def closed_housekeeping():
     """Offline-only closed-ticket page. It cannot use the queue's live path."""
@@ -1194,6 +1206,7 @@ def closed_housekeeping():
             "subject": t.get("subject", ""),
             "status": t.get("status"),
             "closed_at": t.get("closed_at", ""),
+            "closed_display": closed_display(t.get("closed_at", "")),
             "tags": t.get("tags") or [],
             "result": result_state,
             "row_class": row_class,
@@ -1564,6 +1577,7 @@ _SHARED_CSS = """
  .b-sla{background:#e65100;color:#fff}
  .b-updated{background:#00838f;color:#fff}
  .b-closed{background:#00838f;color:#fff}
+ .b-date{background:#00838f;color:#fff}
  .toast{position:fixed;right:16px;bottom:16px;max-width:340px;background:#fdecea;border:1px solid #d66;color:#8a1f1f;padding:10px 14px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:99}
  .toast.hidden{display:none}
  .meta{color:#666;white-space:nowrap}
@@ -1964,7 +1978,7 @@ CLOSED_HTML = """\
 <p class="filter-summary" role=status>{{ view_count }} of {{ result.unique_ticket_count }} unique closed tickets in {{ config.review_view }} view · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
 {% for text in result.warnings %}<div class=incomplete role=status>{{ text }}</div>{% endfor %}{% for text in result.errors %}<div class=incomplete role=alert>{{ text }}</div>{% endfor %}
 {% if closed_last_opened is not none %}{% if last_opened_rendered %}<p class=last-opened-bar><button type=button id=last-opened-jump aria-controls=closed-table>Jump to Last Opened</button></p>{% else %}<div class="banner" id=last-opened-hidden role=status>Last opened ticket is hidden by the current filters.</div>{% endif %}{% endif %}
-{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th scope=col>Ticket ID</th><th scope=col>Subject</th><th scope=col>Status</th><th scope=col>Closed date</th><th scope=col>Current tags</th><th scope=col>Housekeeping</th><th scope=col>Review Result</th><th scope=col>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td><td><span class="badge b-closed">{{ status_label(t.status) }}</span></td><td>{{ t.closed_at }}</td><td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<span class=meta>No tags</span>{% endif %}</td><td><div class=badges>{% for kind, text, cls in t.badges if kind == 'attr' %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td><td><div class=badges>{% for kind, text, cls in t.badges if kind != 'attr' %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td><td><a href="{{ t.url }}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
+{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption class=visually-hidden>Closed ticket search results</caption><tr><th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Review</th></tr>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a><div class="badges" style="margin-top:4px"><span class="badge b-closed">Closed</span><span class="badge b-date">{{ t.closed_display }}</span>{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div>{% if t.tags %}<div class="closed-tags" style="margin-top:4px">Tags: {{ t.tags|join(', ') }}</div>{% else %}<div class="closed-tags" style="margin-top:4px">No tags</div>{% endif %}</td><td><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td></tr>{% endfor %}</table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
 <script>
 var CSRF_TOKEN = {{ csrf_token_json | safe }};
 var REVIEW_CLASS = {

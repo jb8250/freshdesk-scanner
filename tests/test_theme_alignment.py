@@ -142,11 +142,28 @@ def test_queue_filters_and_review_still_work_after_theme(client, monkeypatch):
 
 
 def test_closed_route_columns_preserved(client, monkeypatch):
+    """Closed table renders the queue-style column layout (Prompt 13).
+
+    Previously this asserted the old eight independent columns (Ticket ID,
+    Subject, Status, Closed date, Current tags, Housekeeping, Freshdesk
+    ticket). That layout was the reason for Prompt 13: the /closed table now
+    mirrors the /queue component — Ticket | Subject | Review — with the
+    secondary facts consolidated into the Subject metadata/badge area. The
+    facts themselves are still preserved (see test_closed_table_alignment.py).
+    """
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     cl = _html(client, "/closed")
-    for col in ("Ticket ID", "Subject", "Status", "Closed date",
-                "Current tags", "Housekeeping", "Freshdesk ticket"):
-        assert col in cl, f"missing closed column {col}"
+    for col in ("<th scope=col>Ticket</th>", "<th scope=col>Subject</th>",
+                "<th scope=col>Review</th>"):
+        assert col in cl, f"missing queue-style closed column {col}"
+    for legacy in ("<th scope=col>Ticket ID</th>", "<th scope=col>Status</th>",
+                   "<th scope=col>Closed date</th>", "<th scope=col>Current tags</th>",
+                   "<th scope=col>Housekeeping</th>", "<th scope=col>Review Result</th>",
+                   "<th scope=col>Freshdesk ticket</th>"):
+        assert legacy not in cl, f"legacy closed column still present: {legacy}"
+    # The metadata the old columns carried is still rendered, consolidated.
+    assert "b-closed" in cl and "b-date" in cl and "b-review" in cl
+    assert 'name="review_result"' in cl or "name=review_result" in cl
 
 
 def test_external_links_safe_target_and_rel(client, monkeypatch):
