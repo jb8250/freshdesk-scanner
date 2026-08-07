@@ -634,6 +634,59 @@ print("Prompt09 theme/nav checks: OK")
 PY
 ok "closed page aligns with the queue theme and navigation is corrected (Prompt09)"
 
+# Prompt10 - Closed Status Label: the Status column shows the label "Closed"
+# (not the raw integer 5); 5 stays the internal/API filter & query value; other
+# / invalid / malformed statuses are never mislabelled "Closed"; /queue is
+# unchanged; network stays blocked so no external HTTP occurs; no secret or
+# SQLite file is tracked.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import re
+import requests
+import app  # cwd is ROOT_DIR (validate.sh cd's there)
+
+def blocked(*args, **kwargs):
+    raise AssertionError("external HTTP blocked in Prompt10")
+for name in ("get", "post", "put", "patch", "delete"):
+    setattr(requests, name, blocked)
+
+# 1. Centralised label mapping keys off the internal integer 5.
+assert app.status_label(5) == "Closed"
+assert app.status_label(app.CLOSED_STATUS) == "Closed"
+assert app.STATUS_LABELS[app.CLOSED_STATUS] == "Closed"
+# Other / invalid / malformed statuses are never labelled "Closed".
+for val in (4, 2, 6, 1, 0, None, "5", "nonsense", -1, True, 5.0):
+    assert app.status_label(val) != "Closed", (val, app.status_label(val))
+
+client = app.app.test_client()
+closed = client.get("/closed").get_data(as_text=True)
+
+# 2. Every rendered Status cell shows "Closed"; no raw 5 in a Status cell.
+cells = re.findall(r'<span class="badge b-closed">([^<]*)</span>', closed)
+assert cells, "no Status cells rendered"
+assert all(c == "Closed" for c in cells), cells
+for cell in re.findall(r'<td><span class="badge b-closed">([^<]*)</span></td>', closed):
+    assert cell != "5", cell
+# The Closed badge uses the shared application stylesheet.
+assert ".b-closed" in app._SHARED_CSS
+assert "badge b-closed" in app.CLOSED_HTML
+
+# 3. Internal filtering + query still use integer status 5.
+from datetime import date
+from app import closed_query_string
+assert "status:5" in closed_query_string(date(2026, 1, 1), date(2026, 1, 31), True)
+res = app.retrieve_closed_tickets(date(2025, 12, 25), date(2026, 8, 5), True)
+assert res.tickets and all(t["status"] == app.CLOSED_STATUS for t in res.tickets)
+# The status-4 fixture stays excluded from closed results.
+assert 810005 not in {t["id"] for t in res.tickets}
+
+# 4. /queue unchanged.
+queue = client.get("/queue").get_data(as_text=True)
+assert "Freshdesk Review Queue" in queue
+
+print("Prompt10 closed-status-label checks: OK")
+PY
+ok "closed page shows a Closed label and keeps 5 as the internal filter value (Prompt10)"
+
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"
 if [ -f "$KEY" ]; then

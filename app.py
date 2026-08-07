@@ -123,6 +123,25 @@ PRIORITY_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
 # docs/closed_housekeeping_api_contract.md. This closed-housekeeping foundation
 # deliberately has no live HTTP adapter: all retrieval is fake/injectable.
 CLOSED_STATUS = 5
+
+
+def status_label(value) -> str:
+    """Display a single ticket status value as text.
+
+    Only the integer CLOSED_STATUS (5) is labelled "Closed"; any other value —
+    another known integer status, an unknown number, a string, or a missing
+    value — renders its real label or a neutral fallback. It can never be
+    silently labelled "Closed", so invalid rows fail visibly instead of being
+    mislabelled. The integer status (5) remains the internal/API filter value;
+    this is presentation-only.
+    """
+    if value == CLOSED_STATUS and isinstance(value, int) and not isinstance(value, bool):
+        return STATUS_LABELS[CLOSED_STATUS]  # "Closed"
+    if isinstance(value, int) and not isinstance(value, bool) and value in STATUS_LABELS:
+        return STATUS_LABELS[value]
+    return "Unknown"
+
+
 SEARCH_PAGE_SIZE = 30
 SEARCH_MAX_PAGE = 10
 SEARCH_MAX_RESULTS = SEARCH_PAGE_SIZE * SEARCH_MAX_PAGE
@@ -1695,7 +1714,7 @@ CLOSED_HTML = """\
 {% if error %}<div class="banner err" role=alert>{{ error }}</div>{% elif result %}
 <p class="filter-summary" role=status>{{ result.unique_ticket_count }} unique closed tickets found · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
 {% for text in result.warnings %}<div class=incomplete role=status>{{ text }}</div>{% endfor %}{% for text in result.errors %}<div class=incomplete role=alert>{{ text }}</div>{% endfor %}
-{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th scope=col>Ticket ID</th><th scope=col>Subject</th><th scope=col>Status</th><th scope=col>Closed date</th><th scope=col>Current tags</th><th scope=col>Housekeeping</th><th scope=col>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr><td><a class=tid href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open ticket #{{t.id}} in Freshdesk (new tab)">#{{t.id}}</a></td><td><a class=sbj href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open subject of ticket #{{t.id}} in Freshdesk (new tab)">{{t.subject}}</a></td><td>{% if t.status %}<span class="badge b-closed">{{t.status}}</span>{% else %}<span class="badge b-closed">Closed</span>{% endif %}</td><td>{{t.closed_at}}</td><td>{% if t.tags %}{{t.tags|join(', ')}}{% else %}<span class=meta>No tags</span>{% endif %}</td><td>{% if not t.tags %}<span class="badge b-missing">Missing Tags</span>{% else %}<span class=meta>—</span>{% endif %}</td><td><a href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class=closed-empty>No matching closed tickets were found.</p>{% endif %}
+{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption>Closed ticket search results</caption><thead><tr><th scope=col>Ticket ID</th><th scope=col>Subject</th><th scope=col>Status</th><th scope=col>Closed date</th><th scope=col>Current tags</th><th scope=col>Housekeeping</th><th scope=col>Freshdesk ticket</th></tr></thead><tbody>{% for t in result.tickets %}<tr><td><a class=tid href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open ticket #{{t.id}} in Freshdesk (new tab)">#{{t.id}}</a></td><td><a class=sbj href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer" aria-label="Open subject of ticket #{{t.id}} in Freshdesk (new tab)">{{t.subject}}</a></td><td><span class="badge b-closed">{{ status_label(t.status) }}</span></td><td>{{t.closed_at}}</td><td>{% if t.tags %}{{t.tags|join(', ')}}{% else %}<span class=meta>No tags</span>{% endif %}</td><td>{% if not t.tags %}<span class="badge b-missing">Missing Tags</span>{% else %}<span class=meta>—</span>{% endif %}</td><td><a href="https://broadriverretail-help.freshdesk.com/a/tickets/{{t.id}}" target=_blank rel="noopener noreferrer">Open ticket</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class=closed-empty>No matching closed tickets were found.</p>{% endif %}
 {% endif %}</body></html>
 """
 
@@ -1703,7 +1722,7 @@ CLOSED_HTML = """\
 def _closed_render(**kwargs):
     return render_template_string(
         CLOSED_HTML, offline=True, shared_css=_SHARED_CSS,
-        nav=_nav_html("closed"), **kwargs)
+        nav=_nav_html("closed"), status_label=status_label, **kwargs)
 
 
 def _queue_render(**kwargs):
