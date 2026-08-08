@@ -17,7 +17,7 @@
 | Operators | `AND`, `OR`, and parentheses may group conditions. | The foundation only constructs fixed `AND` clauses; it does not accept raw query syntax. |
 | Quoting | The entire query string must be enclosed in a pair of double quotes and may be up to 512 characters. | The builder returns a quoted query and separately percent-encodes it for URL parameters. Date literals are single-quoted. |
 | URL encoding | The query must be URL encoded. | The builder uses `urllib.parse.urlencode`; no string concatenation with user query text is allowed. |
-| Pagination | A page has 30 objects. `page` starts at 1 and must not exceed 10. | Constants are `30`, `10`, and a 300-result per-query ceiling. The orchestrator never asks for page 11. |
+| Pagination | The search endpoint returns a fixed 30 objects per page. `page` starts at 1 and must not exceed 10. | The guarded probe sends only `page=1`; it deliberately does **not** send `per_page`, which is documented for the separate list-tickets endpoint, not this search endpoint. Constants are `30`, `10`, and a 300-result per-query ceiling. The orchestrator never asks for page 11. |
 | Count | Search response returns total result count with results. | Page 1 total drives page planning and split decisions. |
 | Indexing | Ticket updates can take a few minutes to be indexed and then become available through the API. | A future live result represents indexed search state, not a guaranteed real-time ticket state. |
 | Archived tickets | Archived tickets are not included in search results. | The feature cannot claim archived-ticket completeness. |
