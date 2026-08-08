@@ -48,6 +48,44 @@ The official Filter Tickets table describes `closed_at` as `YYYY-MM-DD`, while t
 
 No dormant real HTTP adapter is included. The only transport is an injectable synthetic fixture transport. Therefore the `/closed` implementation has no Freshdesk URL, authentication path, key read, or write-capable HTTP method. Offline mode has no possible live fallback.
 
+## List All Tickets endpoint — batch stats contract
+
+**Accessed:** 2026-08-08
+**Authoritative source reviewed:** [Freshdesk Developer Documentation — API v2, List All Tickets](https://developers.freshdesk.com/api/#list_all_tickets) and the API documentation's pagination and rate-limit sections. This document records public documentation only. No Freshdesk API endpoint was contacted for this section.
+
+| Contract item | Officially documented fact | Batch-probe use |
+|---|---|---|
+| Endpoint | `GET /api/v2/tickets` | Returns a JSON array of ticket objects. Used for one-page batch retrieval with stats. |
+| `include=stats` | Embedding stats via `?include=stats` "will return the ticket's `closed_at`, `resolved_at` and `first_responded_at` time." | Each ticket in the list response carries a nested `stats` dictionary when `include=stats` is sent. |
+| `per_page` | "The maximum number of objects that can be retrieved per page is 100. Invalid values and values greater than 100 will result in an error." | The batch probe forces `per_page=100`. |
+| `page` | "The page number starts with 1." | The batch probe forces `page=1` and does not request page 2. |
+| `updated_since` | `?updated_since=2015-01-19T02:00:00Z` | The batch probe sends `updated_since=2026-08-01T00:00:00Z` to scope results. |
+| `order_by` | Supported fields: `created_at`, `due_by`, `updated_at`, `status`. Default is `created_at`. | The batch probe forces `order_by=status`. |
+| `order_type` | Supported values: `asc`, `desc`. Default is `desc`. | The batch probe forces `order_type=desc`. |
+| Rate-limit cost | "Each include will consume an additional 2 credits. For example if you embed the stats information you will be charged a total of 3 API credits for the call." | The batch probe records `X-RateLimit-Used-CurrentRequest` from the response header; no additional capacity is purchased or enabled. |
+| Link header | "The 'link' header in the response will hold the next page url if exists." | The batch probe records whether a Link header is present and whether it indicates a next page, but never follows it. |
+| Default window | "By default, only tickets that have not been deleted or marked as spam will be returned." The 30-day default applies unless `updated_since` is used. | The batch probe sends `updated_since` to override the 30-day default. |
+
+### Key difference from Search Tickets
+
+List All Tickets does **not** support the same arbitrary query expression as `GET /api/v2/search/tickets?query=`. It supports predefined filters (`filter=new_and_my_open`, `watching`, `spam`, `deleted`), requester-based filters, and company-based filters, but not the `status:5 AND tag:null AND closed_at:>'...'` expression used by the search endpoint. Therefore, closed-status and missing-tags filtering must be applied **locally** to the list response, not via query parameters.
+
+### Local filtering criteria applied by the batch probe
+
+A ticket is kept when all of the following hold:
+
+1. `status == 5` (Closed)
+2. `tags` is an empty list `[]` (missing tags)
+3. `stats.closed_at` is present, non-null, a string, and parseable by `parse_dt()`
+
+For the local date-window aggregate, the probe additionally checks:
+
+```
+2026-08-01T00:00:00Z <= stats.closed_at < 2026-08-04T00:00:00Z
+```
+
+This represents calendar dates August 1 through August 3 inclusive. The request itself is never modified based on this date range; it is a post-response comparison only.
+
 ## Non-goals
 
 This milestone does not write tags, invoke `POST`, `PUT`, `PATCH`, or `DELETE`, access a Freshdesk tenant, test authentication, or follow ticket links.
