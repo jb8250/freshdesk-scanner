@@ -89,3 +89,46 @@ This represents calendar dates August 1 through August 3 inclusive. The request 
 ## Non-goals
 
 This milestone does not write tags, invoke `POST`, `PUT`, `PATCH`, or `DELETE`, access a Freshdesk tenant, test authentication, or follow ticket links.
+
+## Multi-page pagination and status-order stop rule
+
+**Accessed:** 2026-08-08 (Prompt 20)
+
+### Verified official documentation facts
+
+| Contract item | Officially documented fact | Pagination-probe use |
+|---|---|---|
+| `order_by=status` | Supported field, default `created_at`. | The probe forces `order_by=status` to group statuses contiguously. |
+| `order_type=desc` | Supported values `asc`, `desc`; default `desc`. | The probe forces `order_type=desc` so higher statuses sort first, placing status 5 (Closed) in a contiguous block. |
+| `page` | "The page number starts with 1." | The probe requests sequential pages 1..N (N ≤ 15). It does NOT follow the Link header URL directly; it constructs `page=<next>` from an incremented integer and validates that number. |
+| Link header | "The 'link' header in the response will hold the next page url if exists." | The presence/absence of a next-page Link is recorded per page. If state still needs more pages but no Link exists, the dataset is treated as exhausted and the probe stops successfully. |
+| Rate-limit headers | `X-RateLimit-Total`, `X-RateLimit-Remaining`, `X-RateLimit-Used-CurrentRequest` | The probe inspects `X-RateLimit-Remaining` before every next request. If remaining ≤ 40 (conservative floor), it stops without making the request. |
+
+### Status-desc ordering and the Closed block
+
+Because `order_by=status&order_type=desc` sorts by numeric status descending:
+
+- Statuses > 5 appear first
+- Status 5 (Closed) forms a contiguous block
+- Statuses < 5 appear after the Closed block
+
+**Key assumption to verify on live data:** If the sort is behaving consistently, once a response record has status < 5 after status 5 has been seen, no later page should contain status 5. The probe must validate this assumption by checking sort monotonicity (`previous_status >= current_status`) across ALL records and page boundaries — not blindly trust it.
+
+### Stop conditions (first match wins)
+
+1. Status block exited (first status < 5 seen after status 5 block) → stop after current page
+2. No next-page Link present → stop (dataset exhausted)
+3. Page 15 reached → stop (safety cap)
+4. `X-RateLimit-Remaining` ≤ 40 → stop (rate-limit safety floor)
+5. Sort violation detected → stop (early-stop not safe, review required)
+6. HTTP/JSON/transport error → stop immediately
+
+### Credential and safety constraints
+
+- GET only; no POST/PUT/PATCH/DELETE
+- No retries; one request per page; sequential pages only (no skips, no duplicates)
+- No View Ticket (`GET /api/v2/tickets/<id>`) calls
+- No Search Tickets (`/api/v2/search/tickets`) calls
+- No conversations, requester lookups, attachment requests, notes, or replies
+- TLS verification enforced; foreign redirects rejected
+- API key never output to logs, stdout, or stored in source/fixtures
