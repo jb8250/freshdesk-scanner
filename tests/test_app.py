@@ -57,6 +57,7 @@ from app import (
     paginate_tickets,
     parse_bool,
     parse_days,
+    parse_dt,
     parse_review_view,
     passes_filters,
     resolve_bind_host,
@@ -428,6 +429,24 @@ def test_mixed_ui_groups_and_helper_text(client):
 # ---------------------------------------------------------------------------
 # Filter parsing and URL configuration (new)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [
+    "2026-08-05T12:00:00",
+    "2026-08-05 12:00:00",
+])
+def test_parse_dt_rejects_timezone_less_timestamps(value):
+    """Naive datetimes cannot safely be compared with the UTC app clock."""
+    assert parse_dt(value) is None
+
+
+@pytest.mark.parametrize("value", [
+    "2026-08-05T12:00:00Z",
+    "2026-08-05T12:00:00+00:00",
+    "2026-08-05T08:00:00-04:00",
+])
+def test_parse_dt_accepts_offset_aware_timestamps(value):
+    assert parse_dt(value) is not None
 
 
 @pytest.mark.parametrize("value,expected", [

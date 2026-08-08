@@ -47,6 +47,9 @@ def clean_state(monkeypatch, tmp_path):
     monkeypatch.delenv("FRESHDESK_API_KEY", raising=False)
     monkeypatch.delenv("REVIEW_DB_PATH", raising=False)
     monkeypatch.setattr(scanner_app, "FRESHDESK_API_KEY", "")
+    # Tests must never consult an operator-provisioned external key file. This
+    # keeps missing-key behavior deterministic and prevents credential reads.
+    monkeypatch.setattr(scanner_app, "FRESHDESK_KEY_FILE", str(tmp_path / "absent_freshdesk_api_key"))
     monkeypatch.setattr(scanner_app, "CACHE_FILE", str(tmp_path / "fd_test_cache_isolated.json"))
     db_path = str(tmp_path / "review_state_test.sqlite3")
     monkeypatch.setenv("REVIEW_DB_PATH", db_path)

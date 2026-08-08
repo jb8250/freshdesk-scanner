@@ -198,13 +198,18 @@ def iso_now():
 
 
 def parse_dt(value):
-    """Parse an ISO-8601 timestamp with optional Z suffix. None on failure."""
+    """Parse an offset-aware ISO-8601 timestamp with optional Z suffix.
+
+    Timezone-less values are rejected so callers can fail closed instead of
+    comparing a naive datetime with the dashboard's UTC-aware timestamps.
+    """
     if not value or not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 # ---------------------------------------------------------------------------

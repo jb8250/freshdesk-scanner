@@ -5,7 +5,7 @@ Read-only Freshdesk triage page that surfaces tickets needing attention. No writ
 
 ## Stack
 - Python 3.11+
-- Flask (single route: `/queue`)
+- Flask dashboard routes: `/queue` and offline-only `/closed`, each with local review endpoints
 - `requests` for the eventual read-only Freshdesk list API call
 - pytest for offline tests
 - Local JSON fixtures for guaranteed offline development
@@ -31,7 +31,7 @@ Read-only Freshdesk triage page that surfaces tickets needing attention. No writ
 Set `FRESHDESK_OFFLINE=1`. The application then reads only `fixtures/fixtures.json`, displays an offline banner, never reads the API-key file, and never calls HTTP. Missing or malformed fixture data fails closed and cannot fall back to live mode.
 
 ## Caching
-- File: `cache/queue_cache.json`
+- File: `cache/tickets.json`
 - TTL: 30 minutes
 - Plain Refresh link reloads `/queue`; it does not bypass the cache (preserved behavior)
 
