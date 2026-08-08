@@ -1041,14 +1041,20 @@ def _closed_at_date(ticket):
 def _synthetic_closed_tickets():
     """Synthetic-only fixture corpus. Large cases are generated deterministically."""
     base = [
-        {"id": 810001, "subject": "Synthetic closed untagged", "status": 5, "closed_at": "2026-08-04T09:00:00Z", "tags": []},
-        {"id": 810002, "subject": "Synthetic closed tagged", "status": 5, "closed_at": "2026-08-03T10:00:00Z", "tags": ["parts"]},
-        {"id": 810003, "subject": "Synthetic closed same timestamp low", "status": 5, "closed_at": "2026-08-02T10:00:00Z", "tags": []},
-        {"id": 810004, "subject": "Synthetic closed same timestamp high", "status": 5, "closed_at": "2026-08-02T10:00:00Z", "tags": []},
+        # Prompt 14: closed rows render queue-style Updated / Created columns,
+        # so synthetic tickets carry updated_at/created_at (deterministic, from
+        # closed_at; never derived from the wall clock). 810006/810007 keep the
+        # missing/malformed closed-date coverage; 810006 also has NO
+        # updated_at/created_at on purpose so the safe em-dash display path is
+        # exercised end to end.
+        {"id": 810001, "subject": "Synthetic closed untagged", "status": 5, "closed_at": "2026-08-04T09:00:00Z", "updated_at": "2026-08-04T10:00:00Z", "created_at": "2026-07-20T09:00:00Z", "tags": []},
+        {"id": 810002, "subject": "Synthetic closed tagged", "status": 5, "closed_at": "2026-08-03T10:00:00Z", "updated_at": "2026-08-03T11:00:00Z", "created_at": "2026-07-15T09:00:00Z", "tags": ["parts"]},
+        {"id": 810003, "subject": "Synthetic closed same timestamp low", "status": 5, "closed_at": "2026-08-02T10:00:00Z", "updated_at": "2026-08-02T11:00:00Z", "created_at": "2026-07-10T09:00:00Z", "tags": []},
+        {"id": 810004, "subject": "Synthetic closed same timestamp high", "status": 5, "closed_at": "2026-08-02T10:00:00Z", "updated_at": "2026-08-02T11:30:00Z", "created_at": "2026-07-10T10:00:00Z", "tags": []},
         {"id": 810005, "subject": "Synthetic resolved excluded", "status": 4, "closed_at": "2026-08-01T10:00:00Z", "tags": []},
         {"id": 810006, "subject": "Synthetic missing date", "status": 5, "tags": []},
-        {"id": 810007, "subject": "Synthetic malformed date", "status": 5, "closed_at": "not-a-date", "tags": []},
-        {"id": 810008, "subject": "Synthetic outside range", "status": 5, "closed_at": "2025-01-01T10:00:00Z", "tags": []},
+        {"id": 810007, "subject": "Synthetic malformed date", "status": 5, "closed_at": "not-a-date", "updated_at": "2026-08-03T12:00:00Z", "created_at": "2026-07-18T09:00:00Z", "tags": []},
+        {"id": 810008, "subject": "Synthetic outside range", "status": 5, "closed_at": "2025-01-01T10:00:00Z", "updated_at": "2025-01-01T11:00:00Z", "created_at": "2024-12-01T09:00:00Z", "tags": []},
     ]
     # 301 tickets across two dates proves planner splitting without a 300-row file.
     for i in range(301):
@@ -1056,7 +1062,10 @@ def _synthetic_closed_tickets():
         # custom fake transports cover the unsplittable single-day case.
         day = date(2025, 10, 8) + timedelta(days=i)
         base.append({"id": 820000 + i, "subject": f"Synthetic split ticket {i}", "status": 5,
-                     "closed_at": f"{day.isoformat()}T12:00:00Z", "tags": []})
+                     "closed_at": f"{day.isoformat()}T12:00:00Z",
+                     "updated_at": f"{day.isoformat()}T13:00:00Z",
+                     "created_at": f"{(day - timedelta(days=30)).isoformat()}T09:00:00Z",
+                     "tags": []})
     return base
 
 
@@ -1149,15 +1158,20 @@ def _queue_error_page(message, offline):
 
 
 def closed_display(value: str) -> str:
-    """ISO-8601 closed_at -> compact 'YYYY-MM-DD HH:MM' for the queue-style badge.
+    """ISO-8601 closed_at -> compact 'YYYY-MM-DD HH:MM' (queue date-column style).
 
     Presentation-only: the raw ISO value stays available in the ticket dict
-    (``closed_at``); this just makes the badge compact and scannable the way
-    /queue renders its date columns.
+    (``closed_at``); this helper just makes the Closed column compact and
+    scannable the way /queue renders its date columns. Missing, empty, or
+    malformed values render as an em dash (the /queue date convention) rather
+    than a raw string, and never crash.
     """
     if not value:
-        return ""
-    return (value.replace("T", " ").replace("Z", "").rstrip())[:16]
+        return "—"
+    s = value.replace("T", " ").replace("Z", "").strip()
+    if len(s) < 10 or s[4] != "-" or s[7] != "-":
+        return "—"
+    return s[:16]
 
 
 @app.route("/closed")
@@ -1205,8 +1219,11 @@ def closed_housekeeping():
             "url": ticket_url(tid),
             "subject": t.get("subject", ""),
             "status": t.get("status"),
+            "status_label": STATUS_LABELS.get(t.get("status"), f"Status {t.get('status')}"),
             "closed_at": t.get("closed_at", ""),
             "closed_display": closed_display(t.get("closed_at", "")),
+            "updated_display": (t.get("updated_at") or "")[:16].replace("T", " ") or "—",
+            "created_display": (t.get("created_at") or "")[:10] or "—",
             "tags": t.get("tags") or [],
             "result": result_state,
             "row_class": row_class,
@@ -1577,7 +1594,6 @@ _SHARED_CSS = """
  .b-sla{background:#e65100;color:#fff}
  .b-updated{background:#00838f;color:#fff}
  .b-closed{background:#00838f;color:#fff}
- .b-date{background:#00838f;color:#fff}
  .toast{position:fixed;right:16px;bottom:16px;max-width:340px;background:#fdecea;border:1px solid #d66;color:#8a1f1f;padding:10px 14px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:99}
  .toast.hidden{display:none}
  .meta{color:#666;white-space:nowrap}
@@ -1686,9 +1702,8 @@ QUEUE_HTML = """\
 <caption class=visually-hidden>Freshdesk review queue</caption>
 <tr>
   <th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Status</th>
-  <th scope=col>Badges</th><th scope=col>Review</th><th scope=col>Priority</th>
-  <th scope=col>Due / SLA</th><th scope=col>Updated</th><th scope=col>Created</th>
-  <th scope=col>Tags</th><th scope=col>Type</th>
+  <th scope=col>Badges</th><th scope=col>Review</th><th scope=col>Due / SLA</th>
+  <th scope=col>Updated</th><th scope=col>Created</th><th scope=col>Tags</th>
 </tr>
 {% for t in tickets %}
 <tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}">
@@ -1711,12 +1726,10 @@ QUEUE_HTML = """\
       </select>
     </form>
   </td>
-  <td>{{ t.priority_label }}</td>
   <td class=meta>{{ t.due_display | safe }}</td>
   <td class=meta>{{ t.updated_display }}</td>
   <td class=meta>{{ t.created_display }}</td>
   <td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<em style=color:#bbb>none</em>{% endif %}</td>
-  <td>{{ t.type or '—' }}</td>
 </tr>
 {% endfor %}
 </table>
@@ -1978,7 +1991,11 @@ CLOSED_HTML = """\
 <p class="filter-summary" role=status>{{ view_count }} of {{ result.unique_ticket_count }} unique closed tickets in {{ config.review_view }} view · {% if result.missing_tags_only %}Missing Tags Only{% else %}All tag states{% endif %} · {{ result.date_range[0] }} to {{ result.date_range[1] }} · {{ result.windows_planned|length }} date windows · {{ result.pages_requested|length }} pages · {% if result.complete %}<span class=complete>Complete</span>{% else %}<span class=incomplete>Results incomplete</span>{% endif %}</p>
 {% for text in result.warnings %}<div class=incomplete role=status>{{ text }}</div>{% endfor %}{% for text in result.errors %}<div class=incomplete role=alert>{{ text }}</div>{% endfor %}
 {% if closed_last_opened is not none %}{% if last_opened_rendered %}<p class=last-opened-bar><button type=button id=last-opened-jump aria-controls=closed-table>Jump to Last Opened</button></p>{% else %}<div class="banner" id=last-opened-hidden role=status>Last opened ticket is hidden by the current filters.</div>{% endif %}{% endif %}
-{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption class=visually-hidden>Closed ticket search results</caption><tr><th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Review</th></tr>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a><div class="badges" style="margin-top:4px"><span class="badge b-closed">Closed</span><span class="badge b-date">{{ t.closed_display }}</span>{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div>{% if t.tags %}<div class="closed-tags" style="margin-top:4px">Tags: {{ t.tags|join(', ') }}</div>{% else %}<div class="closed-tags" style="margin-top:4px">No tags</div>{% endif %}</td><td><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td></tr>{% endfor %}</table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
+{% if result.tickets %}<div class=tablewrap><table id=closed-table><caption class=visually-hidden>Closed ticket search results</caption><tr>
+  <th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Status</th>
+  <th scope=col>Badges</th><th scope=col>Review</th><th scope=col>Closed</th>
+  <th scope=col>Updated</th><th scope=col>Created</th><th scope=col>Tags</th>
+</tr>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td><td>{{ t.status_label }}</td><td><div class=badges>{% if t.last_opened %}<span class="badge b-last-opened">LAST OPENED</span>{% endif %}{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td><td><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td><td class=meta>{{ t.closed_display }}</td><td class=meta>{{ t.updated_display }}</td><td class=meta>{{ t.created_display }}</td><td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<em style=color:#bbb>none</em>{% endif %}</td></tr>{% endfor %}</table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
 <script>
 var CSRF_TOKEN = {{ csrf_token_json | safe }};
 var REVIEW_CLASS = {

@@ -247,25 +247,32 @@ with tempfile.TemporaryDirectory() as tmp:
     client = app.app.test_client()
 
     # 1. The closed page renders the review panel: helper note, review-view
-    #    selector, and row-level select controls. Prompt 13 aligned the
-    #    results table with /queue: compact Ticket | Subject | Review header
-    #    (no separate "Review Result" column any more — the select lives in
-    #    the Review column), metadata badges consolidated under the subject.
+    #    selector, and row-level select controls. Prompt 14 restored the
+    #    queue-parity nine-column table (Ticket | Subject | Status | Badges |
+    #    Review | Closed | Updated | Created | Tags) — the Prompt-13 compact
+    #    Ticket | Subject | Review layout and its under-Subject metadata
+    #    cluster are gone. Priority is removed from both tables.
     html = client.get("/closed").get_data(as_text=True)
     assert "Local review result only" in html
     assert "does not change Freshdesk" in html
     assert re.search(
-        r"<table id=closed-table>.*?<th scope=col>Ticket</th>"
-        r"<th scope=col>Subject</th><th scope=col>Review</th></tr>", html, re.S)
+        r"<table id=closed-table>.*?<th scope=col>Ticket</th>.*?"
+        r"<th scope=col>Subject</th>.*?<th scope=col>Status</th>.*?"
+        r"<th scope=col>Badges</th>.*?<th scope=col>Review</th>.*?"
+        r"<th scope=col>Closed</th>.*?<th scope=col>Updated</th>.*?"
+        r"<th scope=col>Created</th>.*?<th scope=col>Tags</th>.*?</tr>", html, re.S)
     assert "<thead>" not in html, "closed table must use the queue's bare <tr> header"
     assert ">Open ticket<" not in html, "no duplicate Freshdesk link column"
     assert re.search(r">5<", html) is None, "raw status 5 must never be rendered"
-    assert "badge b-closed" in html and "badge b-date" in html and "badge b-review" in html
-    assert 'class="closed-tags"' in html
+    assert "badge b-review" in html and "badge b-last-opened" in html
+    assert "closed-tags" not in html, "Prompt-13 under-Subject tags line must be gone"
+    assert "<td>Closed</td>" in html, "Status column must spell Closed"
+    assert "2026-08-04 09:00" in html, "Closed column must show compact, non-ISO date"
+    assert '<em style=color:#bbb>none</em>' in html, "queue-style no-tags token required"
     assert re.search(r'name=review_view', html)
     assert re.search(r'name=review_result', html)
     assert "aria-label=" in html  # one per row select
-    print("closed table uses queue-style layout (Ticket|Subject|Review + metadata badges); select controls in place")
+    print("closed table uses queue-parity 9 columns (no Priority; Status/Closed/Updated/Created/Tags in dedicated columns)")
 
     # 2. The closed review namespace round-trips and is isolated from /queue.
     os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
@@ -709,18 +716,22 @@ loc = r.headers.get("Location", "")
 assert loc.startswith("/queue?"), loc
 assert loc.count("days=") == 1 and loc.count("review_view=") == 1, loc
 
-# 4. Closed functionality unchanged: queue-style table layout (Prompt 13),
-#    presets 30-365, offline refusal, missing-tags toggle, canonical
-#    URL/Enter-submit preserved. The old wide columns (Ticket ID, Status,
-#    Closed date, Current tags, Housekeeping, Freshdesk ticket) are gone —
-#    the queue-aligned Ticket | Subject | Review header carries the same
-#    facts as badges/metadata in the Subject cell.
+# 4. Closed functionality unchanged: queue-parity nine-column layout
+#    (Prompt 14), presets 30-365, offline refusal, missing-tags toggle,
+#    canonical URL/Enter-submit preserved. The old wide columns (Ticket ID,
+#    Status, Closed date, Current tags, Housekeeping, Freshdesk ticket) and
+#    the Prompt-13 under-Subject metadata cluster are gone — every fact sits
+#    in its own queue-style column.
 assert "Closed Ticket Housekeeping" in closed
-assert re.search(r"<th scope=col>Ticket</th><th scope=col>Subject</th>"
-                 r"<th scope=col>Review</th></tr>", closed)
-assert "badge b-closed" in closed and "badge b-date" in closed
+assert re.search(r"<th scope=col>Ticket</th>.*?<th scope=col>Subject</th>"
+                 r".*?<th scope=col>Status</th>.*?<th scope=col>Badges</th>"
+                 r".*?<th scope=col>Review</th>.*?<th scope=col>Closed</th>"
+                 r".*?<th scope=col>Updated</th>.*?<th scope=col>Created</th>"
+                 r".*?<th scope=col>Tags</th>.*?</tr>", closed, re.S)
 assert "badge b-review" in closed and "badge b-missing" in closed
-assert "No tags" in closed  # untagged rows still labelled
+assert "<td>Closed</td>" in closed  # Status column spells "Closed"
+assert '<em style=color:#bbb>none</em>' in closed  # queue-style no-tags token
+assert "not-a-date" not in closed and "T09:00:00Z" not in closed  # no raw ISO leak
 for d in ("30", "60", "90", "180", "365"):
     assert f"/closed?days={d}" in closed, f"preset {d}d missing"
 assert "OFFLINE MODE — Synthetic fixture data only" in closed
@@ -769,14 +780,16 @@ client = app.app.test_client()
 closed = client.get("/closed").get_data(as_text=True)
 
 # 2. Every rendered Status cell shows "Closed"; no raw 5 in a Status cell.
-cells = re.findall(r'<span class="badge b-closed">([^<]*)</span>', closed)
-assert cells, "no Status cells rendered"
-assert all(c == "Closed" for c in cells), cells
-for cell in re.findall(r'<td><span class="badge b-closed">([^<]*)</span></td>', closed):
-    assert cell != "5", cell
-# The Closed badge uses the shared application stylesheet.
+#    Prompt 14 parity: the label renders as the queue-style plain cell
+#    (<td>Closed</td>), not the Prompt-10/13 b-closed badge.
+rows = re.findall(r'<tr class="[^"]*" data-ticket-id="\d+">', closed)
+assert rows, "no Status cells rendered"
+status_cells = re.findall(r"<td>Closed</td>", closed)
+assert len(status_cells) == len(rows), (len(status_cells), len(rows))
+assert re.search(r">5<", closed) is None
+# The label mapping and the shared stylesheet class both stay.
 assert ".b-closed" in app._SHARED_CSS
-assert "badge b-closed" in app.CLOSED_HTML
+assert "<td>{{ t.status_label }}</td>" in app.CLOSED_HTML
 
 # 3. Internal filtering + query still use integer status 5.
 from datetime import date
@@ -794,6 +807,69 @@ assert "Freshdesk Review Queue" in queue
 print("Prompt10 closed-status-label checks: OK")
 PY
 ok "closed page shows a Closed label and keeps 5 as the internal filter value (Prompt10)"
+
+# Prompt14 - Table Structure Parity: /queue and /closed share one nine-column
+# skeleton (Ticket | Subject | Status | Badges | Review | Date | Updated |
+# Created | Tags); the only intentional difference is the sixth column
+# ("Due / SLA" on /queue, "Closed" on /closed). Priority is gone from the
+# visible tables on both pages (underlying priority data stays internal).
+# Offline-only; network is blocked; no API-key read; no tracked sqlite file.
+FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
+import re
+import requests
+import app
+
+def blocked(*args, **kwargs):
+    raise AssertionError("external HTTP blocked in Prompt14")
+for name in ("get", "post", "put", "patch", "delete"):
+    setattr(requests, name, blocked)
+
+client = app.app.test_client()
+q = client.get("/queue").get_data(as_text=True)
+c = client.get("/closed").get_data(as_text=True)
+
+def headers(html):
+    return re.findall(r"<th scope=col>([^<]+)</th>", html)
+
+QUEUE = ["Ticket", "Subject", "Status", "Badges", "Review", "Due / SLA",
+         "Updated", "Created", "Tags"]
+CLOSED = ["Ticket", "Subject", "Status", "Badges", "Review", "Closed",
+          "Updated", "Created", "Tags"]
+
+# 1. Exactly 9 visible columns, in the documented order, on both pages.
+assert headers(q) == QUEUE, headers(q)
+assert headers(c) == CLOSED, headers(c)
+
+# 2. Priority (and the extra Type column the queue markup actually had) is
+#    absent from both visible tables.
+assert "Priority" not in q and "priority" not in q.lower()
+assert "Priority" not in c and "priority" not in c.lower()
+assert "<th scope=col>Type</th>" not in q
+
+# 3. Pairwise parity except index 5 (Due / SLA <-> Closed).
+for i in range(9):
+    if i == 5:
+        assert (QUEUE[i], CLOSED[i]) == ("Due / SLA", "Closed")
+    else:
+        assert QUEUE[i] == CLOSED[i] and headers(q)[i] == headers(c)[i] == QUEUE[i]
+
+# 4. Every data row has exactly one cell per header on both pages.
+for html, name in ((q, "queue"), (c, "closed")):
+    rows = re.findall(r'<tr class="[^"]*" data-ticket-id="\d+">.*?</tr>', html, re.S)
+    assert rows, f"no rows on {name}"
+    for row in rows:
+        ntd = len(re.findall(r"<td(?:\s[^>]*)?>", row))
+        assert ntd == 9, (name, ntd)
+
+# 5. Closed dates render in the Closed column as compact queue-style dates
+#    (never raw ISO), and both tables place the review select identically.
+assert re.search(r"<td class=meta>2026-08-04 09:00</td>", c), "compact Closed date missing"
+assert "T09:00:00Z" not in c and "T10:00:00Z" not in c, "raw ISO leaked"
+assert q.count("form class=rvform") > 0 and c.count("form class=rvform") > 0
+
+print("Prompt14 table-structure-parity checks: OK")
+PY
+ok "queue and closed tables share a 9-column structure; Priority removed (Prompt14)"
 
 echo "=== VALIDATION PASSED ==="
 echo "Run safely with: FRESHDESK_OFFLINE=1 flask --app app run --host 127.0.0.1 --port 5050"

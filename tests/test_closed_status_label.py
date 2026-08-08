@@ -63,36 +63,40 @@ def test_closed_status_lookup_matches_label_mapping():
 # --- rendered table ---
 
 def test_closed_table_status_cells_show_closed():
+    """Every closed row's Status cell reads "Closed" — the plain queue-style
+    label (Prompt 14 parity), no longer the Prompt-13 b-closed badge."""
     html = _html()
-    cells = re.findall(r'<span class="badge b-closed">([^<]*)</span>', html)
-    assert cells, "expected at least one status cell"
-    assert all(cell == "Closed" for cell in cells)
+    rows = re.findall(r'<tr class="[^"]*" data-ticket-id="\d+">', html)
+    assert rows, "expected at least one closed row"
+    status_cells = re.findall(r"<td>Closed</td>", html)
+    assert len(status_cells) == len(rows), (len(status_cells), len(rows))
 
 
 def test_closed_table_never_shows_raw_5_in_status():
-    # Prompt 13 moved the b-closed badge out of its own column into the
-    # Subject cell's badge cluster, so the selector no longer scopes to a
-    # dedicated <td>. The guarantee is unchanged: the status badge reads
-    # "Closed", never the raw integer 5, and no raw 5 is rendered.
+    # The Status column reads "Closed" — never the raw integer 5 — and no
+    # raw 5 renders anywhere on the page.
     html = _html()
-    status_badges = re.findall(r'<span class="badge b-closed">([^<]*)</span>', html)
-    assert status_badges
-    assert all(badge != "5" for badge in status_badges)
     assert re.search(r">5<", html) is None, "raw status 5 must never be visible"
+    status_cells = re.findall(r"<td>Closed</td>", html)
+    assert status_cells
+    assert all(cell != "5" for cell in status_cells)
 
 
-def test_closed_badge_uses_shared_styling():
+def test_closed_status_uses_shared_label_and_css():
+    # The Status label comes from the same central STATUS_LABELS mapping and
+    # the shared stylesheet keeps its closed colour class; the markup now
+    # renders the queue-style `{{ t.status_label }}` cell, not a badge.
     import app
     assert ".b-closed" in app._SHARED_CSS
-    assert "badge b-closed" in app.CLOSED_HTML
+    assert "<td>{{ t.status_label }}</td>" in app.CLOSED_HTML
 
 
 def test_every_closed_row_uses_label_not_numeric():
     html = _html()
-    rows = re.findall(r'<td><a class="?tid.*?</tr>', html)
+    rows = re.findall(r'<tr class="[^"]*" data-ticket-id="\d+">.*?</tr>', html, re.S)
     assert rows
     for row in rows:
-        assert '<span class="badge b-closed">Closed</span>' in row
+        assert "<td>Closed</td>" in row
 
 
 # --- internal value + filtering --------------------------------------------

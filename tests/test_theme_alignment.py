@@ -142,27 +142,34 @@ def test_queue_filters_and_review_still_work_after_theme(client, monkeypatch):
 
 
 def test_closed_route_columns_preserved(client, monkeypatch):
-    """Closed table renders the queue-style column layout (Prompt 13).
+    """Closed table renders the nine queue-parity columns (Prompt 14).
 
-    Previously this asserted the old eight independent columns (Ticket ID,
-    Subject, Status, Closed date, Current tags, Housekeeping, Freshdesk
-    ticket). That layout was the reason for Prompt 13: the /closed table now
-    mirrors the /queue component — Ticket | Subject | Review — with the
-    secondary facts consolidated into the Subject metadata/badge area. The
-    facts themselves are still preserved (see test_closed_table_alignment.py).
+    Prompt 13 had compressed /closed to Ticket | Subject | Review with the
+    secondary facts stuffed under Subject. Prompt 14 restores dedicated
+    queue-style columns, so this test now asserts the full parity header:
+    Ticket | Subject | Status | Badges | Review | Closed | Updated | Created
+    | Tags — "Closed" in the exact slot /queue uses for "Due / SLA".
+    The old independent column names are gone for good, and Priority is
+    absent from both pages.
     """
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     cl = _html(client, "/closed")
-    for col in ("<th scope=col>Ticket</th>", "<th scope=col>Subject</th>",
-                "<th scope=col>Review</th>"):
-        assert col in cl, f"missing queue-style closed column {col}"
-    for legacy in ("<th scope=col>Ticket ID</th>", "<th scope=col>Status</th>",
-                   "<th scope=col>Closed date</th>", "<th scope=col>Current tags</th>",
-                   "<th scope=col>Housekeeping</th>", "<th scope=col>Review Result</th>",
-                   "<th scope=col>Freshdesk ticket</th>"):
+    q = _html(client, "/queue")
+    closed_headers = ["Ticket", "Subject", "Status", "Badges", "Review",
+                      "Closed", "Updated", "Created", "Tags"]
+    assert re.findall(r"<th scope=col>([^<]+)</th>", cl) == closed_headers
+    for legacy in ("<th scope=col>Ticket ID</th>", "<th scope=col>Closed date</th>",
+                   "<th scope=col>Current tags</th>", "<th scope=col>Housekeeping</th>",
+                   "<th scope=col>Review Result</th>", "<th scope=col>Freshdesk ticket</th>",
+                   "<th scope=col>Priority</th>"):
         assert legacy not in cl, f"legacy closed column still present: {legacy}"
-    # The metadata the old columns carried is still rendered, consolidated.
-    assert "b-closed" in cl and "b-date" in cl and "b-review" in cl
+    assert "<th scope=col>Priority</th>" not in q, "queue Priority column must be gone"
+    # Each fact lands in its own column: status label cell, badges column,
+    # meta date cells, tags cell (verified per-row in
+    # tests/test_closed_table_alignment.py).
+    assert "badge b-review" in cl
+    assert "<td>Closed</td>" in cl
+    assert "<td class=meta>" in cl
     assert 'name="review_result"' in cl or "name=review_result" in cl
 
 
