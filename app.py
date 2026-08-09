@@ -37,6 +37,11 @@ import requests
 from flask import (Flask, jsonify, redirect, render_template_string, request,
                    session)
 
+# Live Closed dashboard support (Prompt 24): separate cache, atomic writes and
+# the single-slot refresh job. Importing it here is safe — closed_live imports
+# closed_retriever lazily, so there is no import cycle.
+import closed_live
+
 app = Flask(__name__, static_folder=None)
 # Per-process random key: used only for the loopback CSRF token and flash
 # messages. Changes every restart, which is correct for a local tool.
@@ -1179,22 +1184,113 @@ def closed_display(value: str) -> str:
     return s[:16]
 
 
+CLOSED_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def closed_live_result(config, now=None):
+    """Build a ClosedRetrieval from the LIVE cache file only.
+
+    This never performs a request and never reads the API key: it is pure
+    presentation over ``cache/closed_tickets.json``, which only an explicit
+    refresh can write. Membership uses the exact half-open UTC boundaries
+    ``start <= stats.closed_at < end`` — the same window the refresh job used.
+    """
+    now = now or now_utc()
+    start, end = closed_live.utc_window(config["days"], now)
+    result = ClosedRetrieval(
+        date_range=(start.date(), (end - timedelta(days=1)).date()),
+        missing_tags_only=config["missing_tags"],
+    )
+    result.source_mode = "live-cache"
+    blob = closed_live.load_cache()
+    if blob is None:
+        result.complete = False
+        result.warnings.append(
+            "No live closed data has been retrieved yet. Use Refresh Closed Data to fetch it."
+        )
+        return result
+
+    kept, missing_closed_at, missing_tags_unknown = [], 0, 0
+    for ticket in blob["tickets"]:
+        if ticket.get("status") != CLOSED_STATUS:
+            continue
+        raw = closed_live.cache_closed_at(ticket)
+        closed_dt = parse_dt(raw)
+        if closed_dt is None:
+            missing_closed_at += 1
+            continue
+        if not (start <= closed_dt < end):
+            continue
+        tags = ticket.get("tags")
+        if not isinstance(tags, list):
+            missing_tags_unknown += 1
+            continue
+        if config["missing_tags"] and tags:
+            continue
+        kept.append(dict(ticket, closed_at=raw, tags=tags))
+
+    kept.sort(key=lambda t: (t.get("closed_at") or "", t["id"]), reverse=True)
+    result.tickets = kept
+    result.unique_ticket_count = len(kept)
+
+    # Coverage reporting: the operator must be able to see when the cached
+    # window is narrower or older than what they are asking to view.
+    coverage = blob.get("coverage") if isinstance(blob.get("coverage"), dict) else {}
+    cached_days = blob.get("days")
+    if isinstance(cached_days, int) and cached_days < config["days"]:
+        result.complete = False
+        result.warnings.append(
+            f"Coverage warning: cached data only covers the last {cached_days} days, "
+            f"but {config['days']} days are being displayed. Refresh to widen coverage."
+        )
+    if coverage.get("next_page_existed_at_cap"):
+        result.complete = False
+        result.warnings.append(
+            "Coverage warning: the last refresh hit the page ceiling, so older tickets may be missing."
+        )
+    if missing_closed_at:
+        result.warnings.append(
+            f"Coverage warning: {missing_closed_at} cached tickets have no usable closed_at and were excluded."
+        )
+    if missing_tags_unknown:
+        result.warnings.append(
+            f"Coverage warning: {missing_tags_unknown} cached tickets have unknown tag data and were excluded."
+        )
+    fetched = parse_dt(blob.get("fetched_at"))
+    if fetched is None:
+        result.warnings.append("Coverage warning: cached data has no usable retrieval timestamp.")
+    elif (now - fetched).total_seconds() > CLOSED_CACHE_MAX_AGE_SECONDS:
+        result.warnings.append(
+            f"Coverage warning: cached data was retrieved {fetched.isoformat()} and may be stale."
+        )
+    result.pages_requested = [None] * int(coverage.get("pages_completed") or 0)
+    result.windows_planned = [ClosedWindow(start.date(), (end - timedelta(days=1)).date())]
+    result.windows_completed = list(result.windows_planned)
+    return result
+
+
 @app.route("/closed")
 def closed_housekeeping():
-    """Offline-only closed-ticket page. It cannot use the queue's live path."""
-    if not is_offline():
-        return _closed_render(error="Closed Ticket Housekeeping is offline-only in this milestone.", result=None,
-                              config=closed_filters_from_args(request.args)), 503
+    """Closed-ticket page.
+
+    Offline mode renders the untouched synthetic fixture corpus. Live mode
+    renders ONLY the explicitly refreshed cache file — the page itself never
+    triggers a request and never reads the API key.
+    """
     config = closed_filters_from_args(request.args)
+    offline = is_offline()
     # Local date is intentionally used for display range. Search predicates use
     # explicit YYYY-MM-DD calendar dates; see the UTC caveat in the contract doc.
     end = now_utc().date()
     start = end - timedelta(days=config["days"] - 1)
     try:
-        result = retrieve_closed_tickets(start, end, config["missing_tags"])
+        if offline:
+            result = retrieve_closed_tickets(start, end, config["missing_tags"])
+        else:
+            result = closed_live_result(config)
     except Exception:
-        return _closed_render(result=None, config=config,
-                              error="Closed synthetic retrieval failed safely. No live fallback was attempted."), 500
+        return _closed_render(result=None, config=config, offline=offline,
+                              error="Closed retrieval failed safely. No live fallback was attempted."), 500
 
     # Closed-housekeeping local review state (Prompt 12) — separate namespace
     # from /queue (closed_review_state table), applied after retrieval so the
@@ -1240,7 +1336,7 @@ def closed_housekeeping():
     return _closed_render(
         result=result, config=config, error=None, view_count=len(reviewed),
         csrf_token=get_csrf_token(), flash=flash_msg,
-        review_states=REVIEW_STATES,
+        review_states=REVIEW_STATES, offline=offline,
         closed_last_opened=closed_last_opened,
         last_opened_rendered=any(r["last_opened"] for r in reviewed),
     )
@@ -1251,9 +1347,6 @@ def closed_review_api():
     """Save a local closed-housekeeping review result (form POST). Redirects
     back to the exact /closed view the user was on, preserving days,
     missing_tags, and review_view. Never changes Freshdesk."""
-    if not is_offline():
-        return _closed_render(error="Closed Ticket Housekeeping is offline-only in this milestone.",
-                              result=None, config=dict(closed_filters_from_args(request.form))), 503
     config = closed_filters_from_args(request.form)
 
     def back_to_closed(msg, ok):
@@ -1286,6 +1379,41 @@ def closed_review_api():
         return back_to_closed(f"Review not saved: database error ({e}).", False)
 
     return back_to_closed(f"Review saved for #{ticket_id}: {result}.", True)
+
+
+@app.route("/closed/api/refresh", methods=["POST"])
+def closed_refresh_start():
+    """Start one explicit read-only Freshdesk list-ticket refresh."""
+    if not csrf_valid(request.form.get("csrf_token")):
+        return jsonify({"ok": False, "message": "Invalid security token."}), 403
+    if is_offline():
+        return jsonify({"ok": False, "message": "Offline mode: live refresh is disabled."}), 409
+    config = closed_filters_from_args(request.form)
+    try:
+        api_key = load_api_key()
+    except Exception:
+        return jsonify({"ok": False, "message": "Freshdesk credential is unavailable."}), 503
+    started, message = closed_live.JOB.start(days=config["days"], api_key=api_key, now=now_utc())
+    status = closed_live.JOB.status()
+    status.update({"ok": started, "message": message})
+    return jsonify(status), (202 if started else 409)
+
+
+@app.route("/closed/api/refresh/status")
+def closed_refresh_status():
+    """Safe aggregate status only; ticket payloads are never returned."""
+    return jsonify(closed_live.JOB.status())
+
+
+@app.route("/closed/api/refresh/cancel", methods=["POST"])
+def closed_refresh_cancel():
+    if not csrf_valid(request.form.get("csrf_token")):
+        return jsonify({"ok": False, "message": "Invalid security token."}), 403
+    cancelled = closed_live.JOB.cancel()
+    return jsonify({
+        "ok": cancelled,
+        "message": "Cancellation requested." if cancelled else "No refresh is running.",
+    }), (202 if cancelled else 409)
 
 
 @app.route("/closed/api/opened", methods=["POST"])
@@ -1325,13 +1453,16 @@ def closed_opened_api():
 
 
 def closed_ticket_known(ticket_id):
-    """True when the ticket id belongs to the synthetic closed corpus (status 5).
-    Used by the closed review endpoints to reject unknown tickets safely
-    without any live-server or network interaction."""
-    return any(
-        t.get("status") == CLOSED_STATUS and t.get("id") == ticket_id
-        for t in _synthetic_closed_tickets()
-    )
+    """True when the id is present in the active offline fixture or live cache."""
+    if is_offline():
+        return any(
+            t.get("status") == CLOSED_STATUS and t.get("id") == ticket_id
+            for t in _synthetic_closed_tickets()
+        )
+    payload = closed_live.load_cache()
+    if not payload:
+        return False
+    return any(t.get("id") == ticket_id for t in payload.get("tickets", []))
 
 
 @app.route("/queue")
@@ -1959,7 +2090,17 @@ CLOSED_HTML = """\
 <h1>Closed Ticket Housekeeping</h1>
 <p class=sub>Find closed tickets that may need housekeeping, such as tickets with no tags.</p>
 {% if flash %}<div class="banner {{ 'ok' if flash[0] == 'ok' else 'err' }}" role=status>{{ flash[1] }}</div>{% endif %}
-<div class="banner" role=status><strong>OFFLINE MODE — Synthetic fixture data only</strong></div>
+<div class="banner" role=status>{% if offline %}<strong>OFFLINE MODE — Synthetic fixture data only</strong>{% else %}<strong>LIVE CACHE MODE — Opening or reloading this page makes no Freshdesk request.</strong>{% endif %}</div>
+<div class="refresh-panel" data-offline="{{ 1 if offline else 0 }}">
+  {% if offline %}
+  <button type=button disabled>Refresh from Freshdesk</button>
+  <span class=field-hint>Live refresh is disabled in offline mode.</span>
+  {% else %}
+  <button type=button id=closed-refresh>Refresh from Freshdesk</button>
+  <button type=button id=closed-cancel hidden>Cancel</button>
+  <span id=closed-refresh-status role=status aria-live=polite>{% if live_cache %}Cached through: {{ live_cache.fetched_at }} · Coverage starts: {{ live_cache.coverage_start }}{% else %}No live Closed cache yet.{% endif %}</span>
+  {% endif %}
+</div>
 <form class="controls" method=get action=/closed novalidate>
   <div class="panel-region region-time">
     <span class="days-field field"><span class=lbl>Closed in the last</span>
@@ -2173,6 +2314,41 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     try { syncControlsFromURL(); } catch (err) {}
   });
 })();
+(function () {
+  var start = document.getElementById('closed-refresh');
+  if (!start) { return; }
+  var cancel = document.getElementById('closed-cancel');
+  var output = document.getElementById('closed-refresh-status');
+  var terminalSeen = false;
+  function encode(obj) { return Object.keys(obj).map(function(k){ return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]); }).join('&'); }
+  function render(s) {
+    var p = s.progress || {};
+    var running = s.state === 'running';
+    start.disabled = running;
+    cancel.hidden = !running;
+    var msg = s.message || '';
+    if (running) {
+      msg += ' Page ' + (p.page || p.pages_completed || 0) + ' · ' + (p.rows_received || 0) + ' rows · ' + (p.unique_tickets || 0) + ' unique';
+      if (p.rate_limit_remaining != null) { msg += ' · rate-limit remaining ' + p.rate_limit_remaining; }
+      if (p.waiting_seconds) { msg += ' · waiting ' + p.waiting_seconds + ' seconds'; }
+    }
+    output.textContent = msg;
+    if (running) { window.setTimeout(poll, 1000); }
+    else if (s.state === 'success' && !terminalSeen) { terminalSeen = true; window.location.reload(); }
+  }
+  function poll() { fetch('/closed/api/refresh/status').then(function(r){return r.json();}).then(render).catch(function(){ output.textContent='Unable to read refresh status.'; }); }
+  start.addEventListener('click', function () {
+    terminalSeen = false;
+    var days = document.querySelector('form.controls input[name=days]');
+    fetch('/closed/api/refresh', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:encode({csrf_token:CSRF_TOKEN, days:days ? days.value : '60'})})
+      .then(function(r){return r.json();}).then(render);
+  });
+  cancel.addEventListener('click', function () {
+    fetch('/closed/api/refresh/cancel', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:encode({csrf_token:CSRF_TOKEN})})
+      .then(function(r){return r.json();}).then(function(s){output.textContent=s.message || ''; poll();});
+  });
+  poll();
+})();
 </script>
 {% endif %}</body></html>
 """
@@ -2192,6 +2368,7 @@ def _closed_render(**kwargs):
     ctx.setdefault("view_count", 0)
     ctx.setdefault("closed_last_opened", None)
     ctx.setdefault("last_opened_rendered", False)
+    ctx.setdefault("live_cache", closed_live.load_cache() if not ctx["offline"] else None)
     return render_template_string(CLOSED_HTML, **ctx)
 
 

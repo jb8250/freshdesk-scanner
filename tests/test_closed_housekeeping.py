@@ -142,12 +142,12 @@ def test_closed_route_invalid_and_toggle(monkeypatch):
     assert "All tag states" in submitted_off
 
 
-def test_closed_route_refuses_live_without_key_or_network(monkeypatch):
+def test_closed_route_uses_cache_without_key_or_network(monkeypatch):
     monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
     monkeypatch.setattr(app, "load_api_key", lambda: (_ for _ in ()).throw(AssertionError("key read")))
     response = app.app.test_client().get("/closed")
-    assert response.status_code == 503
-    assert "offline-only" in response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "No live closed data has been retrieved yet" in response.get_data(as_text=True)
 
 
 def test_offline_closed_never_has_a_write_transport():

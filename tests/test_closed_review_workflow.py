@@ -86,7 +86,8 @@ def test_mark_closed_opened_uses_closed_table_only(fixed_clock_fix):
     assert 810001 in load_closed_review_rows()     # closed table written
 
 
-def test_closed_ticket_known_synthetic_ids():
+def test_closed_ticket_known_synthetic_ids(monkeypatch):
+    monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     assert closed_ticket_known(810001)
     assert closed_ticket_known(820300)
     assert not closed_ticket_known(999999)
@@ -302,12 +303,14 @@ def test_closed_api_routes_are_post_only():
     assert rules["/closed"] == ["GET"]
 
 
-def test_closed_review_api_offline_only(monkeypatch):
+def test_closed_review_api_available_for_live_cached_workflow(monkeypatch):
     monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
     client = app.test_client()
     resp = client.post("/closed/api/review",
                        data={"ticket_id": "810001", "review_result": "Resolved"})
-    assert resp.status_code == 503
+    # The route remains local-only in both data-source modes; this request fails
+    # only because no CSRF token was supplied, not because live cache is active.
+    assert resp.status_code == 303
     resp2 = client.post("/closed/api/opened", json={"ticket_id": "810001"})
     assert resp2.status_code == 503
 

@@ -51,6 +51,8 @@ def clean_state(monkeypatch, tmp_path):
     # keeps missing-key behavior deterministic and prevents credential reads.
     monkeypatch.setattr(scanner_app, "FRESHDESK_KEY_FILE", str(tmp_path / "absent_freshdesk_api_key"))
     monkeypatch.setattr(scanner_app, "CACHE_FILE", str(tmp_path / "fd_test_cache_isolated.json"))
+    monkeypatch.setattr(scanner_app.closed_live, "CLOSED_CACHE_FILE", str(tmp_path / "closed_test_cache_isolated.json"))
+    monkeypatch.setattr(scanner_app.closed_live, "JOB", scanner_app.closed_live.RefreshJobManager())
     db_path = str(tmp_path / "review_state_test.sqlite3")
     monkeypatch.setenv("REVIEW_DB_PATH", db_path)
     scanner_app.init_db(db_path)

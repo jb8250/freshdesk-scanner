@@ -30,6 +30,7 @@ Thumbs.db
 
 # Project-specific
 cache/
+closed_ui_prompt24/
 data/
 *.csv
 *.html

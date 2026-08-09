@@ -1073,7 +1073,9 @@ def test_only_expected_routes_registered():
     rules = {r.rule for r in app.app.url_map.iter_rules()}
     assert rules == {"/queue", "/closed",
                      "/queue/api/review", "/queue/api/opened",
-                     "/closed/api/review", "/closed/api/opened"}, f"unexpected routes: {rules}"
+                     "/closed/api/review", "/closed/api/opened",
+                     "/closed/api/refresh", "/closed/api/refresh/status",
+                     "/closed/api/refresh/cancel"}, f"unexpected routes: {rules}"
 
 
 def test_no_mohawk_or_upload_routes():

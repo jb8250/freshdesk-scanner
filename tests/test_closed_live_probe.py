@@ -197,7 +197,7 @@ def test_dashboard_routes_remain_offline_source_only():
     assert "requests.get(" not in closed_route
     assert "load_api_key(" not in closed_route
     assert "retrieve_closed_tickets(" in closed_route
-    assert 'if not is_offline():' in closed_route
+    assert "closed_live_result(config)" in closed_route
     assert "fd_auth(" not in closed_route
 
 
