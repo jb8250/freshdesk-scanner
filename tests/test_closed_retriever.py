@@ -1,5 +1,8 @@
 """Offline tests for the Prompt 22 normal-order retriever."""
+import importlib.util
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -84,7 +87,7 @@ def test_progress_is_safe_and_cancellation_stops_before_next(monkeypatch):
     monkeypatch.setattr(requests,"get",get)
     r=cr.retrieve(config(progress_callback=events.append,cancel_callback=lambda:cancelled[0]))
     assert len(calls)==1 and r.stop_reason=="cancelled"
-    assert events and set(events[-1]) == {"page","pages_completed","http_requests_made","rows_received","unique_tickets","duplicates_removed","matching_closed_no_tag_tickets","rate_limit_remaining","waiting_seconds","status"}
+    assert events and set(events[-1]) == {"page","pages_completed","http_requests_made","rows_received","unique_tickets","duplicates_removed","rate_limit_remaining","waiting_seconds","status"}
     assert "SECRET" not in str(events)
 
 def test_two_second_spacing_with_injected_clock(monkeypatch):
@@ -156,3 +159,81 @@ def test_over_100_rows_safe_stop(monkeypatch):
 def test_config_guards_and_result_serializable():
     with pytest.raises(ValueError): cr.retrieve(config(max_pages=301))
     assert isinstance(cr.serialize(cr.RetrievalResult()),dict)
+
+
+def test_aggregate_counters_use_final_deduplicated_newer_ticket_versions(monkeypatch):
+    older = ticket(1, status=5, tags=[], closed="2026-08-02T12:00:00Z", updated="2026-08-02T12:00:00Z")
+    newer = ticket(1, status=4, tags=["tagged"], closed="bad", updated="2026-08-02T14:00:00Z")
+    unique = [
+        ticket(2, status=5, tags=[], closed="2026-08-01T00:00:00Z"),
+        ticket(3, status=5, tags=[], closed="2026-08-04T00:00:00Z"),
+        ticket(4, status=5, tags=[], closed=None),
+        ticket(5, status=5, tags="malformed", closed="2026-08-02T12:00:00Z"),
+        ticket(6, status=4, tags=[], closed="2026-08-02T12:00:00Z"),
+    ]
+    pages = [[older] + unique, [newer]]
+    calls = [0]
+    def get(*_args, **_kwargs):
+        calls[0] += 1
+        return Resp(pages[calls[0] - 1], headers={"Link": "<next>; rel=\"next\""} if calls[0] == 1 else {})
+    monkeypatch.setattr(requests, "get", get)
+
+    result = cr.retrieve(config())
+
+    assert result.rows_received == 7
+    assert result.unique_ticket_count == 6
+    assert result.duplicate_count == 1
+    assert result.duplicate_payload_updates == 1
+    assert result.status_5_count == 4
+    assert result.empty_tags_count == 4
+    assert result.closed_no_tags_count == 3
+    assert result.valid_closed_at_count == 4
+    assert result.invalid_or_missing_closed_at_count == 2
+    assert result.closed_no_tags_in_date_window_count == 1
+    assert [item["id"] for item in result.matches] == [2]
+    assert next(item for item in result.tickets_unique if item["id"] == 1)["status"] == 4
+    serialized = cr.serialize(result)
+    assert json.dumps(serialized)
+
+
+def test_safe_summary_excludes_sensitive_ticket_content_and_is_serializable():
+    result = cr.RetrievalResult(
+        rows_received=1,
+        unique_ticket_count=1,
+        tickets_unique=[ticket(99)],
+        matches=[ticket(99)],
+        status_5_count=1,
+    )
+    summary = cr.safe_summary(result)
+    assert json.dumps(summary)
+    assert "tickets_unique" not in summary and "matches" not in summary
+    assert "SECRET" not in json.dumps(summary)
+
+
+def test_validation_cli_uses_100_page_ceiling_and_never_prints_ticket_fields(monkeypatch, capsys):
+    spec = importlib.util.spec_from_file_location(
+        "closed_retriever_validation",
+        Path(__file__).parents[1] / "tools" / "closed_retriever_validation.py",
+    )
+    assert spec is not None and spec.loader is not None
+    validation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validation)
+    monkeypatch.setattr(validation, "credential", lambda: "test-key")
+    monkeypatch.setattr(
+        validation.retriever,
+        "retrieve",
+        lambda _config: cr.RetrievalResult(
+            success=True,
+            complete=True,
+            tickets_unique=[ticket(7)],
+            matches=[ticket(7)],
+            status_5_count=1,
+        ),
+    )
+
+    assert validation.main(["--execute"]) == 0
+    output = capsys.readouterr().out
+    assert validation.LIVE_TEST_MAX_PAGES == 100
+    assert '"max_pages": 100' in output
+    assert "SECRET" not in output
+    assert "tickets_unique" not in output and "matches" not in output

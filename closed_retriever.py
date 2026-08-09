@@ -58,6 +58,12 @@ class RetrievalResult:
     retry_429_count: int = 0
     retry_5xx_timeout_count: int = 0
     next_page_existed_at_cap: bool = False
+    status_5_count: int = 0
+    empty_tags_count: int = 0
+    closed_no_tags_count: int = 0
+    valid_closed_at_count: int = 0
+    invalid_or_missing_closed_at_count: int = 0
+    closed_no_tags_in_date_window_count: int = 0
     def to_dict(self): return asdict(self)
 
 def _num(value):
@@ -80,14 +86,47 @@ def _newer(candidate, current):
     a, b = parse_dt(candidate.get("updated_at")), parse_dt(current.get("updated_at"))
     return a is not None and b is not None and a > b
 
+def aggregate_counters(tickets, start, end):
+    counters = {
+        "status_5_count": 0,
+        "empty_tags_count": 0,
+        "closed_no_tags_count": 0,
+        "valid_closed_at_count": 0,
+        "invalid_or_missing_closed_at_count": 0,
+        "closed_no_tags_in_date_window_count": 0,
+    }
+    matches = []
+    for ticket in tickets:
+        status_5 = ticket.get("status") == CLOSED_STATUS
+        empty_tags = isinstance(ticket.get("tags"), list) and len(ticket["tags"]) == 0
+        if status_5:
+            counters["status_5_count"] += 1
+        if empty_tags:
+            counters["empty_tags_count"] += 1
+        if status_5 and empty_tags:
+            counters["closed_no_tags_count"] += 1
+
+        stats = ticket.get("stats")
+        closed = parse_dt(stats.get("closed_at")) if isinstance(stats, dict) and isinstance(stats.get("closed_at"), str) else None
+        if closed is None:
+            counters["invalid_or_missing_closed_at_count"] += 1
+        else:
+            counters["valid_closed_at_count"] += 1
+            if status_5 and empty_tags and start <= closed < end:
+                counters["closed_no_tags_in_date_window_count"] += 1
+                matches.append(ticket)
+    return counters, matches
+
+
 def filter_closed_tickets(tickets, start, end):
-    out = []
-    for t in tickets:
-        if t.get("status") != CLOSED_STATUS or t.get("tags") != []: continue
-        stats = t.get("stats")
-        closed = parse_dt(stats.get("closed_at")) if isinstance(stats, dict) else None
-        if closed is not None and start <= closed < end: out.append(t)
-    return out
+    return aggregate_counters(tickets, start, end)[1]
+
+
+def safe_summary(result):
+    summary = result.to_dict()
+    summary.pop("tickets_unique", None)
+    summary.pop("matches", None)
+    return summary
 
 def validate_config(c):
     if not c.api_key: raise ValueError("api_key is required")
@@ -101,7 +140,7 @@ class TicketRetriever:
     def cancelled(self): return bool(self.c.cancel_callback and self.c.cancel_callback())
     def emit(self, status, page, waiting=0):
         if self.c.progress_callback:
-            self.c.progress_callback({"page":page,"pages_completed":self.r.pages_completed,"http_requests_made":self.r.http_requests_made,"rows_received":self.r.rows_received,"unique_tickets":len(self.tickets),"duplicates_removed":self.r.duplicate_count,"matching_closed_no_tag_tickets":len(self.r.matches),"rate_limit_remaining":self.r.rate_limit_remaining_last,"waiting_seconds":waiting,"status":status})
+            self.c.progress_callback({"page":page,"pages_completed":self.r.pages_completed,"http_requests_made":self.r.http_requests_made,"rows_received":self.r.rows_received,"unique_tickets":len(self.tickets),"duplicates_removed":self.r.duplicate_count,"rate_limit_remaining":self.r.rate_limit_remaining_last,"waiting_seconds":waiting,"status":status})
     def wait(self, seconds, page):
         if seconds <= 0: return not self.cancelled()
         self.emit("waiting", page, seconds); remaining=seconds
@@ -162,9 +201,16 @@ class TicketRetriever:
                 if not _has_next(response): self.r.complete=True; self.r.stop_reason="no next-page Link — dataset exhausted"; break
             else: self.r.next_page_existed_at_cap=True; self.r.stop_reason=f"hard page ceiling reached ({self.c.max_pages})"
         finally:
-            self.r.tickets_unique=list(self.tickets.values()); self.r.unique_ticket_count=len(self.tickets); self.r.matches=filter_closed_tickets(self.r.tickets_unique,self.c.window_start,self.c.window_end); self.r.finished_at=datetime.now(timezone.utc).isoformat(); self.r.elapsed_seconds=(datetime.now(timezone.utc)-started).total_seconds(); self.r.success=self.r.stop_reason in {"no next-page Link — dataset exhausted",f"hard page ceiling reached ({self.c.max_pages})"}
+            self.r.tickets_unique=list(self.tickets.values())
+            self.r.unique_ticket_count=len(self.tickets)
+            counters, self.r.matches = aggregate_counters(self.r.tickets_unique, self.c.window_start, self.c.window_end)
+            for name, value in counters.items():
+                setattr(self.r, name, value)
+            self.r.finished_at=datetime.now(timezone.utc).isoformat()
+            self.r.elapsed_seconds=(datetime.now(timezone.utc)-started).total_seconds()
+            self.r.success=self.r.stop_reason in {"no next-page Link — dataset exhausted",f"hard page ceiling reached ({self.c.max_pages})"}
         return self.r
 
 def retrieve(config): return TicketRetriever(config).run()
 def serialize(result): return result.to_dict()
-__all__=["TicketRetriever","RetrieverConfig","RetrievalResult","filter_closed_tickets","retrieve","serialize","MAX_PAGES","PER_PAGE"]
+__all__=["TicketRetriever","RetrieverConfig","RetrievalResult","aggregate_counters","filter_closed_tickets","safe_summary","retrieve","serialize","MAX_PAGES","PER_PAGE"]

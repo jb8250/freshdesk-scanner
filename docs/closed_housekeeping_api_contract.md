@@ -97,7 +97,7 @@ This milestone does not write tags, invoke `POST`, `PUT`, `PATCH`, or `DELETE`, 
 
 The retriever uses only `GET /api/v2/tickets` with `include=stats`, `per_page=100`, `page=1..N`, and an `updated_since` lower bound. It intentionally omits both `order_by` and `order_type`, therefore relying on Freshdesk's documented default ordering (`created_at` with descending default order). The page number starts at 1; the response `Link` header supplies a next-page URL when another page exists. `stats.closed_at` is available when `include=stats` is requested. Rate-limit response headers include `X-RateLimit-Total`, `X-RateLimit-Remaining`, and `X-RateLimit-Used-CurrentRequest`; the retriever also records `Retry-After` when supplied. A 429 is handled as a bounded same-page retry, never an immediate unbounded retry. Freshdesk documents HTTP error responses and pagination, but does not promise a `Retry-After` value for every 429, so the implementation uses a conservative 60-second fallback when it is absent.
 
-The live validation uses `updated_since=2026-07-31T23:59:55Z` and locally retains only status 5, exactly-empty tags, valid `stats.closed_at`, and the half-open Aug 1–4 UTC window. Dashboard routes remain offline and the retriever is a standalone service.
+The live validation uses `updated_since=2026-07-31T23:59:55Z`, a validation-only ceiling of 100 pages (the reusable retriever ceiling remains 300), and locally retains only status 5, exactly-empty tags, valid `stats.closed_at`, and the half-open Aug 1–4 UTC window. Dashboard routes remain offline and the retriever is a standalone service.
 
 ## Multi-page pagination and status-order stop rule
 
