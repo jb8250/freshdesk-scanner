@@ -5,7 +5,7 @@ Read-only Freshdesk triage page that surfaces tickets needing attention. No writ
 
 ## Stack
 - Python 3.11+
-- Flask dashboard routes: `/queue` and offline-only `/closed`, each with local review endpoints
+- Flask dashboard routes: `/queue` and `/closed`, each with local review endpoints; `/closed` uses a separate local cache and refreshes Freshdesk only through an explicit GET-only control
 - `requests` for the eventual read-only Freshdesk list API call
 - pytest for offline tests
 - Local JSON fixtures for guaranteed offline development

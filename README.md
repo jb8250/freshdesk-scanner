@@ -38,15 +38,15 @@ The fixture file is `fixtures/fixtures.json`. It contains fake data only and mus
 
 ## Closed Ticket Housekeeping
 
-`/closed` is a separate, **offline-only** foundation for finding synthetic closed tickets that may need tag housekeeping. Open `http://127.0.0.1:5050/closed` while `FRESHDESK_OFFLINE=1` is set.
+`/closed` is a separate Closed-ticket housekeeping dashboard. It supports safe offline fixtures and an explicit, read-only live refresh into its own local cache. Open `http://127.0.0.1:5050/closed`.
 
 - Defaults: last 60 days and Missing Tags Only enabled (`/closed?days=60&missing_tags=1`).
-- The documented future retrieval strategy is Freshdesk Filter Tickets search: status `5` (Closed), optional `tag:null`, and an inclusive `closed_at` date range.
-- Search is limited to 30 results/page and 10 pages (300 results/query). The offline planner splits an over-limit calendar range deterministically, deduplicates ticket IDs, and reports completeness.
-- A single calendar date with over 300 results is explicitly incomplete; it is never presented as complete.
-- This milestone has no Freshdesk HTTP adapter, no Freshdesk writes, and no tag editing. A future live **read-only** pilot must validate the contract before any live retrieval is introduced.
+- Opening or reloading `/closed` reads `cache/closed_tickets.json`; it does not automatically contact Freshdesk.
+- Only **Refresh from Freshdesk** starts live retrieval. The retrieval is GET-only, uses 100-ticket sequential pagination, deduplicates ticket IDs, applies conservative rate limiting, and replaces the cache only after a complete successful run.
+- The Closed cache is separate from the queue cache at `cache/tickets.json`.
+- Local review actions remain local; there is no Freshdesk tag editing or other write operation.
 
-The public API contract used by this foundation is recorded in `docs/closed_housekeeping_api_contract.md`.
+Operational details and safe recovery are in `docs/CLOSED_DASHBOARD_RUNBOOK.md`. The historical public API contract used by the original foundation is recorded in `docs/closed_housekeeping_api_contract.md`.
 
 ## Tests and validation
 
