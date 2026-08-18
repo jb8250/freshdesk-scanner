@@ -30,5 +30,15 @@ Thumbs.db
 
 # Project-specific
 cache/
+closed_ui_prompt24/
+data/
 *.csv
 *.html
+
+# Test artifacts
+.pytest_cache/
+__pycache__/
+tests/__pycache__/
+
+# Browser smoke-test screenshots + scripts (Prompt09)
+artifacts/

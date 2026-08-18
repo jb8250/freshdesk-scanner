@@ -1,0 +1,319 @@
+{
+  "description": "Synthetic Freshdesk ticket fixtures for offline dashboard development and tests. All ids, subjects, dates, and values are fictional. No real customer data, names, emails, addresses, phone numbers, order numbers, or ticket content. updated_at values are anchored to a pinned reference time T_REF=2026-08-05T12:00:00Z so days-back tests are stable.",
+  "reference_time": "2026-08-05T12:00:00Z",
+  "pages": [
+    [
+      {
+        "id": 500001,
+        "subject": "Customer sent photo of damaged dresser drawer",
+        "status": 2,
+        "priority": 3,
+        "due_by": "2020-06-15T17:00:00Z",
+        "created_at": "2026-07-01T10:00:00Z",
+        "updated_at": "2026-07-31T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500002,
+        "subject": "Re: video of wobbling table leg",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2035-01-01T12:00:00Z",
+        "created_at": "2026-07-02T11:00:00Z",
+        "updated_at": "2026-07-26T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500003,
+        "subject": "Waiting on customer for photos of shelf damage",
+        "status": 6,
+        "priority": 2,
+        "due_by": "2026-07-10T17:00:00Z",
+        "created_at": "2026-07-03T09:30:00Z",
+        "updated_at": "2026-07-28T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500004,
+        "subject": "Customer photo attached - replacement needed",
+        "status": 2,
+        "priority": 3,
+        "due_by": "2020-06-20T17:00:00Z",
+        "created_at": "2026-07-04T14:00:00Z",
+        "updated_at": "2026-07-24T12:00:00Z",
+        "tags": ["warranty"],
+        "type": "Complaint"
+      },
+      {
+        "id": 500005,
+        "subject": "Closed: customer sent pictures of cabinet",
+        "status": 5,
+        "priority": 1,
+        "due_by": "2020-06-25T17:00:00Z",
+        "created_at": "2026-07-05T08:00:00Z",
+        "updated_at": "2026-07-30T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500006,
+        "subject": "Vendor painted the topic area before delivery",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-06-30T17:00:00Z",
+        "created_at": "2026-07-06T16:00:00Z",
+        "updated_at": "2026-07-22T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500007,
+        "subject": "Please see attached pic of the broken hinge",
+        "status": 2,
+        "priority": 3,
+        "due_by": "2020-07-01T17:00:00Z",
+        "created_at": "2026-07-07T12:00:00Z",
+        "updated_at": "2026-07-21T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500008,
+        "subject": "Update on table delivery",
+        "status": 2,
+        "priority": 1,
+        "due_by": "2020-07-02T17:00:00Z",
+        "created_at": "2026-07-08T10:00:00Z",
+        "updated_at": "2026-07-27T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500009,
+        "subject": "Customer provided video of the sagging shelf",
+        "status": 2,
+        "priority": 2,
+        "created_at": "2026-07-09T09:00:00Z",
+        "updated_at": "2026-07-16T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500010,
+        "subject": "Photo of stain on mattress",
+        "status": 2,
+        "priority": 2,
+        "due_by": "not-a-date",
+        "created_at": "2026-07-10T15:00:00Z",
+        "updated_at": "2026-07-11T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500011,
+        "subject": "Awaiting pictures of the damaged nightstand",
+        "status": 6,
+        "priority": 2,
+        "due_by": "2026-07-15T17:00:00Z",
+        "created_at": "2026-07-11T13:00:00Z",
+        "updated_at": "2026-07-06T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500012,
+        "subject": "Invoice for pending order",
+        "status": 2,
+        "priority": 1,
+        "due_by": "2020-07-05T17:00:00Z",
+        "created_at": "2026-07-12T10:30:00Z",
+        "updated_at": "2026-07-01T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      }
+    ],
+    [
+      {
+        "id": 500013,
+        "subject": "Customer shared photo of drawer hinge",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-07-10T17:00:00Z",
+        "created_at": "2026-06-01T09:00:00Z",
+        "updated_at": "2026-06-11T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500014,
+        "subject": "Photo of cracked table top",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-07-15T17:00:00Z",
+        "created_at": "2026-04-01T09:00:00Z",
+        "updated_at": "2026-05-07T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500015,
+        "subject": "Picture of damaged sofa cushion",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-07-20T17:00:00Z",
+        "created_at": "2025-01-01T09:00:00Z",
+        "updated_at": "2025-07-01T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500016,
+        "subject": "Customer sent picture of new drawer pull",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2036-01-01T12:00:00Z",
+        "created_at": "2026-07-20T09:00:00Z",
+        "updated_at": "2026-07-26T12:00:00Z",
+        "tags": [],
+        "type": "Request"
+      },
+      {
+        "id": 500017,
+        "subject": "Video shows loose shelf bracket",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2036-01-02T12:00:00Z",
+        "created_at": "2026-07-20T09:00:00Z",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "tags": ["warranty"],
+        "type": "Request"
+      },
+      {
+        "id": 500018,
+        "subject": "Awaiting photo of the missing knob",
+        "status": 6,
+        "priority": 1,
+        "due_by": "2036-01-03T12:00:00Z",
+        "created_at": "2026-07-20T09:00:00Z",
+        "updated_at": "2026-07-24T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500019,
+        "subject": "Waiting on customer for pic of handle",
+        "status": 6,
+        "priority": 2,
+        "due_by": "2020-08-01T17:00:00Z",
+        "created_at": "2026-06-15T09:00:00Z",
+        "updated_at": "2026-06-26T12:00:00Z",
+        "tags": ["warranty"],
+        "type": "Complaint"
+      },
+      {
+        "id": 500020,
+        "subject": "Customer sent photos of the warped panel",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-08-05T17:00:00Z",
+        "created_at": "2026-05-01T09:00:00Z",
+        "updated_at": "2026-06-16T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      }
+    ],
+    [
+      {
+        "id": 500021,
+        "subject": "Photo of cracked glass shelf",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-08-10T17:00:00Z",
+        "created_at": "2026-07-25T09:00:00Z",
+        "updated_at": "2026-08-03T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500022,
+        "subject": "Pictures of detached drawer front",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-08-15T17:00:00Z",
+        "created_at": "2026-07-25T09:00:00Z",
+        "updated_at": "2026-08-02T12:00:00Z",
+        "tags": [],
+        "type": "Request"
+      },
+      {
+        "id": 500023,
+        "subject": "Video of rattling bed frame",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-08-20T17:00:00Z",
+        "created_at": "2026-07-25T09:00:00Z",
+        "updated_at": "2026-08-01T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500024,
+        "subject": "Waiting on customer for pics of hinge",
+        "status": 6,
+        "priority": 1,
+        "due_by": "2020-08-25T17:00:00Z",
+        "created_at": "2026-06-20T09:00:00Z",
+        "updated_at": "2026-07-01T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500025,
+        "subject": "Customer will send photo next week",
+        "status": 6,
+        "priority": 1,
+        "due_by": "2036-02-01T12:00:00Z",
+        "created_at": "2026-07-21T09:00:00Z",
+        "updated_at": "2026-07-23T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      },
+      {
+        "id": 500026,
+        "subject": "Regarding the topic shelf condition",
+        "status": 2,
+        "priority": 2,
+        "due_by": "2020-09-01T17:00:00Z",
+        "created_at": "2026-07-26T09:00:00Z",
+        "updated_at": "2026-07-29T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500027,
+        "subject": "Resolved: photo of final install",
+        "status": 4,
+        "priority": 2,
+        "due_by": "2020-09-05T17:00:00Z",
+        "created_at": "2026-07-26T09:00:00Z",
+        "updated_at": "2026-07-29T12:00:00Z",
+        "tags": [],
+        "type": "Complaint"
+      },
+      {
+        "id": 500028,
+        "subject": "Delivery schedule confirmation",
+        "status": 2,
+        "priority": 1,
+        "due_by": "2036-03-01T12:00:00Z",
+        "created_at": "2026-07-27T09:00:00Z",
+        "updated_at": "2026-07-28T12:00:00Z",
+        "tags": [],
+        "type": "Question"
+      }
+    ]
+  ]
+}

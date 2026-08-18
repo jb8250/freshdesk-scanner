@@ -1,59 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Freshdesk Scanner Setup (Mac) ==="
-echo ""
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
 
-# Check for python3.11
-if ! command -v python3.11 &>/dev/null; then
-  echo "Installing python@3.11 via brew..."
-  brew install python@3.11
+# Safe local setup only. This script never prompts for, reads, or writes the
+# Freshdesk API key. Live credentials remain an operator-managed file outside
+# the repository. Use FRESHDESK_OFFLINE=1 for development.
+
+echo "=== Freshdesk Scanner Setup (Mac) ==="
+
+if ! command -v python3.11 >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    echo "python3.11 not found; installing python@3.11 with Homebrew"
+    brew install python@3.11
+  else
+    echo "FAIL: python3.11 not found and Homebrew is unavailable" >&2
+    exit 1
+  fi
 else
-  echo "OK: python3.11 already installed"
+  echo "OK: python3.11 already available"
 fi
 
-# Create venv
 if [ ! -d .venv ]; then
-  echo "Creating virtual environment..."
   python3.11 -m venv .venv
 else
   echo "OK: .venv already exists"
 fi
 
-# Activate venv
-source .venv/bin/activate
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 
-# Install deps
-echo "Installing Python dependencies..."
-pip install -r requirements.txt
-
-# Download spacy model
-echo "Downloading spacy language model..."
-python -m spacy download en_core_web_lg
-
-# Set up API key directory
-mkdir -p ~/.config/furtouch
-chmod 700 ~/.config/furtouch
-
-# Prompt for API key if not present
-if [ ! -f ~/.config/furtouch/freshdesk_api_key ]; then
-  echo ""
-  echo "=== Freshdesk API Key Setup ==="
-  echo "Paste your Freshdesk API key below. It will be saved to ~/.config/furtouch/freshdesk_api_key"
-  echo "(You can find it in Freshdesk: Admin > Security > API Keys)"
-  echo ""
-  read -r -p "API Key: " api_key
-  echo "$api_key" > ~/.config/furtouch/freshdesk_api_key
-  chmod 600 ~/.config/furtouch/freshdesk_api_key
-  echo "OK: API key saved"
+if [ -f "$HOME/.config/furtouch/freshdesk_api_key" ]; then
+  perms="$(stat -f "%Lp" "$HOME/.config/furtouch/freshdesk_api_key" 2>/dev/null || stat -c "%a" "$HOME/.config/furtouch/freshdesk_api_key")"
+  echo "API-key file exists; permissions: $perms (contents not read)"
 else
-  echo "OK: API key already exists at ~/.config/furtouch/freshdesk_api_key"
+  echo "API-key file not present; offline mode does not require it"
 fi
 
 echo ""
-echo "=== Setup complete! ==="
-echo "To run the scanner:"
-echo "  source .venv/bin/activate"
-echo "  flask run --host 127.0.0.1 --port 5050"
-echo ""
+echo "=== Setup complete ==="
+echo "Safe development run:"
+echo "  FRESHDESK_OFFLINE=1 .venv/bin/flask --app app run --host 127.0.0.1 --port 5050"
 echo "Then open: http://127.0.0.1:5050/queue"
