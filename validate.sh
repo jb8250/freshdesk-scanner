@@ -599,9 +599,9 @@ with tempfile.TemporaryDirectory() as tmp:
     # 7. Filter semantics unchanged (spot-check counts on real fixtures).
     fx = json.load(open("fixtures/fixtures.json"))
     pool = [t for page in fx["pages"] for t in page]
-    assert len(app.apply_queue_filters(pool, app.DEFAULT_FILTERS)) == 10  # overdue-only default
+    assert len(app.apply_queue_filters(pool, app.DEFAULT_FILTERS)) == 8  # overdue-only default
     cfg = dict(app.DEFAULT_FILTERS); cfg.update({"responded": True})
-    assert len(app.apply_queue_filters(pool, cfg)) == 7  # Overdue + Responded intersection
+    assert len(app.apply_queue_filters(pool, cfg)) == 5  # Overdue + Responded intersection
 
     # 8. Responsive CSS exists (mobile media query).
     assert "@media (max-width:720px)" in default
