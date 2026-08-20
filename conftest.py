@@ -50,9 +50,13 @@ def clean_state(monkeypatch, tmp_path):
     # Tests must never consult an operator-provisioned external key file. This
     # keeps missing-key behavior deterministic and prevents credential reads.
     monkeypatch.setattr(scanner_app, "FRESHDESK_KEY_FILE", str(tmp_path / "absent_freshdesk_api_key"))
-    monkeypatch.setattr(scanner_app, "CACHE_FILE", str(tmp_path / "fd_test_cache_isolated.json"))
+    monkeypatch.setattr(scanner_app, "LIVE_QUEUE_CACHE_FILE", str(tmp_path / "queue_live_isolated.json"))
+    # CACHE_FILE is aliased to LIVE_QUEUE_CACHE_FILE; keep them in lock-step so
+    # no test ever touches the operator's real cache/ directory.
+    monkeypatch.setattr(scanner_app, "CACHE_FILE", scanner_app.LIVE_QUEUE_CACHE_FILE)
     monkeypatch.setattr(scanner_app.closed_live, "CLOSED_CACHE_FILE", str(tmp_path / "closed_test_cache_isolated.json"))
     monkeypatch.setattr(scanner_app.closed_live, "JOB", scanner_app.closed_live.RefreshJobManager())
+    monkeypatch.setattr(scanner_app.queue_live, "JOB", scanner_app.queue_live.RefreshJobManager())
     db_path = str(tmp_path / "review_state_test.sqlite3")
     monkeypatch.setenv("REVIEW_DB_PATH", db_path)
     scanner_app.init_db(db_path)

@@ -1,13 +1,45 @@
 """Freshdesk Review Queue Dashboard — read-only scanner + local review workflow.
 
 Routes:
-  GET  /queue               dashboard with filter controls and review views
+  GET  /queue               dashboard + local-only filter controls (render-only)
+  POST /queue/api/refresh   start one explicit finite background Freshdesk refresh
+  GET  /queue/api/refresh/status
+                            local-only progress snapshot for that refresh
+  POST /queue/api/refresh/cancel
+                            cooperatively cancel the active queue refresh
   POST /queue/api/review    save a local review result (form POST, CSRF-protected)
   POST /queue/api/opened    record that a ticket link was opened (JSON, CSRF-protected)
+  GET  /closed              closed-ticket housekeeping (render-only, cache only)
+  POST /closed/api/refresh  explicit manual retrieval for the closed cache
+  POST /closed/api/review   save a local closed-ticket review result
+  POST /closed/api/opened   record that a closed ticket link was opened
 
-Data sources:
-  live    GET /api/v2/tickets on the Freshdesk account (read-only, list endpoint only)
-  offline FRESHDESK_OFFLINE=1  -> local fixture pages, no network, no API key
+Data sources (strictly isolated):
+  live    POST /queue/api/refresh -> background GET /api/v2/tickets on the Freshdesk account
+          (read-only list endpoint; write methods POST/PUT/PATCH/DELETE never
+          used). Results are written to the LIVE queue cache
+          (cache/queue_live_tickets.json).
+  offline FRESHDESK_OFFLINE=1 -> local fixture pages (fixtures/fixtures.json),
+          no network, no API key.
+
+Network discipline (mandatory):
+  * GET /queue and GET /closed are RENDER ONLY. They must NEVER trigger a
+    Freshdesk request — not at startup, not on browser reload, not for a
+    missing or stale cache, and not on any timer. Freshness/TTL is shown
+    as information only; the user must click Refresh Tickets to re-fetch.
+  * Queue Freshdesk retrieval happens ONLY after the explicit, CSRF-protected
+    POST /queue/api/refresh starts one finite worker. Closed retrieval remains
+    POST /closed/api/refresh.
+    A bounded pagination/rate-limit sequence within that single manual
+    retrieval is permitted.
+  * Freshdesk is GET-only for data: no POST/PUT/PATCH/DELETE to the API.
+
+Cache isolation:
+  * LIVE queue cache  -> cache/queue_live_tickets.json  (written after successful Refresh only)
+  * OFFLINE fixtures  -> fixtures/fixtures.json          (loaded directly)
+  * LIVE closed cache -> cache/closed_tickets.json       (written by Refresh only)
+  The live queue cache is never read from the fixtures file and the fixtures
+  are never read from the live cache; each is addressed at a distinct path.
 
 Local review state (never sent to Freshdesk): SQLite at data/review_state.sqlite3
 (override with REVIEW_DB_PATH). Contains per-ticket review result, first/last
@@ -15,18 +47,22 @@ opened timestamps, last review change, and the ticket updated_at snapshot taken
 when a reviewed state was assigned (drives the Updated Since Review flag).
 
 Offline mode is fail-closed: it never calls the network and never reads the API
-key file. If the fixture data is missing or malformed, /queue renders an error
-page instead of falling back to live access.
+key. If the fixture data is missing or malformed, /queue renders an error page
+instead of falling back to live access.
 
 The API key is never loaded at import time. Only load_api_key() touches the key
-file, and only the live data path calls it.
+file, and only the live retrieval path calls it.
 """
 import hmac
 import json
+import math
 import os
 import re
 import secrets
 import sqlite3
+import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from math import ceil
@@ -41,6 +77,7 @@ from flask import (Flask, jsonify, redirect, render_template_string, request,
 # the single-slot refresh job. Importing it here is safe — closed_live imports
 # closed_retriever lazily, so there is no import cycle.
 import closed_live
+import queue_live
 
 app = Flask(__name__, static_folder=None)
 # Per-process random key: used only for the loopback CSRF token and flash
@@ -62,6 +99,32 @@ def is_offline() -> bool:
 FRESHDESK_DOMAIN = "broadriverretail-help.freshdesk.com"
 FRESHDESK_KEY_FILE = os.path.expanduser("~/.config/furtouch/freshdesk_api_key")
 
+
+def _safe_float_env(name, default, minimum):
+    try:
+        value = float(os.environ.get(name, str(default)))
+        if not math.isfinite(value):
+            raise ValueError
+        return max(minimum, value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int_env(name, default, minimum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+        return max(minimum, value)
+    except (TypeError, ValueError):
+        return default
+
+
+FRESHDESK_MIN_REQUEST_INTERVAL_SECONDS = _safe_float_env(
+    "FRESHDESK_MIN_REQUEST_INTERVAL_SECONDS", 6, 1
+)
+FRESHDESK_MIN_REMAINING = _safe_int_env("FRESHDESK_MIN_REMAINING", 20, 0)
+FRESHDESK_MAX_RETRIES = min(_safe_int_env("FRESHDESK_MAX_RETRIES", 2, 0), 3)
+QUEUE_RETRIEVAL_LOCK = threading.Lock()  # process-local guard for this Flask process
+
 # Never populated at import time. Live mode only.
 FRESHDESK_API_KEY = ""
 
@@ -73,17 +136,38 @@ FIXTURES_FILE = os.environ.get(
 
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
-CACHE_FILE = os.path.join(CACHE_DIR, "tickets.json")
-CACHE_TTL_SECONDS = 30 * 60
+
+# LIVE queue cache — written ONLY after an explicit successful queue refresh
+# retrieval. GET /queue reads only this file (and never the fixtures file),
+# so offline data can never satisfy a live cache read and vice versa.
+LIVE_QUEUE_CACHE_FILE = os.path.join(CACHE_DIR, "queue_live_tickets.json")
+# Historical queue cache name kept for backward compatibility of read paths;
+# the live retrieval writes to LIVE_QUEUE_CACHE_FILE.
+CACHE_FILE = LIVE_QUEUE_CACHE_FILE
+CACHE_TTL_SECONDS = 30 * 60  # informational only in live mode (never auto-fetches)
 
 UPDATED_SINCE_DAYS = 60  # ~2 months
 
 # Scanner keyword set — matches Chrome extension logic (word-boundary regex).
+# Used by the default Review Scope to show photo/video subjects only.
 KEYWORDS = [
     "photo", "photos", "picture", "pictures",
-    "pic", "pics", "video", "videos", "vid",
+    "pic", "pics", "video", "videos", "vid", "vids",
 ]
 KEYWORD_RE = re.compile(r"\b(" + "|".join(KEYWORDS) + r")\b", re.IGNORECASE)
+
+# Reviewed/closed Freshdesk tags (human-applied). Any ONE of these removes a
+# ticket from the DEFAULT review queue. Comparison is case-insensitive and
+# leading/trailing-whitespace-insensitive; stored ticket tags are never
+# mutated. This set is intentionally limited to these six values.
+REVIEWED_EXCLUSION_TAGS = frozenset({
+    "parts needed",
+    "exchange",
+    "no service needed",
+    "closed",
+    "schedule service",
+    "delivery special needed",
+})
 
 
 class OfflineDataError(Exception):
@@ -113,6 +197,75 @@ def fd_auth():
 
 def keyword_filter_hits(text):
     return bool(KEYWORD_RE.search(text or ""))
+
+
+# ---------------------------------------------------------------------------
+# Default Review Scope (Phase 1): two visible, independent scope layers.
+#
+# Layer 1 — photo/video subjects only: the ticket SUBJECT must contain one of
+# the recognized photo/video keywords (case-insensitive, word-boundary aware).
+# Only the subject field is inspected; description/body/notes/conversations/
+# attachments/requester data are never consulted for this rule.
+#
+# Layer 2 — reviewed/closed tag exclusions: a ticket carrying ANY one of the
+# six REVIEWED_EXCLUSION_TAGS is hidden from the default review queue.
+# Comparison normalizes case and surrounding whitespace for comparison only;
+# stored Freshdesk tags are never modified.
+#
+# Manual queue filters are separate and remain opt-in (neutral by default).
+# ---------------------------------------------------------------------------
+
+
+def subject_matches_photo_video(ticket):
+    """True when the ticket's SUBJECT contains a recognized photo/video
+    keyword. Subject field only. Missing/None/non-string subject fails safely
+    (no match)."""
+    subject = ticket.get("subject")
+    if not isinstance(subject, str):
+        return False
+    return bool(KEYWORD_RE.search(subject))
+
+
+def normalized_ticket_tags(ticket):
+    """Casefolded + stripped view of a ticket's tag strings, for comparison
+    only. Never mutates the source ticket. Non-list/missing tags and non-string
+    tags are ignored safely."""
+    raw = ticket.get("tags")
+    if not isinstance(raw, list):
+        return set()
+    normalized = set()
+    for tag in raw:
+        if not isinstance(tag, str):
+            continue
+        norm = tag.strip().casefold()
+        if norm:
+            normalized.add(norm)
+    return normalized
+
+
+def has_reviewed_exclusion_tag(ticket):
+    """True when the ticket carries ANY of the six reviewed/closed exclusion
+    tags (case-insensitive, whitespace-insensitive comparison only)."""
+    return bool(normalized_ticket_tags(ticket) & set(REVIEWED_EXCLUSION_TAGS))
+
+
+def passes_review_scope(ticket, config):
+    """Default working review scope layer.
+
+    Runs BEFORE the opt-in manual filters. Both scope fields default ON;
+    missing keys also default ON so a hand-built config can never silently
+    widen the default review queue. With photo_video_only OFF the subject rule
+    imposes no restriction; with hide_reviewed_tags OFF the exclusion tags
+    impose no restriction. Both OFF means every cached ticket passes this
+    layer (subject only to ticket-ID deduplication later in the pipeline).
+    """
+    photo_video_only = config.get("photo_video_only", True)
+    hide_reviewed_tags = config.get("hide_reviewed_tags", True)
+    if photo_video_only and not subject_matches_photo_video(ticket):
+        return False
+    if hide_reviewed_tags and has_reviewed_exclusion_tag(ticket):
+        return False
+    return True
 
 
 # Known status values on this account (from live ticket data):
@@ -160,15 +313,25 @@ CLOSED_MAX_DAYS = 3650
 # Dashboard filter configuration (URL-backed, documented defaults)
 # ---------------------------------------------------------------------------
 
-# Category selectors are OR'd together. Missing Tags is an AND gate.
-# Days-back window is an AND gate (updated_at based).
+# Queue filters are deliberately neutral by default. Freshdesk retrieval and
+# local filtering are separate operations: a refresh fills the cache, and the
+# operator opts into any local restriction afterward. Days is a retrieval
+# setting, not a local result filter.
+#
+# The two Review Scope fields (photo_video_only / hide_reviewed_tags) are
+# SEPARATE from the manual filters below. They define the visible default
+# working review queue and default ON. The manual filters default OFF and stay
+# independent; the explicit "Show All Cached Tickets" control turns both scope
+# fields plus every manual filter off to display the complete cache.
 DEFAULT_FILTERS = {
-    "overdue": True,      # due_by is a valid timestamp earlier than now
-    "responded": False,   # status == 2 (Customer responded)
-    "waiting": False,     # status == 6 (Waiting on customer)
-    "missing_tags": True, # AND: tags absent or empty
-    "days": 60,           # tickets updated within the last N days (1-365)
-    "review_view": "active",
+    "photo_video_only": True,    # default Review Scope: subject matches photo/video keyword
+    "hide_reviewed_tags": True,  # default Review Scope: no reviewed/closed exclusions
+    "overdue": False,            # opt-in: due_by is a valid timestamp earlier than now
+    "responded": False,          # opt-in: status == 2 (Customer responded)
+    "waiting": False,            # opt-in: status == 6 (Waiting on customer)
+    "missing_tags": False,       # opt-in: tags absent or empty
+    "days": 60,                  # Freshdesk retrieval window (1-365)
+    "review_view": "all",        # neutral local review-state view
 }
 DAYS_MIN, DAYS_MAX, DAYS_DEFAULT = 1, 365, 60
 REVIEW_VIEWS = ("active", "completed", "all")
@@ -253,62 +416,112 @@ def parse_days(value):
     return n
 
 
-def parse_review_view(value):
+def parse_review_view(value, default=None):
     if value in REVIEW_VIEWS:
         return value
-    return DEFAULT_FILTERS["review_view"]  # invalid -> active
+    if default in REVIEW_VIEWS:
+        return default
+    return DEFAULT_FILTERS["review_view"]  # queue invalid/missing -> neutral All
 
 
-def filters_from_args(args):
-    """Build a canonical filter config from raw query args. Every value is
-    validated; invalid or missing values fall back to the documented default.
-    Repeated query values: the last occurrence wins.
+def filters_from_args(args, submitted=False):
+    """Build a canonical filter config from query or submitted form values.
+
+    GET/query parsing retains documented defaults. A submitted HTML form uses
+    false for an absent checkbox because unchecked checkboxes are omitted by the
+    browser; this distinction is intentional and must not change defaults.
     """
+    checkbox_default = False if submitted else None
+    def checkbox(name):
+        value = _last_value(args, name)
+        default = checkbox_default if submitted else DEFAULT_FILTERS[name]
+        return parse_bool(value, default)
     return {
-        "overdue": parse_bool(_last_value(args, "overdue"), DEFAULT_FILTERS["overdue"]),
-        "responded": parse_bool(_last_value(args, "responded"), DEFAULT_FILTERS["responded"]),
-        "waiting": parse_bool(_last_value(args, "waiting"), DEFAULT_FILTERS["waiting"]),
-        "missing_tags": parse_bool(_last_value(args, "missing_tags"), DEFAULT_FILTERS["missing_tags"]),
+        "photo_video_only": checkbox("photo_video_only"),
+        "hide_reviewed_tags": checkbox("hide_reviewed_tags"),
+        "overdue": checkbox("overdue"),
+        "responded": checkbox("responded"),
+        "waiting": checkbox("waiting"),
+        "missing_tags": checkbox("missing_tags"),
         "days": parse_days(_last_value(args, "days")),
         "review_view": parse_review_view(_last_value(args, "review_view")),
     }
 
 
 def filter_query_string(config):
-    """Canonical query string for a filter config (all five filter params +
-    review_view). Used by the form action, preset links, and redirects."""
+    """Canonical query string for a filter config (review scope + manual filters
+    + review_view). Used by the form action, preset links, and redirects so
+    every URL-backed state can be reproduced exactly."""
     return urlencode({
-        "overdue": "1" if config["overdue"] else "0",
-        "responded": "1" if config["responded"] else "0",
-        "waiting": "1" if config["waiting"] else "0",
-        "missing_tags": "1" if config["missing_tags"] else "0",
-        "days": str(config["days"]),
-        "review_view": config["review_view"],
+        "photo_video_only": "1" if config.get("photo_video_only", True) else "0",
+        "hide_reviewed_tags": "1" if config.get("hide_reviewed_tags", True) else "0",
+        "overdue": "1" if config.get("overdue") else "0",
+        "responded": "1" if config.get("responded") else "0",
+        "waiting": "1" if config.get("waiting") else "0",
+        "missing_tags": "1" if config.get("missing_tags") else "0",
+        "days": str(config.get("days", DAYS_DEFAULT)),
+        "review_view": config.get("review_view", "all"),
     })
 
 
 _VIEW_LABEL = {"active": "Active", "completed": "Completed", "all": "All"}
 
 
+def _last_refresh_display(cache_age, offline):
+    if offline or cache_age is None:
+        return "Never"
+    mins = max(0, int(cache_age) // 60)
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    hrs = mins // 60
+    if hrs < 24:
+        return f"{hrs} hour{'s' if hrs != 1 else ''} ago"
+    days = hrs // 24
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
+
+def _cache_coverage_display(cached_days, selected_days):
+    if not isinstance(cached_days, int):
+        return "Unknown"
+    label = f"Last {cached_days} day{'s' if cached_days != 1 else ''}"
+    if isinstance(selected_days, int) and selected_days > cached_days:
+        return f"{label} (selected {selected_days})"
+    return label
+
+
 def filter_summary_text(config):
-    """Human-readable active-filter summary derived solely from the canonical
-    filter config (which itself comes from the parsed URL state). Rendered as
-    the dashboard's filter-summary bar so it always matches the filters the
-    page is actually using."""
-    prim = []
+    """Human-readable summary of *local* queue restrictions only.
+
+    Days is intentionally omitted because it controls the Freshdesk retrieval
+    window rather than filtering the already-cached rows. The Review Scope
+    fields are shown first because they define the default working queue;
+    manual filters and the review view are shown after them. With every scope
+    field and manual filter off and Review View=All, the queue is a complete
+    view of the cache.
+    """
+    segments = []
+    if config.get("photo_video_only"):
+        segments.append("Photo/video subjects only")
+    if config.get("hide_reviewed_tags"):
+        segments.append("No reviewed/closed tags")
     if config.get("overdue"):
-        prim.append("Overdue")
+        segments.append("Overdue")
     if config.get("responded"):
-        prim.append("Customer Responded")
+        segments.append("Customer Responded")
     if config.get("waiting"):
-        prim.append("Waiting on Customer")
-    if not prim:
-        return "Showing: No ticket category selected"
-    label = _VIEW_LABEL.get(config.get("review_view"), _VIEW_LABEL["active"])
-    segments = list(prim)
+        segments.append("Waiting on Customer")
     if config.get("missing_tags"):
         segments.append("Missing Tags")
-    return f"Showing: {' + '.join(segments)} \u00b7 Last {config.get('days', 60)} days \u00b7 {label}"
+    view = config.get("review_view", "all")
+    if not segments and view == "all":
+        return "Showing: All cached tickets"
+    if not segments:
+        segments.append("All ticket conditions")
+    if view != "all":
+        segments.append(f"{_VIEW_LABEL.get(view, 'All')} review view")
+    return f"Showing: {' + '.join(segments)}"
 
 
 
@@ -348,9 +561,11 @@ def category_matches(t, category):
 
 
 def has_primary_filter(config):
-    """At least one of Overdue / Customer Responded / Waiting on Customer must
-    be selected. When all three are OFF no category restriction is in effect,
-    so no tickets are shown and the 'select a filter' message is displayed."""
+    """Return whether any primary condition/status checkbox is selected.
+
+    This is informational only. A false result now means "no primary
+    restriction", not "show no rows".
+    """
     return config["overdue"] or config["responded"] or config["waiting"]
 
 
@@ -393,25 +608,18 @@ def matches_days_window(t, config):
 
 
 def passes_filters(t, config=None):
-    """Business-rule filter used by the dashboard: status gate (the review
-    queue only contains Customer Responded / Waiting on Customer tickets),
-    keyword gate, then the mixed filter model — at least one primary filter
-    selected (Overdue / Customer Responded / Waiting on Customer), the status
-    group ORs the two statuses, and Overdue and Missing Tags each AND in as
-    separate dimensions. Days-back window is intentionally NOT part of this
-    predicate (it is applied separately as an AND gate at render time).
+    """Apply only the local filters the operator explicitly selected.
 
-    `config` is a filter dict from filters_from_args(); when omitted the
-    documented defaults apply (Overdue ON, Customer Responded OFF, Waiting
-    OFF, Missing Tags ON) — the original scanner's default behavior.
+    There are no hidden queue gates here. In particular, status, subject
+    keywords, Overdue, and Missing Tags do not restrict the cache unless their
+    visible controls are selected. The two status controls OR together;
+    Overdue and Missing Tags are independent AND restrictions when enabled.
+    With every checkbox off this predicate returns True for every cached row.
+
+    Days is not a local filter; it controls the Freshdesk retrieval window.
+    Review View is applied separately from local SQLite state in ``queue()``.
     """
-    if t.get("status") not in SCAN_STATUSES:
-        return False  # Closed/Resolved/Open tickets are never part of the review queue
-    if not keyword_filter_hits(t.get("subject")):
-        return False
     cfg = config or dict(DEFAULT_FILTERS)
-    if not has_primary_filter(cfg):
-        return False
     if not matches_status_group(t, cfg):
         return False
     if not matches_overdue(t, cfg):
@@ -426,28 +634,206 @@ def passes_filters(t, config=None):
 # ---------------------------------------------------------------------------
 
 
-def paginate_tickets():
-    """Fetch all tickets across pages from the list endpoint. Live mode only."""
+class QueueQuotaStop(Exception):
+    """The current scan stopped before requesting another page."""
+
+
+class QueueRateLimitError(Exception):
+    """A bounded 429 retry sequence could not complete."""
+
+
+class QueueCancelled(Exception):
+    """Cooperative cancellation stopped the current queue retrieval."""
+
+
+# Phase 2: Freshdesk's normal timestamp propagation is approximately one
+# second in the audited data.  Five seconds is deliberately small; a longer
+# unexplained tail remains UPDATED SINCE REVIEW.
+CONVERSATION_UPDATE_TOLERANCE_SECONDS = 5
+CONVERSATION_MAX_PAGES = 10
+
+
+def conversation_classification(conversation):
+    """Classify only defensible Freshdesk conversation metadata.
+
+    ``incoming`` is the customer/external discriminator.  ``private`` is the
+    internal-note discriminator; source and user_id are intentionally ignored.
+    """
+    if not isinstance(conversation, dict):
+        return "ambiguous"
+    incoming = conversation.get("incoming")
+    private = conversation.get("private")
+    if not isinstance(incoming, bool) or not isinstance(private, bool):
+        return "ambiguous"
+    if incoming and not private:
+        return "customer"
+    if not incoming and private:
+        return "private"
+    if not incoming and not private:
+        return "public"
+    return "ambiguous"
+
+
+def conversation_activity_timestamp(conversation):
+    """Return max(valid created_at, updated_at), or None for malformed data."""
+    if not isinstance(conversation, dict):
+        return None
+    values = []
+    for key in ("created_at", "updated_at"):
+        raw = conversation.get(key)
+        if raw is not None:
+            parsed = parse_dt(raw)
+            if parsed is None:
+                return None
+            values.append(parsed)
+    return max(values) if values else None
+
+
+def review_ticket_fingerprint(ticket):
+    """Canonicalize fields whose change is meaningful to review state.
+
+    Tags are semantically unordered.  Volatile API bookkeeping fields are not
+    included, so a private note can be the sole harmless change.
+    """
+    if not isinstance(ticket, dict):
+        return None
+    tags = ticket.get("tags")
+    if not isinstance(tags, list):
+        return None
+    custom = ticket.get("custom_fields")
+    if custom is not None and not isinstance(custom, dict):
+        return None
+    return (
+        ticket.get("status"), ticket.get("subject"), ticket.get("priority"),
+        ticket.get("type"), ticket.get("group_id"), ticket.get("responder_id"),
+        ticket.get("due_by"), ticket.get("fr_due_by"),
+        tuple(sorted(str(tag).strip().casefold() for tag in tags)),
+        json.dumps(custom or {}, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
+def _queue_settings():
+    return (
+        _safe_float_env("FRESHDESK_MIN_REQUEST_INTERVAL_SECONDS", 6, 1),
+        _safe_int_env("FRESHDESK_MIN_REMAINING", 20, 0),
+        min(_safe_int_env("FRESHDESK_MAX_RETRIES", 2, 0), 3),
+    )
+
+
+def _header_int(response, name):
+    value = getattr(response, "headers", {}).get(name)
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def paginate_tickets(days=DAYS_DEFAULT, clock=None, sleeper=None,
+                     progress_callback=None, cancel_callback=None):
+    """Fetch all tickets conservatively, optionally reporting progress.
+
+    Request count means Freshdesk HTTP request attempts, including 429s.
+    Existing pacing, retry, quota, and GET-only behavior are preserved.
+    """
+    days = parse_days(days)
+    clock = clock or time.monotonic
+    sleeper = sleeper or time.sleep
+    started = clock()
+    interval, min_remaining, max_retries = _queue_settings()
     page = 1
     per_page = 100
-    since = (now_utc() - timedelta(days=UPDATED_SINCE_DAYS)).isoformat()
+    last_start = None
+    pages_completed = 0
+    tickets_received = 0
+    request_count = 0
+    last_remaining = None
+    def emit(state="running", wait_seconds=0, error=None):
+        if progress_callback:
+            progress_callback({"state": state, "page": page,
+                               "pages_completed": pages_completed,
+                               "tickets_received": tickets_received,
+                               "request_count": request_count,
+                               "rate_limit_remaining": last_remaining,
+                               "elapsed_seconds": round(clock() - started, 3),
+                               "wait_seconds": wait_seconds, "error": error})
+    def wait(seconds):
+        remaining = max(0, seconds)
+        if remaining:
+            emit("waiting", remaining)
+        if not cancel_callback:
+            sleeper(remaining)
+            return True
+        while remaining > 0:
+            if cancel_callback():
+                emit("cancelled")
+                return False
+            step = min(remaining, 0.25)
+            sleeper(step)
+            remaining -= step
+        return not cancel_callback()
+    since = (now_utc() - timedelta(days=days)).isoformat()
     while True:
-        url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets"
-        params = {"page": page, "per_page": per_page, "updated_since": since}
-        r = requests.get(url, auth=fd_auth(), params=params, timeout=30)
-        if r.status_code == 429:
-            retry = r.headers.get("Retry-After")
-            wait = int(retry) if retry and retry.isdigit() else 5
-            raise requests.exceptions.HTTPError(
-                f"429 rate-limited by Freshdesk. Retry after {wait}s."
-            )
+        if cancel_callback and cancel_callback():
+            emit("cancelled")
+            raise QueueCancelled("Queue refresh cancelled.")
+        retries = 0
+        while True:
+            elapsed = None if last_start is None else clock() - last_start
+            if elapsed is not None and elapsed < interval and not wait(interval - elapsed):
+                raise QueueCancelled("Queue refresh cancelled.")
+            last_start = clock()
+            emit("before_request")
+            url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets"
+            params = {"page": page, "per_page": per_page, "updated_since": since}
+            request_count += 1
+            r = requests.get(url, auth=fd_auth(), params=params, timeout=30)
+            if r.status_code != 429:
+                break
+            retry_after = _header_int(r, "Retry-After")
+            wait_seconds = retry_after if retry_after is not None else max(6, interval)
+            if retries >= max_retries:
+                emit("failed", error=f"Freshdesk rate limit retry limit reached on page {page}.")
+                raise QueueRateLimitError(
+                    f"Freshdesk rate limit retry limit reached on page {page}."
+                )
+            if not wait(wait_seconds):
+                raise QueueCancelled("Queue refresh cancelled.")
+            retries += 1
+
         r.raise_for_status()
         data = r.json()
+        # Read supported quota headers after every response. Invalid or missing
+        # metadata is intentionally ignored; only a valid Remaining value can
+        # activate the conservative safety stop.
+        rate_limit_metadata = {
+            name: _header_int(r, name)
+            for name in (
+                "X-RateLimit-Total",
+                "X-RateLimit-Remaining",
+                "X-RateLimit-Used-CurrentRequest",
+                "Retry-After",
+            )
+        }
+        remaining = rate_limit_metadata["X-RateLimit-Remaining"]
+        last_remaining = remaining
+        emit("response")
         if not data:
             break
-        yield from data
+        for ticket in data:
+            if cancel_callback and cancel_callback():
+                emit("cancelled")
+                raise QueueCancelled("Queue refresh cancelled.")
+            tickets_received += 1
+            yield ticket
+        pages_completed += 1
+        emit("running")
         if len(data) < per_page:
             break
+        if remaining is not None and remaining <= min_remaining:
+            raise QueueQuotaStop(
+                f"Freshdesk API quota is getting low. Retrieval stopped with {remaining} calls remaining."
+            )
         page += 1
 
 
@@ -487,44 +873,265 @@ def offline_paginate_tickets():
             yield t
 
 
-def get_ticket_pool():
-    """Return (raw_tickets, cache_age_seconds) using the 30-min cache.
+def load_live_queue_cache():
+    """Read the LIVE queue cache (cache/queue_live_tickets.json).
 
-    Live mode fetches from Freshdesk; offline mode fetches from fixtures. The
-    cache stores the raw ticket list; dashboard filtering (categories, missing
-    tags, days window) happens at render time so every URL-backed filter
-    combination is evaluated against the full pool. Cache file corruption or
-    read errors fall through to a fresh fetch.
+    Render-only, network-free, never reads the API key. Returns None when the
+    cache is absent, malformed, or wrong-shape — so offline fixtures can NEVER
+    satisfy a live cache read (they live in fixtures/ and are addressed
+    separately here). TTL is NOT evaluated: missing/stale cache is a valid
+    render state, it never triggers a fetch.
     """
+    if not os.path.exists(LIVE_QUEUE_CACHE_FILE):
+        return None
+    try:
+        with open(LIVE_QUEUE_CACHE_FILE, "r") as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(blob, dict) or not isinstance(blob.get("tickets"), list):
+        return None
+    return blob
+
+
+def save_live_queue_cache(tickets, days=DAYS_DEFAULT):
+    """Write the LIVE queue cache atomically with its retrieval window.
+
+    Called ONLY by the explicit queue Refresh Tickets worker after complete success. Older
+    cache files without ``days`` remain readable as legacy/unknown coverage.
+    """
+    days = parse_days(days)
     now_ts = now_utc().timestamp()
-    cached = None
-    if os.path.exists(CACHE_FILE):
+    payload = {"fetched_at": now_ts, "days": days, "tickets": list(tickets)}
+    directory = os.path.dirname(os.path.abspath(LIVE_QUEUE_CACHE_FILE)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".queue_live_tickets.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, LIVE_QUEUE_CACHE_FILE)
+    except Exception:
         try:
-            with open(CACHE_FILE, "r") as fh:
-                blob = json.load(fh)
-            if now_ts - blob.get("fetched_at", 0) < CACHE_TTL_SECONDS:
-                cached = blob
-        except Exception:
+            os.unlink(tmp)
+        except OSError:
             pass
+        raise
 
-    if cached:
-        raw = cached["tickets"]
-        cache_age = int(now_ts - cached.get("fetched_at", now_ts))
-        return raw, cache_age
 
+def fetch_live_queue(days=DAYS_DEFAULT, api_key=None, progress_callback=None, cancel_callback=None):
+    """Perform exactly ONE manual Freshdesk queue retrieval for ``days``."""
+    return list(paginate_tickets(days=parse_days(days), progress_callback=progress_callback,
+                                 cancel_callback=cancel_callback))
+
+
+def fetch_ticket_conversations(ticket_id, reviewed_at, api_key=None, clock=None,
+                                sleeper=None, cancel_callback=None,
+                                progress_callback=None):
+    """Fetch just enough conversation pages to cross ``reviewed_at``.
+
+    This uses the same interval/quota/retry policy as ticket retrieval.  A
+    bounded page ceiling or any malformed/failed response is inconclusive.
+    Returns ``(conversations, complete, remaining)``.
+    """
+    reviewed = parse_dt(reviewed_at)
+    if reviewed is None:
+        return [], False, None
+    clock = clock or time.monotonic
+    sleeper = sleeper or time.sleep
+    interval, min_remaining, max_retries = _queue_settings()
+    last_start = None
+    conversations = []
+    remaining = None
+    for page in range(1, CONVERSATION_MAX_PAGES + 1):
+        if cancel_callback and cancel_callback():
+            return conversations, False, remaining
+        elapsed = None if last_start is None else clock() - last_start
+        if elapsed is not None and elapsed < interval:
+            wait = interval - elapsed
+            if cancel_callback:
+                end = clock() + wait
+                while clock() < end:
+                    if cancel_callback():
+                        return conversations, False, remaining
+                    sleeper(min(0.25, end - clock()))
+            else:
+                sleeper(wait)
+        last_start = clock()
+        retries = 0
+        while True:
+            if cancel_callback and cancel_callback():
+                return conversations, False, remaining
+            url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{int(ticket_id)}/conversations"
+            try:
+                response = requests.get(url, auth=fd_auth(),
+                                        params={"page": page, "per_page": 30}, timeout=30)
+            except Exception:
+                return conversations, False, remaining
+            if response.status_code != 429:
+                break
+            retry_after = _header_int(response, "Retry-After")
+            wait = retry_after if retry_after is not None else max(6, interval)
+            if retries >= max_retries:
+                return conversations, False, remaining
+            if cancel_callback:
+                end = clock() + wait
+                while clock() < end:
+                    if cancel_callback():
+                        return conversations, False, remaining
+                    sleeper(min(0.25, end - clock()))
+            else:
+                sleeper(wait)
+            retries += 1
+        try:
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            return conversations, False, remaining
+        remaining = _header_int(response, "X-RateLimit-Remaining")
+        if remaining is not None and remaining <= min_remaining:
+            # This response is usable, but no further request is safe.
+            if not isinstance(data, list):
+                return conversations, False, remaining
+            conversations.extend(data)
+            oldest = [conversation_activity_timestamp(c) for c in data]
+            if any(value is None for value in oldest) or not any(value <= reviewed for value in oldest):
+                return conversations, False, remaining
+            return conversations, True, remaining
+        if not isinstance(data, list):
+            return conversations, False, remaining
+        conversations.extend(data)
+        timestamps = [conversation_activity_timestamp(c) for c in data]
+        if any(value is None for value in timestamps):
+            return conversations, False, remaining
+        if any(value <= reviewed for value in timestamps):
+            return conversations, True, remaining
+        if len(data) < 30:
+            return conversations, True, remaining
+    return conversations, False, remaining
+
+
+def _advance_review_snapshot(ticket_id, updated_at):
+    """Advance one existing queue review snapshot, preserving every field."""
+    if parse_dt(updated_at) is None:
+        return False
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT review_result FROM review_state WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
+        if row is None or row["review_result"] not in REVIEWED_STATES:
+            return False
+        conn.execute(
+            "UPDATE review_state SET reviewed_updated_at = ?, modified_at = ? WHERE ticket_id = ?",
+            (updated_at, iso_now(), ticket_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=None,
+                                         cancel_callback=None):
+    """Classify narrow reviewed/newer candidates before cache commit."""
+    old_tickets = (old_blob or {}).get("tickets") if isinstance(old_blob, dict) else None
+    old_by_id = {t.get("id"): t for t in old_tickets or [] if isinstance(t, dict)}
+    states = load_review_rows()
+    candidates = []
+    for ticket in tickets:
+        tid = ticket.get("id") if isinstance(ticket, dict) else None
+        state = states.get(tid)
+        reviewed = state.get("reviewed_updated_at") if state else None
+        if state and state.get("review_result") in REVIEWED_STATES:
+            if parse_dt(reviewed) and parse_dt(ticket.get("updated_at")) and parse_dt(ticket.get("updated_at")) > parse_dt(reviewed):
+                candidates.append(ticket)
+    updates = {}
+    inconclusive = 0
+    for index, ticket in enumerate(candidates, 1):
+        if cancel_callback and cancel_callback():
+            break
+        tid = ticket["id"]
+        state = states.get(tid)
+        old = old_by_id.get(tid)
+        if (old is None or review_ticket_fingerprint(old) is None or
+                review_ticket_fingerprint(ticket) != review_ticket_fingerprint(old)):
+            inconclusive += 1
+            continue
+        if progress_callback:
+            progress_callback({"current_stage": "Checking reviewed updates",
+                               "conversation_candidates": len(candidates),
+                               "conversation_checks_completed": index,
+                               "private_note_updates_suppressed": len(updates),
+                               "conversation_checks_inconclusive": inconclusive})
+        conversations, complete, remaining = fetch_ticket_conversations(
+            tid, state["reviewed_updated_at"], cancel_callback=cancel_callback,
+            progress_callback=progress_callback)
+        if not complete:
+            inconclusive += 1
+            continue
+        review_at = parse_dt(state["reviewed_updated_at"])
+        ticket_at = parse_dt(ticket.get("updated_at"))
+        post = [(conversation, conversation_activity_timestamp(conversation))
+                for conversation in conversations
+                if conversation_activity_timestamp(conversation) > review_at]
+        if not post or any(conversation_classification(c) != "private" for c, _ in post):
+            inconclusive += 1
+            continue
+        latest = max(value for _, value in post)
+        if ticket_at < latest or (ticket_at - latest).total_seconds() > CONVERSATION_UPDATE_TOLERANCE_SECONDS:
+            inconclusive += 1
+            continue
+        updates[tid] = ticket.get("updated_at")
+    if progress_callback:
+        progress_callback({"current_stage": "Checking reviewed updates",
+                           "conversation_candidates": len(candidates),
+                           "conversation_checks_completed": len(candidates),
+                           "private_note_updates_suppressed": len(updates),
+                           "conversation_checks_inconclusive": inconclusive})
+    def apply_updates():
+        for tid, timestamp in updates.items():
+            try:
+                _advance_review_snapshot(tid, timestamp)
+            except Exception:
+                # Cache remains valid; this ticket simply remains flagged.
+                continue
+    return list(tickets), apply_updates
+
+
+def get_ticket_pool():
+    """Return (raw_tickets, cache_age_seconds) — RENDER ONLY, never fetches.
+
+    Offline mode loads fixtures; live mode reads only the live cache. Missing,
+    stale, or legacy cache state never triggers a fetch.
+    """
     if is_offline():
         raw = list(offline_paginate_tickets())
-    else:
-        raw = list(paginate_tickets())
-    with open(CACHE_FILE, "w") as fh:
-        json.dump({"fetched_at": now_ts, "tickets": raw}, fh)
-    return raw, 0
+        return raw, None
+
+    # LIVE mode: cache read only. No network, no auto-refresh, no fetch.
+    blob = load_live_queue_cache()
+    if blob:
+        raw = blob["tickets"]
+        cache_age = now_utc().timestamp() - blob.get("fetched_at", now_utc().timestamp())
+        cached_days = blob.get("days") if isinstance(blob.get("days"), int) else None
+        return raw, int(cache_age)
+    # No live cache yet: render an empty pool. GET must not fetch.
+    return [], None
 
 
 def apply_queue_filters(tickets, config):
-    """Full dashboard filter pipeline: keyword gate, category OR, Missing Tags
-    AND gate, days-back AND gate. Dedupes by ticket id so a ticket can never
-    render twice, regardless of source quirks."""
+    """Apply default Review Scope first, then opt-in local queue filters, and
+    dedupe by ticket id.
+
+    The cache already represents the selected Freshdesk retrieval window, so
+    Days is deliberately *not* applied again here. Review Scope runs first
+    (photo/video subjects only + reviewed/closed tag exclusions); the manual
+    filters may narrow that result further. With the Review Scope controls and
+    every manual control off, this returns the complete cached ticket list
+    (deduped only).
+    """
     seen = set()
     out = []
     for t in tickets:
@@ -532,7 +1139,9 @@ def apply_queue_filters(tickets, config):
         if tid in seen:
             continue
         seen.add(tid)
-        if passes_filters(t, config) and matches_days_window(t, config):
+        if not passes_review_scope(t, config):
+            continue
+        if passes_filters(t, config):
             out.append(t)
     return out
 
@@ -994,7 +1603,7 @@ def closed_filters_from_args(args):
     return {
         "days": parse_closed_days(args.get("days", CLOSED_DEFAULT_DAYS)),
         "missing_tags": parse_bool(raw_missing),
-        "review_view": parse_review_view(args.get("review_view")),
+        "review_view": parse_review_view(args.get("review_view"), default="active"),
     }
 
 
@@ -1467,36 +2076,46 @@ def closed_ticket_known(ticket_id):
 
 @app.route("/queue")
 def queue():
+    """GET /queue — RENDER ONLY. Never fetches from Freshdesk.
+
+    Renders filter controls, uses whatever is already stored in the LIVE queue
+    cache (live mode) or the offline fixtures (offline mode), applies local
+    filters and local SQLite review state. Missing/stale/absent cache in live
+    mode is a neutral "click Refresh Tickets" state — it is NOT auto-refreshed.
+    """
     config = filters_from_args(request.args)
     offline = is_offline()
 
     # Missing-key warning so the user notices before a blank page. Skipped in
-    # offline mode — offline mode works without a key and never reads it.
+    # offline mode — offline mode works without a key and never reads it. The
+    # live page still renders the filter controls and the neutral Refresh Tickets cue so
+    # the operator always has a valid UI state; Refresh itself explains the
+    # missing key when clicked.
+    missing_key_msg = None
     if not offline and not load_api_key():
-        return _queue_error_page(
+        missing_key_msg = (
             "No Freshdesk API key found. Set FRESHDESK_API_KEY env var or write it to "
-            "~/.config/furtouch/freshdesk_api_key (chmod 600).",
-            offline,
+            "~/.config/furtouch/freshdesk_api_key (chmod 600). Refresh Tickets will not work "
+            "until a key is available."
         )
 
+    # RENDER ONLY — never fetches. OfflineDataError is the only failure path;
+    # live mode always renders successfully (possibly an empty pool).
     try:
         raw, cache_age = get_ticket_pool()
+        blob = None if offline else load_live_queue_cache()
+        cached_days = blob.get("days") if blob and isinstance(blob.get("days"), int) else None
     except OfflineDataError as e:
         return _queue_error_page(str(e), offline)
-    except requests.exceptions.HTTPError as e:
-        resp = getattr(e, "response", None)
-        detail = resp.status_code if resp is not None else str(e)
-        return _queue_error_page(
-            f"Freshdesk API error: {detail} — check your API key and permissions.", offline,
-        )
-    except Exception as e:
-        return _queue_error_page(f"Error fetching tickets: {e}", offline)
 
+    # Default state: Review Scope controls are ON (photo/video subjects only +
+    # reviewed/closed tag exclusions), all manual controls are OFF. The visible
+    # "Show All Cached Tickets" control turns the scope controls and every
+    # manual control off for a complete-cache view.
+    # ``all_categories_off`` is retained as template/context compatibility but
+    # no longer suppresses rows.
     all_categories_off = not (config["overdue"] or config["responded"] or config["waiting"])
-    if all_categories_off:
-        tickets = []
-    else:
-        tickets = apply_queue_filters(raw, config)
+    tickets = apply_queue_filters(raw, config)
 
     state_rows = load_review_rows()
     last_opened_id = last_opened_ticket_id()  # focus state, independent of filters
@@ -1535,18 +2154,68 @@ def queue():
             "row_class": row_class,
             "last_opened": is_last_opened,
             "badges": ticket_badges(t, state_row, updated_flag),
+            "can_acknowledge": bool(state_row and state_row.get("review_result") in REVIEWED_STATES and updated_flag),
         })
 
     flash_msg = session.pop("flash", None)
 
     return _queue_render(
-        tickets=rows, total=len(rows), error=None,
+        tickets=rows, total=len(rows), error=missing_key_msg,
         offline=offline, cache_age=cache_age, config=config,
         csrf_token=get_csrf_token(), flash=flash_msg,
         all_categories_off=all_categories_off,
         last_opened_id=last_opened_id,
         last_opened_rendered=any(r["last_opened"] for r in rows),
+         live_cache_missing=(None is cache_age and not offline and len(raw) == 0),
+         cached_days=cached_days,
+         last_refresh_display=_last_refresh_display(cache_age, offline),
+         cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
     )
+
+
+@app.route("/queue/api/refresh", methods=["POST"])
+def queue_refresh_start():
+    """Start one finite queue refresh; the worker performs the only API calls."""
+    days = parse_days(request.form.get("days"))
+    if not csrf_valid(request.form.get("csrf_token")):
+        return jsonify({"ok": False, "message": "Invalid security token."}), 403
+    if is_offline():
+        return jsonify({"ok": False, "message": "Offline mode: live refresh is disabled."}), 409
+    try:
+        api_key = load_api_key()
+    except Exception:
+        api_key = ""
+    if not api_key:
+        return jsonify({"ok": False, "message": "No Freshdesk API key is available."}), 503
+    old_blob = load_live_queue_cache()
+    def phase2_finalize(tickets, progress_callback=None, cancel_callback=None):
+        return _prepare_conversation_review_updates(
+            tickets, old_blob, progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+        )
+    started, message = queue_live.JOB.start(
+        days=days, api_key=api_key,
+        retrieve=fetch_live_queue,
+        save=save_live_queue_cache,
+        finalize=phase2_finalize,
+    )
+    status = queue_live.JOB.status()
+    status.update({"ok": started, "message": message})
+    return jsonify(status), (202 if started else 409)
+
+
+@app.route("/queue/api/refresh/status")
+def queue_refresh_status():
+    """Return local in-memory queue refresh state only."""
+    return jsonify(queue_live.JOB.status())
+
+
+@app.route("/queue/api/refresh/cancel", methods=["POST"])
+def queue_refresh_cancel():
+    if not csrf_valid(request.form.get("csrf_token")):
+        return jsonify({"ok": False, "message": "Invalid security token."}), 403
+    cancelled = queue_live.JOB.cancel()
+    return jsonify({"ok": cancelled, "message": "Cancel requested." if cancelled else "No queue refresh is running."})
 
 
 @app.route("/queue/api/review", methods=["POST"])
@@ -1594,6 +2263,37 @@ def review_api():
         return back_to_queue(f"Review not saved: database error ({e}).", False)
 
     return back_to_queue(f"Review saved for #{ticket_id}: {result}.", True)
+
+
+@app.route("/queue/api/acknowledge", methods=["POST"])
+def acknowledge_update_api():
+    """Acknowledge the current cached update without contacting Freshdesk."""
+    config = filters_from_args(request.form)
+    def back(msg, ok):
+        session["flash"] = ("ok" if ok else "err", msg)
+        return redirect(f"/queue?{filter_query_string(config)}", code=303)
+    if not csrf_valid(request.form.get("csrf_token")):
+        return back("Update not acknowledged: invalid security token. Reload the page and try again.", False)
+    try:
+        ticket_id = int(request.form.get("ticket_id", ""))
+    except (TypeError, ValueError):
+        return back("Update not acknowledged: invalid ticket ID.", False)
+    try:
+        pool, _ = get_ticket_pool()
+        ticket = next((t for t in pool if t.get("id") == ticket_id), None)
+        state = load_review_rows().get(ticket_id)
+        if ticket is None or state is None or state.get("review_result") not in REVIEWED_STATES:
+            return back("Update not acknowledged: reviewed ticket is unavailable.", False)
+        current = ticket.get("updated_at")
+        if parse_dt(current) is None:
+            return back("Update not acknowledged: cached timestamp is invalid.", False)
+        if not updated_since_review(ticket, state):
+            return back(f"Update already acknowledged for #{ticket_id}.", True)
+        if not _advance_review_snapshot(ticket_id, current):
+            return back("Update not acknowledged: local review state was unavailable.", False)
+    except Exception:
+        return back("Update not acknowledged: local state could not be updated.", False)
+    return back(f"Update acknowledged for #{ticket_id}.", True)
 
 
 @app.route("/queue/api/opened", methods=["POST"])
@@ -1772,8 +2472,17 @@ QUEUE_HTML = """\
 {{ nav|safe }}
 <h1>Freshdesk Review Queue</h1>
 
-<div class=sub>{% if offline %}<strong>OFFLINE MODE</strong> — using mock/offline fixture data. No network access.{% else %}Live mode — read-only ticket list.{% endif %}
-{% if cache_age is not none %} · cache {{ cache_age }}s old{% endif %}</div>
+<div class=sub>{% if offline %}<strong>OFFLINE MODE</strong> — using mock/offline fixture data. No network access.{% elif live_cache_missing %}Live mode — <strong>no Freshdesk data retrieved yet</strong>.{% else %}Live mode — read-only ticket list.{% if cache_age is not none %} · cache {{ cache_age }}s old{% endif %}{% endif %}</div>
+{% if not offline and live_cache_missing %}
+<div class=banner role=status>
+  <strong>Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets.</strong>
+  <span class=meta>Local filters never retrieve Freshdesk data.</span>
+</div>
+{% elif not offline and cached_days is none %}
+<div class=banner role=status>Current live cache coverage is unknown (legacy cache). Click Refresh Tickets to retrieve a verified {{ config.days }}-day window.</div>
+{% elif not offline and config.days > cached_days %}
+<div class=banner role=status>Current live cache covers the last {{ cached_days }} day{{ 's' if cached_days != 1 else '' }}. Click Refresh Tickets to retrieve the last {{ config.days }} days.</div>
+{% endif %}
 
 {% if flash %}
 <div class="banner {{ 'ok' if flash[0] == 'ok' else 'err' }}" role=status>{{ flash[1] }}</div>
@@ -1781,32 +2490,56 @@ QUEUE_HTML = """\
 {% if error %}
 <div class="banner err" role=alert>{{ error }}</div>
 {% endif %}
-
-<form class="controls" method=get action=/queue novalidate>
+<section aria-labelledby=live-data-heading>
+<h2 id=live-data-heading>Live Data</h2>
+<form class="controls" method=post action=/queue/api/refresh novalidate id=queue-refresh-form>
+  <input type=hidden name=csrf_token value="{{ csrf_token }}">
   <div class="panel-region region-time">
-    <span class="days-field field"><span class=lbl>Tickets updated in the last</span>
-      <input type=number name=days min=1 max=365 value={{ config.days }} aria-label="Days back">
+    <span class=field><span class=lbl>Tickets updated in the last</span>
+      <input type=number name=days min=1 max=365 value="{{ config.days }}" aria-label="Days back">
       <span class=lbl>days</span>
+      <span class=meta>Last successful refresh: {{ last_refresh_display }}</span>
+      <span class=meta>Cache coverage: {{ cache_coverage_display }}</span>
     </span>
     <div class=preset-group role=group aria-label="Quick time presets">
       {% for d in [7, 14, 30, 60, 90] %}<a class=preset href="/queue?{{ preset_urls[d] }}" {% if config.days == d %}aria-current=page{% endif %}>{% if config.days == d %}<span class=preset-mark aria-hidden=true>&#10003;</span> {% endif %}{{ d }}d</a>{% endfor %}
     </div>
   </div>
+  <div class="panel-region region-actions">
+    <div class=action-buttons>
+      <button type=submit class=apply id=queue-refresh>Refresh Tickets</button>
+    </div>
+  </div>
+</form>
+<div id=queue-refresh-status class=banner role=status aria-live=polite></div>
+<button type=button id=queue-cancel class=reset hidden>Cancel</button>
+</section>
+
+<section aria-labelledby=filter-cache-heading>
+<h2 id=filter-cache-heading>Filter Current Cache</h2>
+<form class="controls" method=get action=/queue novalidate id=queue-filter-form>
+  <input type=hidden name=days value="{{ config.days }}">
   <div class="panel-region region-groups">
+    <fieldset class="filter-group scope-group">
+      <legend class=group-lbl>Review Scope</legend>
+      <div class=field><input type=hidden name=photo_video_only value=0><label for=filter-photo-video><input type=checkbox id=filter-photo-video name=photo_video_only value=1 {{ 'checked' if config.photo_video_only }}> Photo/video subjects only</label></div>
+      <div class=field><input type=hidden name=hide_reviewed_tags value=0><label for=filter-hide-reviewed><input type=checkbox id=filter-hide-reviewed name=hide_reviewed_tags value=1 {{ 'checked' if config.hide_reviewed_tags }}> Hide tickets with reviewed/closed tags</label></div>
+      <p class=field-hint>Default working review queue. Manual filters below stay opt-in and can narrow this scope further. Use Show All Cached Tickets for the complete cache.</p>
+    </fieldset>
     <fieldset class=filter-group>
       <legend class=group-lbl>Ticket conditions</legend>
-      <div class=field><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></div>
-      <p class=field-hint>Works together with the selected status.</p>
+      <div class=field><input type=hidden name=overdue value=0><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></div>
+      <p class=field-hint>Leave unchecked for no overdue restriction.</p>
     </fieldset>
     <fieldset class=filter-group>
       <legend class=group-lbl>Freshdesk status</legend>
-      <div class=field><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></div>
-      <div class=field><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></div>
-      <p class=field-hint>Select one or both statuses.</p>
+      <div class=field><input type=hidden name=responded value=0><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></div>
+      <div class=field><input type=hidden name=waiting value=0><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></div>
+      <p class=field-hint>Select one or both statuses, or leave both unchecked for any status.</p>
     </fieldset>
     <fieldset class=filter-group>
       <legend class=group-lbl>Additional filters</legend>
-      <div class=field><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></div>
+      <div class=field><input type=hidden name=missing_tags value=0><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></div>
     </fieldset>
   </div>
   <div class="panel-region region-actions">
@@ -1816,13 +2549,14 @@ QUEUE_HTML = """\
       </select></span>
     <div class=action-buttons>
       <button type=submit class=apply>Apply Filters</button>
-      <a class=reset href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active" role=button aria-label="Reset filters to defaults">Reset to Defaults</a>
+      <a class=reset href="/queue?photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
+      <a class=reset href="/queue?photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all" role=button aria-label="Show every cached ticket">Show All Cached Tickets</a>
     </div>
   </div>
 </form>
 <p class=filter-summary role=status>{{ active_summary }}</p>
 
-<p class=count>{{ total }} tickets matching your filters</p>
+<p class=count>{{ total }} tickets displayed from the current cache</p>
 {% if last_opened_id is not none %}
   {% if last_opened_rendered %}
 <p class=last-opened-bar><button type=button id=last-opened-jump aria-controls=queue-table>Jump to Last Opened</button></p>
@@ -1830,9 +2564,7 @@ QUEUE_HTML = """\
 <div class="banner" id=last-opened-hidden role=status>Last opened ticket is hidden by the current filters.</div>
   {% endif %}
 {% endif %}
-{% if all_categories_off %}
-<div class=empty>Select Overdue or at least one status to display results.</div>
-{% elif tickets %}
+{% if tickets %}
 <div class=tablewrap>
 <table id=queue-table>
 <caption class=visually-hidden>Freshdesk review queue</caption>
@@ -1851,6 +2583,8 @@ QUEUE_HTML = """\
     <form class=rvform method=post action=/queue/api/review>
       <input type=hidden name=csrf_token value="{{ csrf_token }}">
       <input type=hidden name=ticket_id value="{{ t.id }}">
+      <input type=hidden name=photo_video_only value="{{ '1' if config.photo_video_only else '0' }}">
+      <input type=hidden name=hide_reviewed_tags value="{{ '1' if config.hide_reviewed_tags else '0' }}">
       <input type=hidden name=overdue value="{{ '1' if config.overdue else '0' }}">
       <input type=hidden name=responded value="{{ '1' if config.responded else '0' }}">
       <input type=hidden name=waiting value="{{ '1' if config.waiting else '0' }}">
@@ -1859,9 +2593,10 @@ QUEUE_HTML = """\
       <input type=hidden name=review_view value="{{ config.review_view }}">
       <select name=review_result aria-label="Review result for ticket {{ t.id }}" onchange="this.form.submit()">
         {% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}
-      </select>
-    </form>
-  </td>
+       </select>
+       {% if t.can_acknowledge %}<button type=submit class=acknowledge formaction=/queue/api/acknowledge formmethod=post aria-label="Acknowledge Update for ticket {{ t.id }}">Acknowledge Update</button>{% endif %}
+     </form>
+   </td>
   <td class=meta>{{ t.due_display | safe }}</td>
   <td class=meta>{{ t.updated_display }}</td>
   <td class=meta>{{ t.created_display }}</td>
@@ -2013,16 +2748,10 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     });
   });
 });
-// Filter controls: canonicalize on submit (Prompt05). Native HTML checkbox
-// GET forms omit *unchecked* fields entirely, so turning OFF a default-ON
-// category (Overdue, Missing Tags) submitted no parameter and the backend's
-// documented default re-checked it. On submit we prevent default navigation
-// and rebuild one canonical query string from the live control state so every
-// parameter (overdue, responded, waiting, missing_tags, days, review_view)
-// appears exactly once with an explicit 0/1 / validated value. This fires for
-// mouse click, keyboard activation, and Enter in the days field alike.
+// Local Apply Filters form (GET /queue): canonicalize every checkbox to an
+// explicit 0/1 so every local checkbox can remain intentionally unchecked. This navigation is GET-only and never contacts Freshdesk.
 (function () {
-  var form = document.querySelector('form.controls');
+  var form = document.getElementById('queue-filter-form');
   if (!form) { return; }
   function normDays(raw) {
     var v = String(raw == null ? '' : raw).trim();
@@ -2030,37 +2759,17 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     var n = parseInt(v, 10);
     return (n >= 1 && n <= 365) ? n : 60;
   }
-  function normView(v) { return (v === 'completed' || v === 'all') ? v : 'active'; }
+  function normView(v) { return (v === 'active' || v === 'completed') ? v : 'all'; }
+  // Hidden 0 values paired with the checkboxes make this a native, bookmarkable
+  // GET form: checked controls submit the later 1 value, unchecked controls
+  // submit only 0. No retrieval route is involved.
   form.addEventListener('submit', function (e) {
-    try {
-      var params = {};
-      ['overdue', 'responded', 'waiting', 'missing_tags'].forEach(function (n) {
-        var el = form.querySelector('input[name="' + n + '"]');
-        params[n] = el && el.checked ? '1' : '0';
-      });
-      var daysEl = form.querySelector('input[name=days]');
-      params['days'] = String(normDays(daysEl ? daysEl.value : null));
-      var viewEl = form.querySelector('select[name=review_view]');
-      params['review_view'] = normView(viewEl ? viewEl.value : 'active');
-      var parts = [];
-      ['overdue', 'responded', 'waiting', 'missing_tags', 'days', 'review_view'].forEach(function (k) {
-        parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
-      });
-      e.preventDefault();
-      window.location.href = '/queue?' + parts.join('&');
-    } catch (err) {
-      // On any unexpected error, fall back to native submission.
-    }
+    // Native GET submission to /queue.
   });
-  // Browser back/forward (and bfcache restore) may re-apply stale values to
-  // the controls even though the server re-rendered from the current URL
-  // (e.g. the days box showing its previous typed value while the URL says
-  // 60). Re-derive every control from the canonical URL on every pageshow so
-  // the rendered controls always reflect the address-bar state.
   function syncControlsFromURL() {
     var q = new URLSearchParams(window.location.search);
-    ['overdue', 'responded', 'waiting', 'missing_tags'].forEach(function (n) {
-      var el = form.querySelector('input[name="' + n + '"]');
+    ['photo_video_only', 'hide_reviewed_tags', 'overdue', 'responded', 'waiting', 'missing_tags'].forEach(function (n) {
+      var el = form.querySelector('input[type=checkbox][name="' + n + '"]');
       if (el) { el.checked = (q.get(n) === '1'); }
     });
     var daysEl = form.querySelector('input[name=days]');
@@ -2070,7 +2779,72 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
   }
   window.addEventListener('pageshow', function () { syncControlsFromURL(); });
 })();
-setTimeout(function(){ location.reload(); }, 300000); // auto-refresh every 5 min
+// Local Apply Filters (GET): prevent the JS refresh handler from ever calling
+// it, and rely on native form GET submission. Any interception is removed here.
+
+
+// Refresh Tickets form (POST /queue/api/refresh): start one background refresh
+// and poll the local status endpoint once per second until it terminates.
+(function () {
+  var form = document.getElementById('queue-refresh-form');
+  var statusEl = document.getElementById('queue-refresh-status');
+  if (!form || !statusEl) { return; }
+  var csrf = form.querySelector('input[name=csrf_token]');
+  var refreshBtn = document.getElementById('queue-refresh');
+  var cancelBtn = document.getElementById('queue-cancel');
+  var pollTimer = null;
+  function encode(obj) {
+    return Object.keys(obj).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k]); }).join('&');
+  }
+  function render(s) {
+    var p = s.progress || {};
+    var running = (s.state === 'running');
+    if (refreshBtn) { refreshBtn.disabled = running; }
+    if (cancelBtn) { cancelBtn.hidden = !running; }
+    var msg = s.message || '';
+    if (running || s.state === 'running') {
+      msg += ' Pages: ' + (p.pages_completed || 0);
+      msg += ' · Tickets received: ' + (p.tickets_received || 0);
+      msg += ' · Requests: ' + (p.request_count || 0);
+      var rem = p.rate_limit_remaining;
+      msg += ' · Rate limit remaining: ' + (rem == null ? 'Unknown' : rem);
+      msg += ' · Elapsed: ' + (p.elapsed_seconds != null ? p.elapsed_seconds + 's' : '0s');
+      if (p.wait_seconds) { msg += ' · Waiting before next request…'; }
+    }
+    statusEl.textContent = msg;
+    if (running) {
+      pollTimer = window.setTimeout(poll, 1000);
+    } else if (s.state === 'succeeded') {
+      // A data refresh must never silently carry local filters forward. Show
+      // the newly completed cache in the neutral local view while preserving
+      // only the retrieval Days selection.
+      var doneDays = (s.days != null ? s.days : (form.querySelector('input[name=days]') || {}).value) || 60;
+      window.location.assign('/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=' + encodeURIComponent(doneDays) + '&review_view=all');
+    } else if (s.state === 'failed' || s.state === 'cancelled') {
+      // Leave the page as-is; the prior cache is untouched.
+    }
+  }
+  function poll() {
+    fetch('/queue/api/refresh/status').then(function (r) { return r.json(); }).then(render).catch(function () {
+      statusEl.textContent = 'Unable to read refresh status.';
+    });
+  }
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', function () {
+      fetch('/queue/api/refresh/cancel', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: encode({ csrf_token: csrf ? csrf.value : '' }) }).then(function () { poll(); });
+    });
+  }
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var daysEl = form.querySelector('input[name=days]');
+    var body = encode({ csrf_token: csrf ? csrf.value : '', days: daysEl ? daysEl.value : '1' });
+    statusEl.textContent = 'Starting refresh…';
+    if (refreshBtn) { refreshBtn.disabled = true; }
+    fetch('/queue/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+      .then(function (r) { return r.json(); }).then(function (s) { render(s); if (s.state === 'running') { poll(); } })
+      .catch(function () { statusEl.textContent = 'Refresh could not be started.'; if (refreshBtn) { refreshBtn.disabled = false; } });
+  });
+})();
 </script>
 </body></html>
 """
@@ -2334,7 +3108,7 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     }
     output.textContent = msg;
     if (running) { window.setTimeout(poll, 1000); }
-    else if (s.state === 'success' && !terminalSeen) { terminalSeen = true; window.location.reload(); }
+    else if ((s.state === 'success' || s.state === 'succeeded') && !terminalSeen) { terminalSeen = true; window.location.reload(); }
   }
   function poll() { fetch('/closed/api/refresh/status').then(function(r){return r.json();}).then(render).catch(function(){ output.textContent='Unable to read refresh status.'; }); }
   start.addEventListener('click', function () {
@@ -2347,7 +3121,8 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     fetch('/closed/api/refresh/cancel', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:encode({csrf_token:CSRF_TOKEN})})
       .then(function(r){return r.json();}).then(function(s){output.textContent=s.message || ''; poll();});
   });
-  poll();
+  // No page-load poll: opening or reloading /closed performs zero requests.
+  // Status polling starts only from the explicit Refresh/Cancel actions above.
 })();
 </script>
 {% endif %}</body></html>
@@ -2386,6 +3161,9 @@ def _queue_render(**kwargs):
     ctx.setdefault("review_states", REVIEW_STATES)
     ctx.setdefault("preset_urls", {d: filter_query_string(dict(cfg, days=d)) for d in (7, 14, 30, 60, 90)})
     ctx.setdefault("active_summary", filter_summary_text(cfg))
+    ctx.setdefault("live_cache_missing", False)
+    ctx.setdefault("last_refresh_display", "Never")
+    ctx.setdefault("cache_coverage_display", "Unknown")
     return render_template_string(QUEUE_HTML, **ctx)
 
 

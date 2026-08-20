@@ -40,7 +40,12 @@ def result(*, success=True, complete=True, stop_reason="natural_exhaustion"):
 
 def test_closed_cache_is_separate_and_gitignored():
     assert "closed_tickets.json" in Path("closed_live.py").read_text()
-    assert 'CACHE_FILE = os.path.join(CACHE_DIR, "tickets.json")' in Path("app.py").read_text()
+    # The queue's LIVE cache is a distinct file from the closed cache; the two
+    # namespaces must never cross-satisfy a read.
+    src = Path("app.py").read_text()
+    assert 'LIVE_QUEUE_CACHE_FILE' in src
+    assert "queue_live_tickets.json" in src
+    assert app.LIVE_QUEUE_CACHE_FILE != closed_live.CLOSED_CACHE_FILE
     assert "CLOSED_CACHE_FILE" in Path("closed_live.py").read_text()
     assert "cache/" in Path(".gitignore").read_text()
 

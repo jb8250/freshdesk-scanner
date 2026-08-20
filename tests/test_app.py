@@ -46,6 +46,7 @@ from app import (
     is_overdue,
     is_waiting_on_customer,
     keyword_filter_hits,
+    has_reviewed_exclusion_tag,
     last_opened_ticket_id,
     load_review_rows,
     mark_opened,
@@ -53,6 +54,7 @@ from app import (
     matches_missing_tags,
     matches_overdue,
     matches_status_group,
+    normalized_ticket_tags,
     offline_paginate_tickets,
     paginate_tickets,
     parse_bool,
@@ -60,6 +62,7 @@ from app import (
     parse_dt,
     parse_review_view,
     passes_filters,
+    passes_review_scope,
     resolve_bind_host,
     review_view_includes,
     set_review_result,
@@ -71,6 +74,25 @@ from app import (
 
 T_REF = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
 FIXTURES = os.path.join(os.path.dirname(__file__), "..", "fixtures", "fixtures.json")
+
+
+def _patch_live_get(monkeypatch):
+    """Replace requests.get with a recorder that FAILS if any external request
+    actually lands. Returns the call-count dict. GET /queue must never call it.
+
+    This complements the conftest block_network guard (which raises AssertionError)
+    with an explicit count so tests can assert `calls == 0`.
+    """
+    state = {"calls": 0}
+
+    def _boom(url, *args, **kwargs):
+        state["calls"] += 1
+        raise AssertionError(
+            f"NETWORK BLOCKED: unexpected external HTTP request to {url}"
+        )
+
+    monkeypatch.setattr(requests, "get", _boom)
+    return state
 
 
 def _ids(text):
@@ -91,6 +113,12 @@ def _row_for(html, tid):
 
 def _csrf(client):
     html = client.get("/queue").get_data(as_text=True)
+    m = re.search(r'name=csrf_token value="([^"]+)"', html)
+    assert m, "csrf token not found in page"
+    return m.group(1)
+
+
+def _csrf_from_html(html):
     m = re.search(r'name=csrf_token value="([^"]+)"', html)
     assert m, "csrf token not found in page"
     return m.group(1)
@@ -132,6 +160,18 @@ def test_offline_flag_unset_means_live(monkeypatch):
     "Photo of stain on mattress",
     "Pics of the drawer front",
     "send a vid now",
+    "Customer sent the vids of the broken hinge",
+    "Photo/video request",
+    "Video/photo request - sectional",
+    "PHOTO REQUEST",
+    "Need photos",
+    "Need pictures",
+    "Customer pics",
+    "Pics requested",
+    "Need video",
+    "Send videos",
+    "Need vid",
+    "Need vids",
 ])
 def test_keyword_matches(subject):
     assert keyword_filter_hits(subject), f"expected match: {subject}"
@@ -140,6 +180,8 @@ def test_keyword_matches(subject):
 def test_keyword_matches_case_insensitive():
     assert keyword_filter_hits("PHOTO OF DAMAGE")
     assert keyword_filter_hits("Customer sent Photo of the drawer")
+    assert keyword_filter_hits("VIDEO OF DAMAGE")
+    assert keyword_filter_hits("Customer sent VIDS of the drawer")
 
 
 @pytest.mark.parametrize("subject", [
@@ -150,6 +192,8 @@ def test_keyword_matches_case_insensitive():
     "Delivery schedule confirmation",
     "provide identification",
     "topic",
+    "Photography services requested",
+    "Videography equipment needed",
 ])
 def test_keyword_non_matches(subject):
     assert not keyword_filter_hits(subject), f"expected NO match: {subject}"
@@ -157,10 +201,12 @@ def test_keyword_non_matches(subject):
 
 def test_keyword_word_boundary_vid_vs_vendor():
     assert KEYWORD_RE.search("send a vid now") is not None
+    assert KEYWORD_RE.search("send the vids please") is not None
     assert KEYWORD_RE.search("provide identification") is None
     assert KEYWORD_RE.search("topic") is None
     assert KEYWORD_RE.search("vendor") is None
     assert KEYWORD_RE.search("picturesque") is None
+    assert KEYWORD_RE.search("candid") is None
 
 
 # ---------------------------------------------------------------------------
@@ -184,202 +230,173 @@ def _ticket(**over):
     return base
 
 
-def test_filter_includes_overdue_customer_responded():
+def test_default_filters_are_neutral_and_show_cached_rows():
+    # The two Review Scope controls define the visible default working review
+    # queue and default ON. Every MANUAL local filter stays neutral (off) by
+    # default: the queue must never hide tickets because of status, due date,
+    # or missing tags unless the operator explicitly selects the filter.
+    assert DEFAULT_FILTERS == {
+        "photo_video_only": True,
+        "hide_reviewed_tags": True,
+        "overdue": False,
+        "responded": False,
+        "waiting": False,
+        "missing_tags": False,
+        "days": 60,
+        "review_view": "all",
+    }
     assert passes_filters(_ticket()) is True
+    assert passes_filters(_ticket(status=5, subject="Update on table delivery", tags=["warranty"], due_by=None)) is True
+    assert passes_filters(_ticket(status=4, subject="No photo keyword", tags=["tagged"])) is True
 
 
-def test_filter_excludes_not_yet_overdue():
-    t = _ticket(due_by="2035-01-01T12:00:00Z")
-    assert passes_filters(t) is False
+def test_default_review_scope_is_visible_and_on_by_default():
+    # The Review Scope layer is separate from the manual filters and defaults
+    # ON: photo/video subjects only, and no reviewed/closed exclusion tags.
+    cfg = dict(DEFAULT_FILTERS)
+    assert cfg["photo_video_only"] is True
+    assert cfg["hide_reviewed_tags"] is True
+    assert passes_review_scope(_ticket(subject="Photo/video request"), cfg) is True
+    assert passes_review_scope(_ticket(subject="Update on table delivery"), cfg) is False
 
 
-# MODIFIED (behavior changed by the dashboard spec): a status-2 ticket with a
-# missing due_by is no longer part of the default Overdue view. It is shown by
-# the Customer Responded category instead (with an SLA DATE UNAVAILABLE badge),
-# because "Overdue" now strictly means "valid due_by earlier than now".
-def test_filter_missing_due_by_shown_only_under_customer_responded():
-    t = _ticket(due_by=None)
-    assert passes_filters(t) is False  # default: Overdue only
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True)
-    assert passes_filters(t, cfg) is True
+def test_filter_overdue_only_is_opt_in():
+    cfg = dict(DEFAULT_FILTERS, overdue=True)
+    assert passes_filters(_ticket(due_by="2020-06-15T17:00:00Z"), cfg) is True
+    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False
+    assert passes_filters(_ticket(due_by=None), cfg) is False
+    assert passes_filters(_ticket(status=5, due_by="2020-06-15T17:00:00Z"), cfg) is True
 
 
-# MODIFIED (behavior changed by the dashboard spec): same rationale as above —
-# a malformed due_by is Customer Responded territory, not Overdue.
-def test_filter_malformed_due_by_shown_only_under_customer_responded():
-    t = _ticket(due_by="not-a-date")
-    assert passes_filters(t) is False  # default: Overdue only
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True)
-    assert passes_filters(t, cfg) is True
-
-
-# Waiting on Customer is one member of the status group (OR with Customer
-# Responded), which ANDs with the Overdue condition. Under the default config
-# (Overdue ON, Waiting OFF) a waiting ticket that is NOT overdue is hidden;
-# with Waiting selected and Overdue OFF it is shown.
-def test_filter_waiting_on_customer_requires_waiting_category():
-    # MODIFIED (Prompt 06): Overdue (ON by default) now ANDs with the status
-    # group, so a Waiting ticket must ALSO be overdue when Overdue is ON.
-    # Previously Waiting and Overdue ORed, leaking non-overdue waiting tickets.
-    t = _ticket(status=6, due_by="2035-01-01T12:00:00Z", subject="Waiting on customer for photos of shelf damage")
-    assert passes_filters(t) is False  # waiting OFF and not overdue
-    # Selecting only Waiting (Overdue OFF) shows this waiting ticket regardless of due date.
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=True)
-    assert passes_filters(t, cfg) is True
-    # Default Overdue ON + Waiting ON is an intersection: waiting AND overdue.
-    cfg_overdue = dict(DEFAULT_FILTERS, waiting=True)
-    assert passes_filters(t, cfg_overdue) is False  # waiting but not overdue
-    assert passes_filters(_ticket(status=6, subject="Waiting on customer for photos of shelf damage"), cfg_overdue) is True  # waiting AND overdue
-
-
-def test_filter_overdue_waiting_ticket_matches_via_overdue():
-    # An overdue Waiting ticket still matches when only Overdue is on: the
-    # status group imposes no restriction when neither status is selected.
-    t = _ticket(status=6, due_by="2020-06-15T17:00:00Z", subject="Waiting on customer for photos of shelf damage")
-    assert passes_filters(t) is True
-
-
-def test_filter_excludes_tagged_ticket():
-    t = _ticket(tags=["warranty"])
-    assert passes_filters(t) is False
-
-
-def test_filter_includes_tagged_ticket_when_missing_tags_off():
-    t = _ticket(tags=["warranty"])
-    cfg = dict(DEFAULT_FILTERS, missing_tags=False)
-    assert passes_filters(t, cfg) is True
-
-
-def test_filter_excludes_closed_ticket():
-    t = _ticket(status=5)
-    assert passes_filters(t) is False
-
-
-def test_filter_excludes_resolved_status4_ticket():
-    t = _ticket(status=4)
-    assert passes_filters(t) is False
-
-
-def test_filter_excludes_no_keyword_subject():
-    t = _ticket(subject="Update on table delivery")
-    assert passes_filters(t) is False
-
-
-def test_filter_excludes_vendor_and_topic_subjects():
-    t = _ticket(subject="Vendor painted the topic area")
-    assert passes_filters(t) is False
-
-
-# ---------------------------------------------------------------------------
-# Mixed filter model (Prompt 06): Overdue ANDs with the status group, the two
-# statuses OR within their group, Missing Tags ANDs, and no primary filter
-# selected shows no results. Previously all three controls ORed together,
-# which made Overdue + Customer Responded a union instead of an intersection.
-# ---------------------------------------------------------------------------
-
-
-def test_mixed_overdue_only_shows_all_overdue():
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=False, waiting=False)
-    assert passes_filters(_ticket(), cfg) is True                       # overdue responded
-    assert passes_filters(_ticket(status=6), cfg) is True               # overdue waiting
-    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False  # not overdue
-
-
-def test_mixed_customer_responded_only_shows_all_responded():
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True, waiting=False)
-    assert passes_filters(_ticket(), cfg) is True                       # responded, overdue
-    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is True  # responded, not overdue
-    assert passes_filters(_ticket(status=6), cfg) is False              # waiting excluded
-
-
-def test_mixed_waiting_only_shows_all_waiting():
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=True)
-    assert passes_filters(_ticket(status=6), cfg) is True               # waiting, overdue
-    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is True
-    assert passes_filters(_ticket(status=2), cfg) is False              # responded excluded
-
-
-def test_mixed_overdue_plus_responded_is_intersection():
-    # Regression for Prompt 06: this combination previously ORed (union) and
-    # leaked Customer-Responded-only AND Overdue-only tickets into the list.
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False)
-    assert passes_filters(_ticket(), cfg) is True                       # overdue AND responded
-    assert passes_filters(_ticket(status=6), cfg) is False              # overdue waiting: not responded
-    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False  # responded, not overdue
-
-
-def test_mixed_overdue_plus_waiting_is_intersection():
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=False, waiting=True)
-    assert passes_filters(_ticket(status=6), cfg) is True               # overdue AND waiting
-    assert passes_filters(_ticket(), cfg) is False                      # responded: not waiting
-    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is False  # waiting, not overdue
-
-
-def test_mixed_responded_plus_waiting_is_status_union():
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=True, waiting=True)
-    assert passes_filters(_ticket(status=2), cfg) is True               # responded
-    assert passes_filters(_ticket(status=6), cfg) is True               # waiting
-
-
-def test_mixed_overdue_plus_both_statuses_overdue_either_status():
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=True)
-    assert passes_filters(_ticket(), cfg) is True                       # overdue responded
-    assert passes_filters(_ticket(status=6), cfg) is True               # overdue waiting
-    assert passes_filters(_ticket(due_by="2035-01-01T12:00:00Z"), cfg) is False  # not overdue
-    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is False
-
-
-def test_mixed_all_three_off_shows_no_tickets():
-    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
-    assert passes_filters(_ticket(), cfg) is False
+def test_filter_customer_responded_only_is_opt_in():
+    cfg = dict(DEFAULT_FILTERS, responded=True)
+    assert passes_filters(_ticket(status=2), cfg) is True
     assert passes_filters(_ticket(status=6), cfg) is False
+    assert passes_filters(_ticket(status=5), cfg) is False
+
+
+def test_filter_waiting_only_is_opt_in():
+    cfg = dict(DEFAULT_FILTERS, waiting=True)
+    assert passes_filters(_ticket(status=6), cfg) is True
+    assert passes_filters(_ticket(status=2), cfg) is False
+    assert passes_filters(_ticket(status=5), cfg) is False
+
+
+def test_filter_responded_plus_waiting_is_status_union():
+    cfg = dict(DEFAULT_FILTERS, responded=True, waiting=True)
+    assert passes_filters(_ticket(status=2), cfg) is True
+    assert passes_filters(_ticket(status=6), cfg) is True
+    assert passes_filters(_ticket(status=5), cfg) is False
+
+
+def test_filter_overdue_plus_responded_is_intersection():
+    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True)
+    assert passes_filters(_ticket(status=2, due_by="2020-06-15T17:00:00Z"), cfg) is True
+    assert passes_filters(_ticket(status=2, due_by="2035-01-01T12:00:00Z"), cfg) is False
+    assert passes_filters(_ticket(status=6, due_by="2020-06-15T17:00:00Z"), cfg) is False
+
+
+def test_filter_overdue_plus_waiting_is_intersection():
+    cfg = dict(DEFAULT_FILTERS, overdue=True, waiting=True)
+    assert passes_filters(_ticket(status=6, due_by="2020-06-15T17:00:00Z"), cfg) is True
+    assert passes_filters(_ticket(status=6, due_by="2035-01-01T12:00:00Z"), cfg) is False
+    assert passes_filters(_ticket(status=2, due_by="2020-06-15T17:00:00Z"), cfg) is False
+
+
+def test_filter_missing_tags_only_is_opt_in():
+    cfg = dict(DEFAULT_FILTERS, missing_tags=True)
+    assert passes_filters(_ticket(tags=[]), cfg) is True
+    assert passes_filters(_ticket(tags=None), cfg) is True
+    assert passes_filters(_ticket(tags=["warranty"]), cfg) is False
+    # Missing Tags is allowed by itself; no status/Overdue selection is required.
+    assert passes_filters(_ticket(status=5, tags=[]), cfg) is True
+
+
+def test_filter_missing_tags_ands_with_other_filters():
+    cfg = dict(DEFAULT_FILTERS, responded=True, missing_tags=True)
+    assert passes_filters(_ticket(status=2, tags=[]), cfg) is True
+    assert passes_filters(_ticket(status=2, tags=["warranty"]), cfg) is False
+    assert passes_filters(_ticket(status=6, tags=[]), cfg) is False
+
+
+def test_all_checkbox_filters_off_means_no_restriction():
+    cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=False, missing_tags=False)
     assert has_primary_filter(cfg) is False
+    assert passes_filters(_ticket(status=2), cfg) is True
+    assert passes_filters(_ticket(status=6), cfg) is True
+    assert passes_filters(_ticket(status=5, subject="No keyword", tags=["x"], due_by=None), cfg) is True
 
 
-def test_mixed_missing_tags_applies_with_and():
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False)
-    tagged = _ticket(tags=["warranty"])
-    assert passes_filters(_ticket(), cfg) is True        # missing tags: in
-    assert passes_filters(tagged, cfg) is False          # tagged: out, even though overdue+responded
-    cfg_off = dict(cfg, missing_tags=False)
-    assert passes_filters(tagged, cfg_off) is True       # Missing Tags OFF: no restriction
+def test_subject_keyword_is_not_a_hidden_manual_filter():
+    # The photo/video subject rule lives in the visible Review Scope layer, not
+    # in the opt-in manual filter layer. passes_filters (manual layer only)
+    # must ignore subjects; passes_review_scope (default scope) applies them.
+    cfg = dict(DEFAULT_FILTERS)
+    assert passes_filters(_ticket(subject="Update on table delivery"), cfg) is True
+    assert passes_review_scope(_ticket(subject="Update on table delivery"), cfg) is False
+    # Turning the visible scope control off removes that restriction.
+    cfg_off = dict(DEFAULT_FILTERS, photo_video_only=False)
+    assert passes_review_scope(_ticket(subject="Update on table delivery"), cfg_off) is True
 
 
-def test_mixed_days_window_still_applies_with_and(monkeypatch):
+def test_days_window_is_retrieval_only_not_local_filter(monkeypatch):
     monkeypatch.setattr(app, "now_utc", lambda: T_REF)
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False, days=60)
+    cfg = dict(DEFAULT_FILTERS, days=60)
     pool = [
-        _ticket(id=1, updated_at=_updated(5)),    # in window
-        _ticket(id=2, updated_at=_updated(90)),   # outside window: excluded
+        _ticket(id=1, updated_at=_updated(5)),
+        _ticket(id=2, updated_at=_updated(90)),
+        _ticket(id=3, updated_at="garbage"),
     ]
+    # The cache already represents the retrieval window, so local Apply does
+    # not silently remove rows based on updated_at/Days.
     out = apply_queue_filters(pool, cfg)
-    assert [t["id"] for t in out] == [1]
+    assert [t["id"] for t in out] == [1, 2, 3]
 
 
-def test_mixed_no_duplicate_rows_when_ticket_matches_both():
-    # A ticket matching overdue AND responded must appear exactly once even if
-    # the raw pool contains it twice (dedupe happens before filtering).
-    cfg = dict(DEFAULT_FILTERS, overdue=True, responded=True, waiting=False)
-    pool = [_ticket(id=1), _ticket(id=1)]
-    out = apply_queue_filters(pool, cfg)
-    assert [t["id"] for t in out] == [1]
+def test_apply_queue_filters_dedupes_in_show_all_view():
+    # Show All Cached Tickets (both scope controls OFF) returns the complete
+    # cache, deduped only by ticket id — even with a non-photo subject.
+    pool = [_ticket(id=1), _ticket(id=1), _ticket(id=2, status=5, subject="No keyword")]
+    out = apply_queue_filters(pool, dict(DEFAULT_FILTERS, photo_video_only=False,
+                                         hide_reviewed_tags=False))
+    assert [t["id"] for t in out] == [1, 2]
+    # The default Review Scope narrows that pool to photo/video subjects.
+    scoped = apply_queue_filters(pool, dict(DEFAULT_FILTERS))
+    assert [t["id"] for t in scoped] == [1]
 
 
-def test_mixed_unknown_url_values_fail_safely():
-    # Garbage values fall back to documented defaults (Overdue ON), so the
-    # dashboard never crashes and never silently widens to "show everything".
-    cfg = filters_from_args(MultiDict([("overdue", "x"), ("responded", "y"), ("waiting", "z")]))
-    assert cfg["overdue"] is True and cfg["responded"] is False and cfg["waiting"] is False
-    assert passes_filters(_ticket(), cfg) is True
+def test_invalid_url_values_fall_back_to_neutral_defaults():
+    cfg = filters_from_args(MultiDict([
+        ("overdue", "x"), ("responded", "y"), ("waiting", "z"),
+        ("missing_tags", "maybe"), ("review_view", "bogus"),
+        ("photo_video_only", "banana"), ("hide_reviewed_tags", "2"),
+    ]))
+    assert cfg["overdue"] is False
+    assert cfg["responded"] is False
+    assert cfg["waiting"] is False
+    assert cfg["missing_tags"] is False
+    assert cfg["review_view"] == "all"
+    assert cfg["photo_video_only"] is True    # invalid scope value -> default ON
+    assert cfg["hide_reviewed_tags"] is True  # invalid scope value -> default ON
+    assert passes_filters(_ticket(status=5, subject="No keyword", tags=["x"]), cfg) is True
 
 
 def test_mixed_filter_query_string_canonical():
     # One value per parameter, canonical order, no duplicates — bookmarkable.
     qs = filter_query_string(dict(
+        photo_video_only=True, hide_reviewed_tags=True,
         overdue=True, responded=True, waiting=True,
         missing_tags=True, days=60, review_view="active",
     ))
-    assert qs == "overdue=1&responded=1&waiting=1&missing_tags=1&days=60&review_view=active"
+    assert qs == "photo_video_only=1&hide_reviewed_tags=1&overdue=1&responded=1&waiting=1&missing_tags=1&days=60&review_view=active"
+
+
+def test_filter_query_string_scope_defaults_on_when_missing():
+    # A config that predates the scope fields still relies on documented
+    # defaults (both scope controls ON) — missing state is never hidden.
+    qs = filter_query_string(dict(overdue=True, responded=True, waiting=False,
+                                  missing_tags=True, days=30, review_view="completed"))
+    assert qs == "photo_video_only=1&hide_reviewed_tags=1&overdue=1&responded=1&waiting=0&missing_tags=1&days=30&review_view=completed"
 
 
 def test_mixed_review_view_is_independent_and_gate(client, monkeypatch):
@@ -420,10 +437,9 @@ def test_mixed_ui_groups_and_helper_text(client):
     html = client.get("/queue").get_data(as_text=True)
     for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
         assert f"<legend class=group-lbl>{legend}</legend>" in html, legend
-    # Prompt 07 helper copy: describes how Overdue combines with status and
-    # that one or both statuses may be selected (replaces the Prompt 06 text).
-    assert "Works together with the selected status." in html
-    assert "Select one or both statuses." in html
+    # Neutral helper copy: local status restrictions are opt-in.
+    assert "Leave unchecked for no overdue restriction." in html
+    assert "Select one or both statuses, or leave both unchecked for any status." in html
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +491,8 @@ def test_parse_review_view():
     assert parse_review_view("active") == "active"
     assert parse_review_view("completed") == "completed"
     assert parse_review_view("all") == "all"
-    assert parse_review_view("bogus") == "active"
-    assert parse_review_view(None) == "active"
+    assert parse_review_view("bogus") == "all"
+    assert parse_review_view(None) == "all"
 
 
 def test_filters_from_args_defaults():
@@ -490,23 +506,27 @@ def test_filters_from_args_defaults():
 def test_filters_from_args_explicit():
     class Args:
         def getlist(self, key):
-            return {"overdue": ["1"], "responded": ["1"], "waiting": ["0"],
+            return {"photo_video_only": ["0"], "hide_reviewed_tags": ["0"],
+                    "overdue": ["1"], "responded": ["1"], "waiting": ["0"],
                     "missing_tags": ["1"], "days": ["30"], "review_view": ["completed"]}[key]
     cfg = filters_from_args(Args())
-    assert cfg == {"overdue": True, "responded": True, "waiting": False,
+    assert cfg == {"photo_video_only": False, "hide_reviewed_tags": False,
+                   "overdue": True, "responded": True, "waiting": False,
                    "missing_tags": True, "days": 30, "review_view": "completed"}
 
 
 def test_filters_from_args_invalid_falls_back_to_defaults():
     class Args:
         def getlist(self, key):
-            return {"overdue": ["banana"], "responded": ["2"], "waiting": ["maybe"],
+            return {"photo_video_only": ["maybe"], "hide_reviewed_tags": ["2"],
+                    "overdue": ["banana"], "responded": ["2"], "waiting": ["maybe"],
                     "missing_tags": ["0"], "days": ["999"], "review_view": ["nope"]}.get(key, [])
     cfg = filters_from_args(Args())
-    # invalid values fall back to defaults; "0" for missing_tags is a VALID
-    # false, so it stays False.
-    assert cfg == {"overdue": True, "responded": False, "waiting": False,
-                   "missing_tags": False, "days": 60, "review_view": "active"}
+    # invalid values fall back to defaults (scope controls default ON);
+    # "0" for missing_tags is a VALID false, so it stays False.
+    assert cfg == {"photo_video_only": True, "hide_reviewed_tags": True,
+                   "overdue": False, "responded": False, "waiting": False,
+                   "missing_tags": False, "days": 60, "review_view": "all"}
 
 
 def test_filters_from_args_repeated_values_last_wins():
@@ -527,10 +547,11 @@ def test_filters_from_args_repeated_invalid_last_uses_default():
 
 
 def test_filter_query_string_roundtrip():
-    cfg = {"overdue": True, "responded": True, "waiting": False,
+    cfg = {"photo_video_only": False, "hide_reviewed_tags": False,
+           "overdue": True, "responded": True, "waiting": False,
            "missing_tags": True, "days": 30, "review_view": "completed"}
     qs = filter_query_string(cfg)
-    assert qs == "overdue=1&responded=1&waiting=0&missing_tags=1&days=30&review_view=completed"
+    assert qs == "photo_video_only=0&hide_reviewed_tags=0&overdue=1&responded=1&waiting=0&missing_tags=1&days=30&review_view=completed"
     assert filters_from_args(_ArgsFrom(qs)) == cfg
 
 
@@ -581,13 +602,9 @@ def test_category_matches():
 
 
 def test_has_primary_filter_all_off():
-    # MODIFIED (was test_matches_any_category_all_off): the OR-over-categories
-    # predicate that made Overdue+Responded a union was replaced by the mixed
-    # model. `has_primary_filter` is the new gate that refuses to show results
-    # when Overdue / Customer Responded / Waiting on Customer are all OFF.
     cfg = dict(DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
     assert has_primary_filter(cfg) is False
-    assert passes_filters(_ticket(), cfg) is False  # no results without any primary filter
+    assert passes_filters(_ticket(), cfg) is True  # no primary selection = no restriction
 
 
 def test_has_primary_filter_requires_at_least_one():
@@ -652,16 +669,16 @@ def test_apply_queue_filters_dedupes():
     assert [t["id"] for t in out] == [1, 2]
 
 
-def test_apply_queue_filters_applies_days_and_categories(monkeypatch):
+def test_apply_queue_filters_neutral_does_not_reapply_days_or_hidden_categories(monkeypatch):
     monkeypatch.setattr(app, "now_utc", lambda: T_REF)
     pool = [
-        _ticket(id=1, updated_at=_updated(5)),                       # in
-        _ticket(id=2, updated_at=_updated(90)),                      # out (days)
-        _ticket(id=3, due_by="2035-01-01T12:00:00Z", updated_at=_updated(5)),  # out (not overdue, default)
-        _ticket(id=4, tags=["warranty"], updated_at=_updated(5)),    # out (missing tags gate)
+        _ticket(id=1, updated_at=_updated(5)),
+        _ticket(id=2, updated_at=_updated(90)),
+        _ticket(id=3, due_by="2035-01-01T12:00:00Z", updated_at=_updated(5)),
+        _ticket(id=4, tags=["warranty"], updated_at=_updated(5)),
     ]
     out = apply_queue_filters(pool, dict(DEFAULT_FILTERS))
-    assert [t["id"] for t in out] == [1]
+    assert [t["id"] for t in out] == [1, 2, 3, 4]
 
 
 # ---------------------------------------------------------------------------
@@ -860,86 +877,64 @@ def test_offline_get_ticket_pool_returns_raw_pool(monkeypatch):
 
 
 def test_cache_write_then_read(monkeypatch):
+    """The live queue cache is written only by save_live_queue_cache() (called from
+    the explicit Apply path). get_ticket_pool() does not write it — it only reads."""
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
-    calls = {"n": 0}
-    orig = app.offline_paginate_tickets
-
-    def spy():
-        calls["n"] += 1
-        yield from orig()
-
-    monkeypatch.setattr(app, "offline_paginate_tickets", spy)
-    first, _ = app.get_ticket_pool()
-    assert calls["n"] == 1
-    assert os.path.exists(app.CACHE_FILE)
-    with open(app.CACHE_FILE) as fh:
+    tickets = [{"id": 1, "status": 2, "subject": "photo", "tags": []}]
+    app.save_live_queue_cache(tickets)
+    assert os.path.exists(app.LIVE_QUEUE_CACHE_FILE)
+    with open(app.LIVE_QUEUE_CACHE_FILE) as fh:
         blob = json.load(fh)
-    assert "fetched_at" in blob and isinstance(blob["tickets"], list)
+    assert "fetched_at" in blob and blob["tickets"] == tickets
+    # A second save is idempotent and overwrites atomically.
+    app.save_live_queue_cache(tickets)
+    with open(app.LIVE_QUEUE_CACHE_FILE) as fh:
+        blob2 = json.load(fh)
+    assert blob2["tickets"] == tickets
 
-    second, cache_age = app.get_ticket_pool()
-    assert calls["n"] == 1, "second call must be served from cache"
-    assert [t["id"] for t in first] == [t["id"] for t in second]
-    assert 0 <= cache_age < app.CACHE_TTL_SECONDS
 
-
-def test_cache_expiration_triggers_refetch(monkeypatch):
-    monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
+def test_live_pool_reads_cache_and_reports_age(monkeypatch):
+    """Live get_ticket_pool() is render-only: it reads the live cache and reports
+    cache_age, but never fetches. Stale/missing cache -> (list, age) with no fetch."""
+    monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
     stale = {
         "fetched_at": time.time() - app.CACHE_TTL_SECONDS - 5,
         "tickets": [{"id": 1, "status": 2, "subject": "stale photo", "tags": []}],
     }
-    with open(app.CACHE_FILE, "w") as fh:
+    with open(app.LIVE_QUEUE_CACHE_FILE, "w") as fh:
         json.dump(stale, fh)
-    calls = {"n": 0}
-    orig = app.offline_paginate_tickets
 
-    def spy():
-        calls["n"] += 1
-        yield from orig()
-
-    monkeypatch.setattr(app, "offline_paginate_tickets", spy)
+    # patch_live_get ensures no real network could escape even if a bug called it.
+    patched = _patch_live_get(monkeypatch)
     tickets, cache_age = app.get_ticket_pool()
-    assert calls["n"] == 1, "expired cache must be refetched"
-    assert cache_age == 0
-    assert len(tickets) == 28
+    assert patched["calls"] == 0, "stale cache must NOT trigger a fetch"
+    assert [t["id"] for t in tickets] == [1]
+    assert cache_age >= app.CACHE_TTL_SECONDS
 
 
-def test_cache_fresh_file_avoids_refetch(monkeypatch):
-    monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
-    fresh = {
-        "fetched_at": time.time(),
-        "tickets": [{"id": 1, "status": 2, "subject": "fresh photo", "tags": []}],
-    }
-    with open(app.CACHE_FILE, "w") as fh:
-        json.dump(fresh, fh)
-    calls = {"n": 0}
-    orig = app.offline_paginate_tickets
-
-    def spy():
-        calls["n"] += 1
-        yield from orig()
-
-    monkeypatch.setattr(app, "offline_paginate_tickets", spy)
-    tickets, _ = app.get_ticket_pool()
-    assert calls["n"] == 0, "fresh cache must not refetch"
-    assert tickets[0]["id"] == 1
+def test_live_pool_missing_cache_never_fetches(monkeypatch):
+    """Live mode with no cached file: get_ticket_pool() returns an empty pool and
+    a None age. It must NOT fetch (the user must click Apply)."""
+    monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
+    if os.path.exists(app.LIVE_QUEUE_CACHE_FILE):
+        os.unlink(app.LIVE_QUEUE_CACHE_FILE)
+    patched = _patch_live_get(monkeypatch)
+    tickets, cache_age = app.get_ticket_pool()
+    assert patched["calls"] == 0, "missing cache must NOT trigger a fetch"
+    assert tickets == []
+    assert cache_age is None
 
 
-def test_cache_corrupt_file_refetches(monkeypatch):
-    monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
-    with open(app.CACHE_FILE, "w") as fh:
+def test_corrupt_live_cache_never_fetches(monkeypatch):
+    """A malformed live cache must not raise and must never trigger a fetch."""
+    monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
+    with open(app.LIVE_QUEUE_CACHE_FILE, "w") as fh:
         fh.write("{ not json")
-    calls = {"n": 0}
-    orig = app.offline_paginate_tickets
-
-    def spy():
-        calls["n"] += 1
-        yield from orig()
-
-    monkeypatch.setattr(app, "offline_paginate_tickets", spy)
-    tickets, _ = app.get_ticket_pool()
-    assert calls["n"] == 1, "corrupt cache must be refetched"
-    assert len(tickets) == 28
+    patched = _patch_live_get(monkeypatch)
+    tickets, cache_age = app.get_ticket_pool()
+    assert patched["calls"] == 0, "corrupt cache must NOT trigger a fetch"
+    assert tickets == []
+    assert cache_age is None
 
 
 # ---------------------------------------------------------------------------
@@ -947,31 +942,62 @@ def test_cache_corrupt_file_refetches(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_live_429_renders_error_page(monkeypatch):
+def test_live_429_returns_error_flash_on_apply(monkeypatch):
+    """A 429 during the explicit Apply retrieval now surfaces as a flash message
+    on the redirected GET, never as a GET /queue fetch. GET /queue itself still
+    renders 200 with no request."""
     monkeypatch.setenv("FRESHDESK_API_KEY", "fake-key-for-tests")
+    # Bound the retries so the background job terminates immediately (this test
+    # proves error surfacing, not retry counts) and can be awaited before the
+    # next test — an un-awaited job thread would otherwise race later tests'
+    # fake transports.
+    monkeypatch.setenv("FRESHDESK_MAX_RETRIES", "0")
 
     def fake_get(url, auth=None, params=None, timeout=None):
         return FakeResp([], status=429, headers={"Retry-After": "5"})
 
     monkeypatch.setattr(requests, "get", fake_get)
-    resp = app.app.test_client().get("/queue")
-    assert resp.status_code == 200
-    assert "Freshdesk API error" in resp.get_data(as_text=True)
+    client = app.app.test_client()
+    # GET /queue before Apply: no fetch, 200, neutral state.
+    r0 = client.get("/queue")
+    html = r0.get_data(as_text=True)
+    assert r0.status_code == 200
+    assert "no freshdesk data retrieved yet" in html.lower()
+    assert "Local filters never retrieve Freshdesk data." in html
+    # Extract the CSRF token that the page rendered (same token the form expects).
+    token = _csrf_from_html(html)
+    # Refresh starts a background job and returns 202 immediately; the fake 429
+    # path surfaces as a failed job, never as a GET fetch.
+    resp = client.post("/queue/api/refresh", data={"csrf_token": token, "days": "60"})
+    assert resp.status_code == 202
+    app.queue_live.JOB.wait(timeout=10)  # await the failing job thread
+    status = client.get("/queue/api/refresh/status").get_json()
+    assert status["state"] != "idle"  # job transitioned out of idle
 
 
-def test_live_connection_error_renders_error_page(monkeypatch):
+def test_live_connection_error_returns_error_flash_on_apply(monkeypatch):
+    """A connection error during Apply surfaces as a flash message, not a GET
+    fetch. The redirected GET renders 200 with no new request."""
     monkeypatch.setenv("FRESHDESK_API_KEY", "fake-key-for-tests")
 
     def fake_get(url, auth=None, params=None, timeout=None):
         raise requests.exceptions.ConnectionError("boom")
 
     monkeypatch.setattr(requests, "get", fake_get)
-    resp = app.app.test_client().get("/queue")
-    assert resp.status_code == 200
-    assert "Error fetching tickets" in resp.get_data(as_text=True)
+    client = app.app.test_client()
+    r0 = client.get("/queue")
+    html = r0.get_data(as_text=True)
+    assert r0.status_code == 200
+    assert "no freshdesk data retrieved yet" in html.lower()
+    token = _csrf_from_html(html)
+    resp = client.post("/queue/api/refresh", data={"csrf_token": token, "days": "60"})
+    assert resp.status_code in (202, 409)
+    app.queue_live.JOB.wait(timeout=10)  # await the failing job thread
 
 
 def test_missing_key_renders_understandable_error(monkeypatch):
+    """Live mode without a key still renders the filter controls + neutral
+    Apply cue (a valid UI state); the missing-key banner explains the issue."""
     monkeypatch.delenv("FRESHDESK_API_KEY", raising=False)
     monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
     resp = app.app.test_client().get("/queue")
@@ -979,6 +1005,9 @@ def test_missing_key_renders_understandable_error(monkeypatch):
     assert resp.status_code == 200
     assert "No Freshdesk API key found" in text
     assert "freshdesk_api_key" in text
+    # filters and the neutral Apply cue are still present
+    assert "action=/queue/api/refresh" in text
+    assert "click Refresh Tickets to retrieve Freshdesk tickets" in text
 
 
 def test_offline_cannot_fall_back_to_live(monkeypatch):
@@ -1005,14 +1034,12 @@ def test_queue_offline_renders_with_banner(monkeypatch):
     assert resp.status_code == 200
     assert "OFFLINE MODE" in text
     assert "mock/offline fixture data" in text
-    assert "#500001" in text
-    assert "#500007" in text
-    assert "matching your filters" in text
-    # excluded tickets never render
-    assert "500002" not in text
-    assert "500004" not in text
-    assert "500005" not in text
-    assert "Mohawk" not in text
+    assert "23 tickets displayed from the current cache" in text
+    # Default Review Scope (photo/video subjects only) shows matching rows;
+    # non-matching subjects are hidden until the operator opts out.
+    for tid in ("500001", "500002", "500004", "500005", "500027"):
+        assert f"#{tid}" in text
+    assert "#500028" not in text  # "Delivery schedule confirmation" hidden by scope
 
 
 def test_queue_offline_waiting_param_shows_waiting(monkeypatch):
@@ -1024,19 +1051,11 @@ def test_queue_offline_waiting_param_shows_waiting(monkeypatch):
     assert "#500011" in text
 
 
-def test_queue_offline_default_hides_not_overdue_waiting(monkeypatch):
-    """MODIFIED (behavior changed by the dashboard spec): status-6 tickets
-    with a PAST due_by now appear under the Overdue category (OR semantics),
-    so the old assertion that 500003/500011 are hidden by default no longer
-    holds. The default view still hides waiting tickets that are NOT overdue
-    (500018/500025) because the Waiting category defaults to off."""
+def test_queue_offline_default_shows_waiting_and_other_statuses_neutrally(monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
-    resp = app.app.test_client().get("/queue")
-    text = resp.get_data(as_text=True)
-    assert "#500003" in text  # overdue status-6 -> Overdue category
-    assert "#500011" in text
-    assert "#500018" not in text  # future-due waiting, Waiting OFF -> hidden
-    assert "#500025" not in text
+    text = app.app.test_client().get("/queue").get_data(as_text=True)
+    for tid in ("500003", "500011", "500018", "500025"):
+        assert f"#{tid}" in text
 
 
 def test_queue_offline_no_network_and_no_key(monkeypatch):
@@ -1053,12 +1072,13 @@ def test_refresh_link_does_not_bypass_cache(monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     resp = app.app.test_client().get("/queue")
     text = resp.get_data(as_text=True)
-    # MODIFIED (Prompt05): the Reset link now carries the full canonical
-    # default query, so a bare `href=/queue` no longer exists. The filter form
-    # still submits to /queue (its action), which is what this asserts.
+    # MODIFIED (manual-refresh): the refresh form POSTs to /queue/api/refresh;
+    # the local filter form GETs to /queue.
+    assert 'action=/queue/api/refresh' in text
     assert 'action=/queue' in text
     assert 'refresh' not in text.lower() or True  # no cache-busting param added
     assert "?refresh=" not in text and "cache=0" not in text
+    assert "setTimeout(function(){" not in text  # no 5-min auto-reload
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1092,9 @@ def test_only_expected_routes_registered():
     to the expected surface alongside the queue review endpoints."""
     rules = {r.rule for r in app.app.url_map.iter_rules()}
     assert rules == {"/queue", "/closed",
-                     "/queue/api/review", "/queue/api/opened",
+                     "/queue/api/refresh", "/queue/api/refresh/status",
+                     "/queue/api/refresh/cancel",
+                      "/queue/api/review", "/queue/api/opened", "/queue/api/acknowledge",
                      "/closed/api/review", "/closed/api/opened",
                      "/closed/api/refresh", "/closed/api/refresh/status",
                      "/closed/api/refresh/cancel"}, f"unexpected routes: {rules}"
@@ -1151,7 +1173,7 @@ def test_network_blocker_is_active():
 
 def test_dashboard_form_reflects_url_state(client):
     html = client.get("/queue?overdue=1&responded=1&waiting=0&missing_tags=1&days=30&review_view=all").get_data(as_text=True)
-    assert 'name=days min=1 max=365 value=30' in html
+    assert re.search(r'name=days min=1 max=365 value=["\']30["\']', html)
     assert 'name=overdue value=1 checked' in html
     assert 'name=responded value=1 checked' in html
     assert 'name=waiting value=1 checked' not in html  # unchecked -> no checked attribute
@@ -1161,23 +1183,24 @@ def test_dashboard_form_reflects_url_state(client):
 
 def test_dashboard_form_defaults(client):
     html = client.get("/queue").get_data(as_text=True)
-    assert 'name=days min=1 max=365 value=60' in html
-    assert 'name=overdue value=1 checked' in html
+    assert re.search(r'name=days min=1 max=365 value=["\']60["\']', html)
+    assert 'name=overdue value=1 checked' not in html
     assert 'name=responded value=1 checked' not in html
     assert 'name=waiting value=1 checked' not in html
-    assert 'name=missing_tags value=1 checked' in html
+    assert 'name=missing_tags value=1 checked' not in html
+    assert '<option value=all selected>' in html
 
 
 def test_dashboard_form_invalid_url_falls_back_to_defaults(client):
     html = client.get("/queue?days=999&overdue=banana&responded=2&review_view=bogus").get_data(as_text=True)
-    assert 'name=days min=1 max=365 value=60' in html
-    assert 'name=overdue value=1 checked' in html
-    assert '<option value=active selected>' in html
+    assert re.search(r'name=days min=1 max=365 value=["\']60["\']', html)
+    assert 'name=overdue value=1 checked' not in html
+    assert '<option value=all selected>' in html
 
 
 def test_dashboard_repeated_query_last_wins(client):
     html = client.get("/queue?days=30&days=7&overdue=0&overdue=1").get_data(as_text=True)
-    assert 'name=days min=1 max=365 value=7' in html
+    assert re.search(r'name=days min=1 max=365 value=["\']7["\']', html)
     assert 'name=overdue value=1 checked' in html
 
 
@@ -1185,30 +1208,38 @@ def test_apply_filters_link_preserves_all_params(client):
     html = client.get("/queue?overdue=1&responded=0&waiting=1&missing_tags=0&days=90&review_view=all").get_data(as_text=True)
     assert 'action=/queue' in html
     # every hidden review form carries the current filter state so POSTs
-    # redirect back to the same view
+    # redirect back to the same view (scope defaults ON for this URL)
     assert 'name=days value="90"' in html
     assert 'name=review_view value="all"' in html
+    assert 'name=photo_video_only value="1"' in html
+    assert 'name=hide_reviewed_tags value="1"' in html
     assert 'name=overdue value="1"' in html
     assert 'name=waiting value="1"' in html
     assert 'name=missing_tags value="0"' in html
 
 
 def test_all_categories_off_message(client):
-    # MODIFIED: message wording updated to match the new mixed filter model —
-    # with Overdue, Customer Responded and Waiting on Customer all OFF there is
-    # no primary restriction, so the dashboard shows no results and explains
-    # that Overdue or at least one status must be selected.
-    html = client.get("/queue?overdue=0&responded=0&waiting=0").get_data(as_text=True)
-    assert "Select Overdue or at least one status to display results." in html
-    assert "matching your filters" in html
-    assert "0 tickets matching your filters" in html
+    # Show All Cached Tickets (both scope controls plus all manual controls
+    # OFF) is the complete-cache view, not an empty-state gate.
+    html = client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=0&waiting=0&missing_tags=0&review_view=all").get_data(as_text=True)
+    assert "Select Overdue or at least one status to display results." not in html
+    assert "Showing: All cached tickets" in html
+    assert "28 tickets displayed from the current cache" in html
+
+
+def test_default_review_scope_message(client):
+    # The default queue is visibly scoped: 23 of 28 fixture tickets carry a
+    # photo/video subject keyword, and the summary names the scope controls.
+    html = client.get("/queue").get_data(as_text=True)
+    assert "Showing: Photo/video subjects only + No reviewed/closed tags" in html
+    assert "23 tickets displayed from the current cache" in html
 
 
 def test_days_presets_links(client):
     html = client.get("/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active").get_data(as_text=True)
     html = html.replace("&amp;", "&")  # Jinja autoescapes & in href attributes
     for d in ("7", "14", "30", "60", "90"):
-        assert f'class=preset href="/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days={d}&review_view=active"' in html
+        assert f'class=preset href="/queue?photo_video_only=1&hide_reviewed_tags=1&overdue=1&responded=0&waiting=0&missing_tags=1&days={d}&review_view=active"' in html
 
 
 # ===========================================================================
@@ -1216,79 +1247,116 @@ def test_days_presets_links(client):
 # ===========================================================================
 
 
+DEFAULT_SCOPED_IDS = [
+    "500001", "500002", "500003", "500004", "500005",
+    "500007", "500009", "500010", "500011", "500013",
+    "500014", "500015", "500016", "500017", "500018",
+    "500019", "500020", "500021", "500022", "500023",
+    "500024", "500025", "500027",
+]
+
+
 def test_default_view_rows(client):
-    assert _ids(client.get("/queue").get_data(as_text=True)) == [
-        "500001", "500003", "500007", "500011", "500013",
-        "500020", "500021", "500022", "500023", "500024",
+    # Bare /queue applies the visible DEFAULT REVIEW SCOPE: photo/video
+    # subjects only + no reviewed/closed tags. 23 of 28 fixture tickets carry
+    # a photo/video subject keyword; the five non-matching subjects are hidden.
+    assert _ids(client.get("/queue").get_data(as_text=True)) == DEFAULT_SCOPED_IDS
+
+
+def test_show_all_view_rows_shows_complete_cache(client):
+    # Show All Cached Tickets produces the complete cache (deduped only).
+    assert _ids(client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all").get_data(as_text=True)) == [
+        "500001", "500002", "500003", "500004", "500005", "500006",
+        "500007", "500008", "500009", "500010", "500011", "500012",
+        "500013", "500014", "500015", "500016", "500017", "500018",
+        "500019", "500020", "500021", "500022", "500023", "500024",
+        "500025", "500026", "500027", "500028",
     ]
 
 
 def test_responded_view_rows(client):
-    ids = _ids(client.get("/queue?overdue=0&responded=1&waiting=0&missing_tags=1&days=60").get_data(as_text=True))
-    # status-2, untagged, keyword, updated within 60d — including not-yet-due,
-    # missing-due and malformed-due tickets
+    # Manual filter regression, preserved with the Review Scope turned off the
+    # same way Show All Cached Tickets would: responded + missing tags only.
+    ids = _ids(client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=1&waiting=0&missing_tags=1&days=60&review_view=all").get_data(as_text=True))
     assert ids == [
-        "500001", "500002", "500007", "500009", "500010",
-        "500013", "500016", "500020", "500021", "500022", "500023",
+        "500001", "500002", "500006", "500007", "500008", "500009",
+        "500010", "500012", "500013", "500014", "500015", "500016",
+        "500020", "500021", "500022", "500023", "500026", "500028",
+    ]
+
+
+def test_responded_view_rows_under_default_scope(client):
+    # Review Scope runs first, then the manual filters narrow it further.
+    ids = _ids(client.get("/queue?overdue=0&responded=1&waiting=0&missing_tags=1&days=60&review_view=all").get_data(as_text=True))
+    assert ids == [
+        "500001", "500002", "500007", "500009", "500010", "500013",
+        "500014", "500015", "500016", "500020", "500021", "500022", "500023",
     ]
 
 
 def test_waiting_view_rows(client):
-    ids = _ids(client.get("/queue?overdue=0&responded=0&waiting=1&missing_tags=1&days=60").get_data(as_text=True))
+    ids = _ids(client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=0&waiting=1&missing_tags=1&days=60&review_view=all").get_data(as_text=True))
     assert ids == ["500003", "500011", "500018", "500024", "500025"]
 
 
 def test_overdue_plus_responded_is_intersection(client):
-    # MODIFIED (was test_overdue_plus_responded_union, Prompt 06): this combo
-    # used to OR and return every overdue OR responded ticket. It is now an
-    # AND: only tickets that are overdue AND customer-responded (with the
-    # Missing Tags gate on).
-    ids = _ids(client.get("/queue?overdue=1&responded=1&waiting=0&missing_tags=1&days=60").get_data(as_text=True))
-    expected = ["500001", "500007", "500013", "500020", "500021", "500022", "500023"]
-    assert ids == expected
-    # Union leaks that used to appear in this view are now correctly excluded:
-    assert "500002" not in ids and "500009" not in ids  # responded but NOT overdue
-    assert "500017" not in ids                          # responded but tagged + not overdue
-    assert "500003" not in ids                          # waiting (not responded)
-    assert "500004" not in ids  # tagged
+    ids = _ids(client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=all").get_data(as_text=True))
+    assert ids == [
+        "500001", "500006", "500007", "500008", "500012", "500013",
+        "500014", "500015", "500020", "500021", "500022", "500023", "500026",
+    ]
+
+
+def test_overdue_plus_responded_under_default_scope(client):
+    # Scope intersection on the same manual combination: only photo/video
+    # subjects that are overdue + responded + missing tags remain.
+    ids = _ids(client.get("/queue?overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=all").get_data(as_text=True))
+    assert ids == [
+        "500001", "500007", "500013", "500014", "500015",
+        "500020", "500021", "500022", "500023",
+    ]
 
 
 def test_missing_tags_off_includes_tagged(client):
-    ids = _ids(client.get("/queue?overdue=1&responded=0&waiting=0&missing_tags=0&days=60").get_data(as_text=True))
-    assert "500004" in ids  # overdue + tagged, now shown
-    assert "500019" in ids  # waiting + tagged
-    assert "500017" not in ids  # not overdue, responded off
+    ids = _ids(client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=1&responded=0&waiting=0&missing_tags=0&days=60&review_view=all").get_data(as_text=True))
+    assert "500004" in ids
+    assert "500019" in ids
+    assert "500017" not in ids  # not overdue
 
 
 def test_days_7_rows(client):
+    # Days controls the next Freshdesk retrieval; GET/local Apply never
+    # refilters the cache by Days — and the default Review Scope still applies.
     ids = _ids(client.get("/queue?days=7").get_data(as_text=True))
-    assert ids == ["500001", "500021", "500022", "500023"]
+    assert ids == DEFAULT_SCOPED_IDS
 
 
 def test_days_30_rows(client):
+    # Days controls the next Freshdesk retrieval; GET/local Apply never
+    # refilters the cache by Days — and the default Review Scope still applies.
     ids = _ids(client.get("/queue?days=30").get_data(as_text=True))
-    assert ids == ["500001", "500003", "500007", "500011", "500021", "500022", "500023"]
+    assert ids == DEFAULT_SCOPED_IDS
 
 
 def test_days_90_rows(client):
+    # Days controls the next Freshdesk retrieval; GET/local Apply never
+    # refilters the cache by Days — and the default Review Scope still applies.
     ids = _ids(client.get("/queue?days=90").get_data(as_text=True))
-    assert "500014" in ids  # updated exactly 90 days ago: inclusive boundary
-    assert "500015" not in ids  # updated 400 days ago
+    assert ids == DEFAULT_SCOPED_IDS
 
 
 def test_days_365_rows(client):
+    # Days controls the next Freshdesk retrieval; GET/local Apply never
+    # refilters the cache by Days — and the default Review Scope still applies.
     ids = _ids(client.get("/queue?days=365").get_data(as_text=True))
-    assert "500014" in ids      # updated 90 days ago: within 365
-    assert "500015" not in ids  # updated 400 days ago: beyond 365 (excluded)
+    assert ids == DEFAULT_SCOPED_IDS
 
 
 def test_single_row_per_ticket(client):
     html = client.get("/queue").get_data(as_text=True)
     n_rows = len(re.findall(r'<tr class="rv-', html))
-    assert n_rows == 10  # default view
+    assert n_rows == 23
     for tid in _ids(html):
-        # exactly one row -> data-ticket-id appears exactly three times
-        # (the <tr> focus anchor + ticket-number link + subject link)
         assert html.count(f'data-ticket-id="{tid}"') == 3, f"duplicate row for {tid}"
 
 
@@ -1300,10 +1368,11 @@ def test_single_row_per_ticket(client):
 def test_default_view_badges(client):
     html = client.get("/queue").get_data(as_text=True)
     assert "OVERDUE" in html
-    assert "CUSTOMER RESPONDED" in html       # status-2 rows
-    assert "WAITING ON CUSTOMER" in html      # status-6 rows (500003 etc.)
+    assert "CUSTOMER RESPONDED" in html
+    assert "WAITING ON CUSTOMER" in html
     assert "MISSING TAGS" in html
-    assert "SLA DATE UNAVAILABLE" not in html  # 500009/500010 hidden in default view
+    # Neutral view also shows tickets whose SLA date is unavailable.
+    assert "SLA DATE UNAVAILABLE" in html
 
 
 def test_sla_date_unavailable_badge(client):
@@ -1471,7 +1540,9 @@ def test_review_post_saves_and_preserves_filters(client):
         "days": "60", "review_view": "active",
     })
     assert r.status_code == 303
-    assert r.headers["Location"] == "/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    # Missing scope fields fall back to documented defaults (both ON) and the
+    # canonical URL makes every state explicit.
+    assert r.headers["Location"] == "/queue?photo_video_only=1&hide_reviewed_tags=1&overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
     rows = load_review_rows()
     assert rows[500021]["review_result"] == "Resolved"
 
@@ -1543,7 +1614,7 @@ def test_resolved_moves_to_completed_view(client):
         "overdue": "1", "responded": "0", "waiting": "0", "missing_tags": "1",
         "days": "60", "review_view": "active",
     })
-    assert "500021" not in _ids(client.get("/queue").get_data(as_text=True))
+    assert "500021" not in _ids(client.get("/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=active").get_data(as_text=True))
     assert "500021" in _ids(client.get("/queue?review_view=completed").get_data(as_text=True))
 
 
@@ -1554,7 +1625,7 @@ def test_follow_up_stays_active(client):
         "overdue": "1", "responded": "0", "waiting": "0", "missing_tags": "1",
         "days": "60", "review_view": "active",
     })
-    assert "500022" in _ids(client.get("/queue").get_data(as_text=True))
+    assert "500022" in _ids(client.get("/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=active").get_data(as_text=True))
 
 
 def test_no_action_and_na_are_completed(client):
@@ -1565,7 +1636,7 @@ def test_no_action_and_na_are_completed(client):
             "overdue": "1", "responded": "0", "waiting": "0", "missing_tags": "1",
             "days": "60", "review_view": "active",
         })
-    active = _ids(client.get("/queue").get_data(as_text=True))
+    active = _ids(client.get("/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=active").get_data(as_text=True))
     completed = _ids(client.get("/queue?review_view=completed").get_data(as_text=True))
     assert "500021" not in active and "500022" not in active
     assert "500021" in completed and "500022" in completed
@@ -1593,7 +1664,7 @@ def test_updated_since_review_returns_to_active(client):
         "days": "60", "review_view": "active",
     })
     set_review_result(500021, "Resolved", reviewed_updated_at="2026-07-01T00:00:00Z")
-    active = client.get("/queue").get_data(as_text=True)
+    active = client.get("/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=active").get_data(as_text=True)
     assert "500021" in _ids(active)                      # back in Active
     assert "UPDATED SINCE REVIEW" in active              # badge visible
     assert 'value="Resolved" selected' in active         # previous result preserved
@@ -1606,7 +1677,7 @@ def test_updated_since_review_returns_to_active(client):
         "overdue": "1", "responded": "0", "waiting": "0", "missing_tags": "1",
         "days": "60", "review_view": "active",
     })
-    active2 = client.get("/queue").get_data(as_text=True)
+    active2 = client.get("/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=active").get_data(as_text=True)
     assert "500021" not in _ids(active2)
     assert "UPDATED SINCE REVIEW" not in active2
 
@@ -1706,15 +1777,13 @@ def test_click_js_anchors_on_data_ticket_id(client):
     # Spec §4: the click handler must use a reliable DOM identifier
     # (data-ticket-id) and must never prevent the native new-tab navigation
     # (spec §5), so the external ticket always opens.
-    # MODIFIED (Prompt05): a preventDefault now exists for the filter-form
-    # canonicalizer (explicit 0/1 for unchecked checkboxes). It is scoped to
-    # that block; the ticket-link click path, which precedes it in the script,
-    # still never calls preventDefault.
+    # The filter form must retain native POST semantics; ticket links also
+    # retain their native navigation behavior.
     html = client.get("/queue").get_data(as_text=True)
     assert "querySelectorAll('a[data-ticket-id]')" in html
-    ticket_part, _, filter_part = html.partition("// Filter controls:")
-    assert "preventDefault" not in ticket_part  # ticket links still open natively
-    assert "preventDefault" in filter_part      # only the filter form canonicalizes
+    ticket_part, _, filter_part = html.partition("// Local Apply Filters form")
+    assert "preventDefault" in filter_part
+    assert "window.location.href = '/queue?'" not in filter_part
 
 
 def test_click_js_updates_row_badge_and_selector(client):
@@ -2194,7 +2263,7 @@ def test_marker_hidden_by_completed_view_shows_message(client):
 def test_resolved_marker_hidden_from_active_view(client):
     set_review_result(500001, "Resolved")
     _open(client, 500001)
-    html_active = client.get("/queue").get_data(as_text=True)  # active view
+    html_active = client.get("/queue?review_view=active").get_data(as_text=True)
     assert "id=last-opened-hidden" in html_active
     html_completed = client.get("/queue?review_view=completed").get_data(as_text=True)
     assert "rv-last-opened" in _row_for(html_completed, 500001).split('>', 1)[0]
@@ -2448,8 +2517,8 @@ def _form_parser_for(html):
 
 def _controls_form(html):
     forms = _form_parser_for(html).forms
-    controls = [f for f in forms if "controls" in f["attrs"].get("class", "")]
-    assert len(controls) == 1, f"expected exactly one controls form, got {len(controls)}"
+    controls = [f for f in forms if f["attrs"].get("id") == "queue-filter-form"]
+    assert len(controls) == 1, f"expected exactly one local filter form, got {len(controls)}"
     return controls[0], forms
 
 
@@ -2523,9 +2592,11 @@ def test_filter_checkboxes_unique_ids_and_correct_names(client):
     form, _ = _controls_form(html)
     boxes = [i for i in form["inputs"] if i.get("type") == "checkbox"]
     names = [i.get("name") for i in boxes]
-    assert names == ["overdue", "responded", "waiting", "missing_tags"]
+    assert names == ["photo_video_only", "hide_reviewed_tags",
+                     "overdue", "responded", "waiting", "missing_tags"]
     ids = [i.get("id") for i in boxes]
-    assert ids == ["filter-overdue", "filter-responded", "filter-waiting", "filter-missing"]
+    assert ids == ["filter-photo-video", "filter-hide-reviewed",
+                   "filter-overdue", "filter-responded", "filter-waiting", "filter-missing"]
     assert all(i.get("value") == "1" for i in boxes)
     all_ids = _all_ids(html)
     assert len(all_ids) == len(set(all_ids)), "duplicate element IDs in page"
@@ -2536,20 +2607,23 @@ def test_filter_checkboxes_unique_ids_and_correct_names(client):
 def test_filter_labels_are_unique_and_associated(client):
     html = client.get("/queue").get_data(as_text=True)
     # Every checkbox is wrapped by its own <label> (implicit association).
-    for name in ("overdue", "responded", "waiting", "missing_tags"):
+    for name in ("photo_video_only", "hide_reviewed_tags",
+                 "overdue", "responded", "waiting", "missing_tags"):
         m = re.search(rf"<label[^>]*for=filter-[^>]*>\s*<input[^>]*name={name}[^>]*>\s*[^<]+</label>", html)
         assert m, f"checkbox {name} lacks an associated <label>"
     assert 'aria-label="Days back"' in html  # days input has an accessible label
     assert re.search(r'<label[^>]*for=review_view>', html)  # select label present
 
 
-def test_days_input_belongs_to_filter_form(client):
-    html = client.get("/queue").get_data(as_text=True)
+def test_days_selection_is_preserved_hidden_in_local_filter_form(client):
+    html = client.get("/queue?days=7").get_data(as_text=True)
     form, _ = _controls_form(html)
     days = [i for i in form["inputs"] if i.get("name") == "days"]
-    assert days, "days input missing from filter form"
-    assert days[0].get("type") == "number"
-    assert days[0].get("min") == "1" and days[0].get("max") == "365"
+    assert days, "hidden retrieval Days state missing from local filter form"
+    assert days[0].get("type") == "hidden"
+    assert days[0].get("value") == "7"
+    # The user-editable Days control belongs only to Refresh Tickets.
+    assert re.search(r'<form[^>]*id=queue-refresh-form.*?name=days min=1 max=365', html, re.S)
 
 
 def test_review_view_control_belongs_to_filter_form(client):
@@ -2577,14 +2651,14 @@ def test_browser_parsed_dom_contains_expected_controls(client):
 
 def test_canonical_query_explicit_1_for_checked_0_for_unchecked():
     qs = filter_query_string(filters_from_args(MultiDict([])))
-    assert qs == "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    assert qs == "photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all"
 
 
 def test_canonical_query_all_three_categories_off():
     qs = filter_query_string(filters_from_args(MultiDict([
         ("overdue", "0"), ("responded", "0"), ("waiting", "0"),
     ])))
-    assert qs == "overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    assert qs == "photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all"
 
 
 def test_canonical_query_no_duplicate_parameters():
@@ -2597,11 +2671,12 @@ def test_canonical_query_no_duplicate_parameters():
     assert "overdue=1&" in qs and "responded=0&" in qs
 
 
-def test_canonical_query_all_six_params_exactly_once():
+def test_canonical_query_all_params_exactly_once():
     qs = filter_query_string(filters_from_args(MultiDict([("days", "30")])))
-    for key in ("overdue", "responded", "waiting", "missing_tags", "days", "review_view"):
+    for key in ("photo_video_only", "hide_reviewed_tags",
+                "overdue", "responded", "waiting", "missing_tags", "days", "review_view"):
         assert qs.count(f"{key}=") == 1, f"{key} must appear exactly once: {qs}"
-    assert qs.endswith("review_view=active")
+    assert qs.endswith("review_view=all")
 
 
 def test_canonical_query_unknown_boolean_falls_back():
@@ -2611,9 +2686,9 @@ def test_canonical_query_unknown_boolean_falls_back():
     assert cfg["responded"] is True  # parse_bool accepts 'yes'
 
 
-def test_canonical_query_invalid_review_view_falls_back_to_active():
+def test_canonical_query_invalid_review_view_falls_back_to_all():
     cfg = filters_from_args(MultiDict([("review_view", "wat")]))
-    assert cfg["review_view"] == "active"
+    assert cfg["review_view"] == "all"
 
 
 def test_canonical_query_invalid_days_falls_back_to_60():
@@ -2627,7 +2702,14 @@ def test_canonical_query_invalid_days_falls_back_to_60():
 
 def test_reset_link_is_exact_canonical_default_url(client):
     html = client.get("/queue").get_data(as_text=True)
-    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in html
+    # Reset to Default Review Scope: both scope controls ON, every manual
+    # control OFF, Review View All — the canonical default URL.
+    assert 'href="/queue?photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days=60&amp;review_view=all"' in html
+    assert '>Reset to Default Review Scope</a>' in html
+    # Show All Cached Tickets: both scope controls OFF and manual controls OFF.
+    assert 'href="/queue?photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days=60&amp;review_view=all"' in html
+    assert '>Show All Cached Tickets</a>' in html
+    assert '>Clear Filters</a>' not in html  # replaced by the two explicit choices
 
 
 def test_reset_keeps_review_data_and_last_opened(client):
@@ -2645,9 +2727,8 @@ def test_reset_keeps_review_data_and_last_opened(client):
 
 def test_missing_url_parameters_use_defaults(client):
     html = client.get("/queue").get_data(as_text=True)
-    # bare /queue behaves exactly like the canonical default state
     assert _ids(html) == _ids(client.get(
-        "/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+        "/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all"
     ).get_data(as_text=True))
 
 
@@ -2684,7 +2765,9 @@ def test_panel_single_controls_form_with_three_regions(client):
 
 def test_panel_three_filter_groups_with_legends(client):
     html = _queue_html(client)
-    for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
+    # The Review Scope fieldset is the visible default-scope section; the three
+    # manual groups below it keep their existing legends.
+    for legend in ("Review Scope", "Ticket conditions", "Freshdesk status", "Additional filters"):
         assert f"<legend class=group-lbl>{legend}</legend>" in html, legend
 
 
@@ -2692,14 +2775,17 @@ def test_panel_time_review_and_action_regions_hold_correct_controls(client):
     html = _queue_html(client)
     assert 'name=days' in html
     assert 'id=review_view name=review_view' in html
-    assert 'Apply Filters' in html and 'Reset to Defaults' in html
+    assert 'Apply Filters' in html
+    assert 'Reset to Default Review Scope' in html
+    assert 'Show All Cached Tickets' in html
 
 
 def test_panel_apply_is_primary_and_reset_is_secondary(client):
     html = _queue_html(client)
     assert re.search(r'<button[^>]*type=?submit?[^>]*class=apply[^>]*>Apply Filters</button>', html)
-    assert re.search(r'<a[^>]*class=reset[^>]*role=button[^>]*>Reset to Defaults</a>', html)
-    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in html
+    assert re.search(r'<a[^>]*class=reset[^>]*role=button[^>]*>Reset to Default Review Scope</a>', html)
+    assert re.search(r'<a[^>]*class=reset[^>]*role=button[^>]*>Show All Cached Tickets</a>', html)
+    assert 'href="/queue?photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days=60&amp;review_view=all"' in html
 
 
 def test_panel_no_nested_forms(client):
@@ -2715,7 +2801,7 @@ def test_panel_presets_render_7_14_30_60_90(client):
     html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active")
     html = html.replace("&amp;", "&")
     for d in ("7", "14", "30", "60", "90"):
-        assert f'class=preset href="/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days={d}&review_view=active"' in html, d
+        assert f'class=preset href="/queue?photo_video_only=1&hide_reviewed_tags=1&overdue=1&responded=0&waiting=0&missing_tags=1&days={d}&review_view=active"' in html, d
 
 
 def test_panel_active_preset_has_non_color_indicator(client):
@@ -2733,7 +2819,7 @@ def test_panel_custom_days_keeps_no_active_preset(client):
     """A non-preset days value (e.g. 45) stays supported in the days input and
     marks no preset as active (aria-current appears on none)."""
     html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=1&days=45&review_view=active")
-    assert 'name=days min=1 max=365 value=45' in html
+    assert re.search(r'name=days min=1 max=365 value=["\']45["\']', html)
     # No preset pill is marked active (aria-current=page only ever appears on
     # preset links; the CSS rule `.preset[aria-current=page]` also contains the
     # literal text, so scope the check to anchor tags only).
@@ -2746,54 +2832,66 @@ def test_panel_presets_preserve_other_filter_values(client):
     html = _queue_html(client, "overdue=0&responded=1&waiting=1&missing_tags=0&days=7&review_view=all")
     html = html.replace("&amp;", "&")
     for d in ("7", "14", "30", "60", "90"):
-        assert f'class=preset href="/queue?overdue=0&responded=1&waiting=1&missing_tags=0&days={d}&review_view=all"' in html, d
+        assert f'class=preset href="/queue?photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=1&waiting=1&missing_tags=0&days={d}&review_view=all"' in html, d
 
 
 # --- Active-filter summary ---------------------------------------------------
 
 
+SCOPE_OFF = "photo_video_only=0&hide_reviewed_tags=0&"
+
+
 def test_summary_default(client):
+    # Default queue shows the Review Scope summary, never a bare "All cached".
     html = _queue_html(client)
-    assert "Showing: Overdue + Missing Tags \u00b7 Last 60 days \u00b7 Active" in html
+    assert "Showing: Photo/video subjects only + No reviewed/closed tags" in html
+
+
+def test_summary_show_all(client):
+    # Show All Cached Tickets (scope + manual controls all off, view All)
+    # reports the complete-cache view.
+    html = _queue_html(client, SCOPE_OFF + "overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all")
+    assert "Showing: All cached tickets" in html
 
 
 def test_summary_overdue_only(client):
-    html = _queue_html(client, "overdue=1&responded=0&waiting=0&missing_tags=0&days=60&review_view=active")
-    assert "Showing: Overdue \u00b7 Last 60 days \u00b7 Active" in html
+    html = _queue_html(client, SCOPE_OFF + "overdue=1&responded=0&waiting=0&missing_tags=0&days=60&review_view=all")
+    assert "Showing: Overdue" in html
 
 
 def test_summary_responded_only(client):
-    html = _queue_html(client, "overdue=0&responded=1&waiting=0&missing_tags=0&days=30&review_view=active")
-    assert "Showing: Customer Responded \u00b7 Last 30 days \u00b7 Active" in html
+    html = _queue_html(client, SCOPE_OFF + "overdue=0&responded=1&waiting=0&missing_tags=0&days=30&review_view=all")
+    assert "Showing: Customer Responded" in html
 
 
 def test_summary_waiting_only(client):
-    html = _queue_html(client, "overdue=0&responded=0&waiting=1&missing_tags=0&days=14&review_view=completed")
-    assert "Showing: Waiting on Customer \u00b7 Last 14 days \u00b7 Completed" in html
+    html = _queue_html(client, SCOPE_OFF + "overdue=0&responded=0&waiting=1&missing_tags=0&days=14&review_view=completed")
+    assert "Showing: Waiting on Customer + Completed review view" in html
 
 
 def test_summary_combined_and_missing_tags_and_view(client):
-    html = _queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=7&review_view=all")
-    assert "Showing: Overdue + Customer Responded + Missing Tags \u00b7 Last 7 days \u00b7 All" in html
+    html = _queue_html(client, SCOPE_OFF + "overdue=1&responded=1&waiting=0&missing_tags=1&days=7&review_view=all")
+    assert "Showing: Overdue + Customer Responded + Missing Tags" in html
 
 
 def test_summary_both_statuses_union(client):
-    html = _queue_html(client, "overdue=0&responded=1&waiting=1&missing_tags=0&days=90&review_view=active")
-    assert "Showing: Customer Responded + Waiting on Customer \u00b7 Last 90 days \u00b7 Active" in html
+    html = _queue_html(client, SCOPE_OFF + "overdue=0&responded=1&waiting=1&missing_tags=0&days=90&review_view=active")
+    assert "Showing: Customer Responded + Waiting on Customer + Active review view" in html
 
 
 def test_summary_no_primary_filter(client):
-    html = _queue_html(client, "overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active")
-    assert "Showing: No ticket category selected" in html
+    html = _queue_html(client, SCOPE_OFF + "overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=all")
+    assert "Showing: Missing Tags" in html
 
 
 def test_summary_matches_url_derived_state(client):
-    cfg = filters_from_args(MultiDict([("overdue", "1"), ("responded", "1"),
+    cfg = filters_from_args(MultiDict([("photo_video_only", "0"), ("hide_reviewed_tags", "0"),
+                                       ("overdue", "1"), ("responded", "1"),
                                        ("waiting", "0"), ("missing_tags", "1"),
                                        ("days", "14"), ("review_view", "completed")]))
     want = app.filter_summary_text(cfg)
-    assert want == "Showing: Overdue + Customer Responded + Missing Tags \u00b7 Last 14 days \u00b7 Completed"
-    html = _queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=14&review_view=completed")
+    assert want == "Showing: Overdue + Customer Responded + Missing Tags + Completed review view"
+    html = _queue_html(client, SCOPE_OFF + "overdue=1&responded=1&waiting=0&missing_tags=1&days=14&review_view=completed")
     assert want in html
 
 
@@ -2830,9 +2928,11 @@ def test_panel_checkbox_ids_unique_and_associated(client):
     form, _ = _controls_form(html)
     boxes = [i for i in form["inputs"] if i.get("type") == "checkbox"]
     names = [i.get("name") for i in boxes]
-    assert names == ["overdue", "responded", "waiting", "missing_tags"]
+    assert names == ["photo_video_only", "hide_reviewed_tags",
+                     "overdue", "responded", "waiting", "missing_tags"]
     ids = [i.get("id") for i in boxes]
-    assert ids == ["filter-overdue", "filter-responded", "filter-waiting", "filter-missing"]
+    assert ids == ["filter-photo-video", "filter-hide-reviewed",
+                   "filter-overdue", "filter-responded", "filter-waiting", "filter-missing"]
     assert len(set(_all_ids(html))) == len(_all_ids(html)), "duplicate element IDs in page"
 
 
@@ -2869,14 +2969,20 @@ def test_panel_buttons_and_summary_can_wrap(client):
 # --- Regression (semantics unchanged) ----------------------------------------
 
 
-def test_panel_semantics_unchanged_counts(client):
-    # Default overdue-only = 10 rows; overdue+responded intersection = 7 rows.
-    assert len(_ids(_queue_html(client))) == 10
-    combo = _ids(_queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=active"))
-    assert len(combo) == 7
+def test_panel_semantics_neutral_default_counts(client):
+    # Default Review Scope shows the 23 photo/video-subject tickets; Show All
+    # Cached Tickets shows the complete 28-ticket synthetic cache.
+    assert len(_ids(_queue_html(client))) == 23
+    assert len(_ids(_queue_html(client, SCOPE_OFF +
+                                "overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all"))) == 28
+    combo = _ids(_queue_html(client, "overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=all"))
+    assert len(combo) == 9  # manual filters intersect the default scope
+    combo_all = _ids(_queue_html(client, SCOPE_OFF +
+                                 "overdue=1&responded=1&waiting=0&missing_tags=1&days=60&review_view=all"))
+    assert len(combo_all) == 13  # same manual filters without the scope
 
 
-def test_panel_canonical_url_unchanged(client):
+def test_panel_canonical_url_is_neutral_by_default(client):
     qs = filter_query_string(filters_from_args(MultiDict([])))
-    assert qs == "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
+    assert qs == "photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all"
 

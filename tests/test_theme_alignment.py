@@ -120,7 +120,8 @@ def test_queue_js_selectors_and_dom_ids_unchanged(client, monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     q = _html(client, "/queue")
     # The IDs/selectors the queue JS hooks into must still exist in markup or JS.
-    for token in ("queue-table", "review_view", "filter-overdue",
+    for token in ("queue-table", "review_view", "filter-photo-video",
+                  "filter-hide-reviewed", "filter-overdue",
                   "filter-responded", "filter-waiting", "filter-missing",
                   "last-opened-jump", "last-opened-hidden",
                   "data-ticket-id", "class=apply", "class=reset",
@@ -130,9 +131,13 @@ def test_queue_js_selectors_and_dom_ids_unchanged(client, monkeypatch):
 
 def test_queue_filters_and_review_still_work_after_theme(client, monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
-    # Apply Filters / Reset present and form submits to /queue.
+    # Apply Filters present and the form submits to /queue. The old single
+    # "Clear Filters" action was replaced by two explicit choices:
+    # "Reset to Default Review Scope" and "Show All Cached Tickets".
     q = _html(client, "/queue")
-    assert "Apply Filters" in q and "Reset to Defaults" in q
+    assert "Apply Filters" in q
+    assert "Reset to Default Review Scope" in q and "Show All Cached Tickets" in q
+    assert "Clear Filters" not in q
     assert 'action=/queue' in q
     # Local review write still works (its token scraped from the page).
     resp = client.post("/queue/api/review", data={

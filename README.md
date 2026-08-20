@@ -8,15 +8,23 @@ This branch is a safe local-development milestone. It supports an explicit offli
 
 ## What It Does
 
-- Scans Freshdesk tickets from the last 60 days in live mode
-- Uses only `GET /api/v2/tickets` in live mode
-- Filters for photo/video keywords in the subject line using word boundaries
-- Shows only untagged tickets
-- Excludes closed tickets
-- Flags overdue customer responses using `due_by`
-- Includes waiting-on-customer tickets in the fetched pool; hidden by default and shown with `?waiting=1` (preserved existing behavior)
-- Uses a 30-minute cache
-- Has no ticket mutation actions
+- Retrieves Freshdesk tickets only when **Refresh Tickets** is explicitly clicked
+- Lets the operator choose the live retrieval window (1-365 rolling days); **Days** controls Freshdesk retrieval only, it never re-filters the already-cached rows
+- Uses only `GET /api/v2/tickets` for queue retrieval, plus targeted conversation `GET /api/v2/tickets/{id}/conversations` checks only for locally reviewed tickets whose `updated_at` became newer than their review snapshot
+- Paces ticket and conversation requests through the same conservative rate limiter and reports finite refresh progress
+- Conversation-aware **UPDATED SINCE REVIEW** handling suppresses only explained private-agent-note-only activity; customer activity, public agent replies, ambiguous metadata, meaningful ticket-field changes, unexplained timestamp tails, lookup failures, and incomplete pagination fail safe and remain flagged
+- **Acknowledge Update** is a local-only action for meaningful reviewed updates. It advances the local snapshot to the current cached `updated_at`, preserves the existing reviewer badge, makes no Freshdesk request or write, and preserves the current queue filters
+- No conversation lookup is performed for unreviewed, unchanged, or older reviewed tickets
+
+
+- Keeps **Apply Filters** completely local to the current cache
+- **Default Review Scope** (visible in the UI, defaults ON): the default queue shows photo/video subjects only, and hides tickets carrying any reviewed/closed Freshdesk tag (Parts needed, Exchange, No Service Needed, Closed, Schedule Service, Delivery special needed)
+- Photo/video matching is case-insensitive and word-boundary aware on the ticket **subject** only (Photo, Photos, Picture, Pictures, Pic, Pics, Video, Videos, Vid, Vids)
+- Tag comparison for the reviewed/closed exclusions is case-insensitive and leading/trailing-whitespace-insensitive for comparison only; stored Freshdesk tags are never modified
+- Optional manual local filters stay independent and remain opt-in: Overdue, Customer Responded, Waiting on Customer, Missing Tags, and Review View (all default OFF / All)
+- **Reset to Default Review Scope** restores the scoped default queue; **Show All Cached Tickets** turns the scope controls and every manual filter off to display the complete current cache (deduped only) — both are local-only and never contact Freshdesk
+- A successful data refresh reloads the queue back into the default Review Scope view
+- Has no Freshdesk ticket mutation actions
 - Binds to `127.0.0.1` by default and refuses `0.0.0.0`
 
 ## Safe offline development
