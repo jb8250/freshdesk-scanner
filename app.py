@@ -155,6 +155,7 @@ CACHE_TTL_SECONDS = 30 * 60  # informational only in live mode (never auto-fetch
 QUEUE_CACHE_SCHEMA_VERSION = 2
 ROLLING_RETENTION_DAYS = 60
 QUEUE_CACHE_REFRESH_MODES = frozenset({"legacy", "baseline", "reconcile", "incremental", "full_rebuild"})
+INCREMENTAL_CURSOR_OVERLAP_SECONDS = 120
 
 UPDATED_SINCE_DAYS = 60  # ~2 months
 
@@ -784,8 +785,8 @@ def _header_int(response, name):
         return None
 
 
-def paginate_tickets(days=DAYS_DEFAULT, clock=None, sleeper=None,
-                     progress_callback=None, cancel_callback=None):
+def paginate_tickets(days=DAYS_DEFAULT, effective_since=None, clock=None, sleeper=None,
+                      progress_callback=None, cancel_callback=None):
     """Fetch all tickets conservatively, optionally reporting progress.
 
     Request count means Freshdesk HTTP request attempts, including 429s.
@@ -827,7 +828,7 @@ def paginate_tickets(days=DAYS_DEFAULT, clock=None, sleeper=None,
             sleeper(step)
             remaining -= step
         return not cancel_callback()
-    since = (now_utc() - timedelta(days=days)).isoformat()
+    since = effective_since or (now_utc() - timedelta(days=days)).isoformat()
     while True:
         if cancel_callback and cancel_callback():
             emit("cancelled")
@@ -971,18 +972,21 @@ def normalize_live_queue_cache(blob):
     if (not isinstance(schema_version, int) or isinstance(schema_version, bool)
             or schema_version != QUEUE_CACHE_SCHEMA_VERSION):
         return None
+    # A v2 envelope without an established cursor is structurally safe to
+    # reconcile as a baseline; only the cursor itself is unknown.
     required = (
-        "days", "fetched_at", "last_successful_refresh_started_at",
-        "last_successful_refresh_finished_at", "last_refresh_mode",
+        "days", "fetched_at", "last_refresh_mode",
         "last_refresh_requested_days", "rolling_retention_days",
     )
     if any(key not in blob for key in required):
         return None
+    started = blob.get("last_successful_refresh_started_at")
+    finished = blob.get("last_successful_refresh_finished_at")
     if (not _valid_queue_cache_days(blob["days"])
             or not isinstance(blob["fetched_at"], (int, float))
             or isinstance(blob["fetched_at"], bool)
-            or not _valid_queue_cache_timestamp(blob["last_successful_refresh_started_at"])
-            or not _valid_queue_cache_timestamp(blob["last_successful_refresh_finished_at"])
+            or (started is not None and not isinstance(started, str))
+            or (finished is not None and not isinstance(finished, str))
             or blob["last_refresh_mode"] not in QUEUE_CACHE_REFRESH_MODES
             or blob["last_refresh_mode"] == "legacy"
             or not _valid_queue_cache_days(blob["last_refresh_requested_days"])
@@ -991,12 +995,61 @@ def normalize_live_queue_cache(blob):
             or blob["rolling_retention_days"] <= 0):
         return None
     return {**blob, "cache_metadata": {
-        key: blob[key] for key in (
-            "schema_version", "last_successful_refresh_started_at",
-            "last_successful_refresh_finished_at", "last_refresh_mode",
-            "last_refresh_requested_days", "rolling_retention_days",
-        )
+        "schema_version": blob["schema_version"],
+        "last_successful_refresh_started_at": started,
+        "last_successful_refresh_finished_at": finished,
+        "last_refresh_mode": blob["last_refresh_mode"],
+        "last_refresh_requested_days": blob["last_refresh_requested_days"],
+        "rolling_retention_days": blob["rolling_retention_days"],
     }}
+
+
+def queue_refresh_plan(cache_blob, days, attempt_started_at):
+    """Choose the sole retrieval horizon for one refresh attempt.
+
+    Invalid or future cursor metadata falls back to a Days baseline when the
+    envelope itself is structurally valid. A cursor strictly later than this
+    attempt's start is never safe to use incrementally: baseline reconciliation
+    installs this attempt's start only after a successful atomic cache commit.
+    """
+    days = parse_days(days)
+    attempt_started_at = attempt_started_at.astimezone(timezone.utc).replace(microsecond=0)
+    metadata = cache_blob.get("cache_metadata", {}) if isinstance(cache_blob, dict) else {}
+    raw_cursor = metadata.get("last_successful_refresh_started_at")
+    raw_finished = metadata.get("last_successful_refresh_finished_at")
+    cursor = parse_dt(raw_cursor)
+    finished = parse_dt(raw_finished)
+    # A cursor later than this attempt is future metadata, including after a
+    # local clock rollback. Never derive an incremental horizon from it: the
+    # normal Days baseline reconciles conservatively and replaces it only after
+    # successful atomic cache commit.
+    cursor_not_future = cursor is not None and cursor <= attempt_started_at
+    valid_cursor = (
+        metadata.get("schema_version") == QUEUE_CACHE_SCHEMA_VERSION
+        and _valid_queue_cache_timestamp(raw_cursor)
+        and _valid_queue_cache_timestamp(raw_finished)
+        and cursor is not None and finished is not None
+        and cursor <= finished and cursor_not_future
+    )
+    # Corrupt timestamp strings are an invalid cursor, not an unsafe ticket
+    # envelope: reconcile safely from the requested Days baseline.  Non-string
+    # timestamp metadata is rejected earlier by envelope validation.
+    if (raw_cursor is not None and not isinstance(raw_cursor, str)) or (
+            raw_finished is not None and not isinstance(raw_finished, str)):
+        raise ValueError("Queue cursor metadata is structurally unsafe.")
+    if valid_cursor:
+        cursor = cursor.astimezone(timezone.utc).replace(microsecond=0)
+        effective = cursor - timedelta(seconds=INCREMENTAL_CURSOR_OVERLAP_SECONDS)
+        return {
+            "refresh_mode": "incremental", "cursor_source": "previous_successful_start",
+            "effective_updated_since": queue_cache_timestamp(effective),
+            "durable_refresh_started_at": max(cursor, attempt_started_at),
+        }
+    return {
+        "refresh_mode": "baseline", "cursor_source": "days_baseline",
+        "effective_updated_since": queue_cache_timestamp(attempt_started_at - timedelta(days=days)),
+        "durable_refresh_started_at": attempt_started_at,
+    }
 
 
 def load_live_queue_cache():
@@ -1012,7 +1065,7 @@ def load_live_queue_cache():
 
 
 def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, refresh_finished_at=None,
-                          refresh_mode="reconcile"):
+                           refresh_mode="reconcile", effective_updated_since=None):
     """Atomically save a successfully reconciled queue-cache envelope.
 
     ``fetched_at`` remains a compatibility Unix timestamp and denotes the same
@@ -1033,6 +1086,8 @@ def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, r
         "rolling_retention_days": ROLLING_RETENTION_DAYS,
         "tickets": list(tickets),
     }
+    if effective_updated_since is not None:
+        payload["last_refresh_effective_updated_since"] = effective_updated_since
     directory = os.path.dirname(os.path.abspath(LIVE_QUEUE_CACHE_FILE)) or "."
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".queue_live_tickets.", suffix=".tmp", dir=directory)
@@ -1050,9 +1105,11 @@ def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, r
         raise
 
 
-def fetch_live_queue(days=DAYS_DEFAULT, api_key=None, progress_callback=None, cancel_callback=None):
-    """Perform exactly ONE manual Freshdesk queue retrieval for ``days``."""
-    return list(paginate_tickets(days=parse_days(days), progress_callback=progress_callback,
+def fetch_live_queue(days=DAYS_DEFAULT, effective_since=None, api_key=None, progress_callback=None,
+                     cancel_callback=None):
+    """Perform exactly one manual Freshdesk queue retrieval from an explicit horizon."""
+    return list(paginate_tickets(days=parse_days(days), effective_since=effective_since,
+                                 progress_callback=progress_callback,
                                  cancel_callback=cancel_callback))
 
 
@@ -2386,6 +2443,8 @@ def queue_refresh_start():
     if not api_key:
         return jsonify({"ok": False, "message": "No Freshdesk API key is available."}), 503
     old_blob = load_live_queue_cache()
+    # Capture this attempt's start before the job can issue its first request.
+    attempt_started_at = now_utc().astimezone(timezone.utc).replace(microsecond=0)
     if old_blob is None and os.path.exists(LIVE_QUEUE_CACHE_FILE):
         return jsonify({"ok": False, "message": "Existing queue cache is malformed; refresh was not started."}), 409
     started, message = queue_live.JOB.start(
@@ -2396,6 +2455,9 @@ def queue_refresh_start():
             old_blob, incoming_tickets, progress_callback=progress_callback,
             cancel_callback=cancel_callback,
         ),
+        plan=lambda requested_days, job_attempt_started_at: queue_refresh_plan(
+            old_blob, requested_days, job_attempt_started_at),
+        attempt_started_at=attempt_started_at,
     )
     status = queue_live.JOB.status()
     status.update({"ok": started, "message": message})

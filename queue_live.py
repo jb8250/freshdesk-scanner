@@ -36,7 +36,8 @@ class RefreshJobManager:
             return out
 
     def start(self, *, days: int, api_key: str, retrieve: Callable, save: Callable,
-              finalize: Callable | None = None):
+               finalize: Callable | None = None, plan: Callable | None = None,
+               attempt_started_at: datetime | None = None):
         if not api_key:
             return False, "No Freshdesk API key is available."
         if not self._lock.acquire(blocking=False):
@@ -54,10 +55,11 @@ class RefreshJobManager:
                               "tickets_received": 0, "request_count": 0,
                               "rate_limit_remaining": None, "elapsed_seconds": 0,
                               "wait_seconds": 0},
-                "merge_metrics": None,
+                "merge_metrics": None, "refresh_mode": None,
+                "effective_updated_since": None, "cursor_source": None,
             })
             self._thread = threading.Thread(
-                target=self._run, args=(days, api_key, retrieve, save, finalize),
+                target=self._run, args=(days, api_key, retrieve, save, finalize, plan, attempt_started_at),
                 name="queue-refresh", daemon=True,
             )
             self._thread.start()
@@ -107,14 +109,20 @@ class RefreshJobManager:
             if time.time() > deadline:
                 return
 
-    def _run(self, days, api_key, retrieve, save, finalize=None):
-        # Retrieval remains complete and Days-based. Capture its descriptive
-        # metadata before the first request; reconciliation happens only after it succeeds.
-        refresh_started_at = datetime.now(timezone.utc)
+    def _run(self, days, api_key, retrieve, save, finalize=None, plan=None, attempt_started_at=None):
+        # Capture one UTC whole-second attempt start before the first request.
+        refresh_started_at = (attempt_started_at or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
         try:
-            tickets = retrieve(days=days, api_key=api_key,
-                               progress_callback=self._progress,
-                               cancel_callback=self._cancel.is_set)
+            refresh_plan = plan(days, refresh_started_at) if plan else {
+                "refresh_mode": "baseline", "cursor_source": "days_baseline",
+                "effective_updated_since": None, "durable_refresh_started_at": refresh_started_at,
+            }
+            with self._lock:
+                self._state.update({key: refresh_plan[key] for key in (
+                    "refresh_mode", "cursor_source", "effective_updated_since")})
+            tickets = retrieve(days=days, effective_since=refresh_plan["effective_updated_since"], api_key=api_key,
+                                progress_callback=self._progress,
+                                cancel_callback=self._cancel.is_set)
             if self._cancel.is_set():
                 self._finish(CANCELLED, "Refresh cancelled. The cached results were left unchanged.")
                 return
@@ -140,8 +148,11 @@ class RefreshJobManager:
             self._progress({"current_stage": "Saving cache", "state": "running"})
             # Completion is captured after successful retrieval/finalization and
             # immediately before the atomic cache commit.
-            save(tickets, days=days, refresh_started_at=refresh_started_at,
-                 refresh_finished_at=datetime.now(timezone.utc))
+            save(tickets, days=days,
+                 refresh_started_at=refresh_plan["durable_refresh_started_at"],
+                 refresh_finished_at=datetime.now(timezone.utc),
+                 refresh_mode=refresh_plan["refresh_mode"],
+                 effective_updated_since=refresh_plan["effective_updated_since"])
             if finalize_after_save:
                 finalize_after_save()
             self._finish(SUCCEEDED, f"Refresh complete — {len(tickets)} tickets cached.", written=True)

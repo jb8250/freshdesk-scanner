@@ -104,7 +104,7 @@ def test_legacy_cache_reconciles_to_v2_without_read_rewrite():
         payload = json.load(fh)
     assert manager.status()["state"] == queue_live.SUCCEEDED
     assert payload["schema_version"] == 2
-    assert payload["last_refresh_mode"] == "reconcile"
+    assert payload["last_refresh_mode"] == "baseline"
     assert [row["id"] for row in payload["tickets"]] == [1, 2, 3]
 
 
@@ -113,7 +113,7 @@ def test_no_cache_initializes_reconcile_envelope():
     with open(app.LIVE_QUEUE_CACHE_FILE) as fh:
         payload = json.load(fh)
     assert manager.status()["state"] == queue_live.SUCCEEDED
-    assert payload["last_refresh_mode"] == "reconcile"
+    assert payload["last_refresh_mode"] == "baseline"
     assert payload["days"] == payload["last_refresh_requested_days"] == 7
 
 

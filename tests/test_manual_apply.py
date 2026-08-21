@@ -136,7 +136,7 @@ def test_change_filters_pre_apply_zero_requests(live_client, monkeypatch):
 def test_days_window_is_sent_to_freshdesk(live_client, monkeypatch):
     fixed_now = app.datetime(2026, 8, 18, tzinfo=app.timezone.utc)
     monkeypatch.setattr(app, "now_utc", lambda: fixed_now)
-    for days in (1, 7, 30, 60):
+    for index, days in enumerate((1, 7, 30, 60)):
         seen = {}
         def fake_get(url, auth=None, params=None, timeout=None):
             seen.update(params)
@@ -150,7 +150,9 @@ def test_days_window_is_sent_to_freshdesk(live_client, monkeypatch):
             if app.queue_live.JOB.status()["state"] != "running":
                 break
             time.sleep(0.01)
-        assert seen["updated_since"] == (fixed_now - app.timedelta(days=days)).isoformat()
+        expected = (app.queue_cache_timestamp(fixed_now - app.timedelta(days=days))
+                    if index == 0 else app.queue_cache_timestamp(fixed_now - app.timedelta(minutes=2)))
+        assert seen["updated_since"] == expected
 
 
 def test_apply_form_is_normal_post_and_not_intercepted(live_client, monkeypatch):
@@ -179,7 +181,7 @@ def test_invalid_days_falls_back_to_default_and_cache_records_retrieval_days(liv
     response = live_client.post("/queue/api/refresh", data={"days": "999", "csrf_token": token})
     assert response.status_code == 202
     app.queue_live.JOB.wait(timeout=10)
-    assert seen["updated_since"] == (app.now_utc() - app.timedelta(days=60)).isoformat()
+    assert seen["updated_since"] == app.queue_cache_timestamp(app.now_utc() - app.timedelta(days=60))
     with open(app.LIVE_QUEUE_CACHE_FILE) as fh:
         assert json.load(fh)["days"] == 60
 
