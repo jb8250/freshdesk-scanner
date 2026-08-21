@@ -70,6 +70,10 @@ def test_queue_range_controls_render_custom_state_and_safe_wiring(client):
     assert "customWrap.classList.remove('hidden')" in html
     assert "customWrap.hidden = false" in html
     assert "customInput.focus()" in html
+    assert "function selectCustomRange()" in html
+    assert "document.querySelectorAll('.reconcile-panel .preset')" in html
+    assert "control.classList.remove('active', 'preset-on')" in html
+    assert "control.setAttribute('aria-pressed', 'false')" in html
     # Native hidden state must win over any later display rule in a real browser.
     assert "[hidden]{display:none!important}" in html
 
@@ -84,6 +88,6 @@ def test_queue_range_controls_are_local_and_refresh_uses_custom_value(client, mo
     assert client.get("/queue?days=45").status_code == 200
     with client.session_transaction() as session:
         csrf = session["csrf_token"]
-    response = client.post("/queue/api/refresh", data={"csrf_token": csrf, "days": "45"})
+    response = client.post("/queue/api/refresh", data={"csrf_token": csrf, "days": "45", "mode": "reconcile"})
     assert response.status_code == 202
     assert calls and calls[0]["days"] == 45

@@ -1005,15 +1005,20 @@ def normalize_live_queue_cache(blob):
     }}
 
 
-def queue_refresh_plan(cache_blob, days, attempt_started_at):
-    """Choose the sole retrieval horizon for one refresh attempt.
+def queue_refresh_plan(cache_blob, days, attempt_started_at, mode=None):
+    """Choose the retrieval horizon for one normal or explicit reconcile attempt.
 
-    Invalid or future cursor metadata falls back to a Days baseline when the
-    envelope itself is structurally valid. A cursor strictly later than this
-    attempt's start is never safe to use incrementally: baseline reconciliation
-    installs this attempt's start only after a successful atomic cache commit.
+    Normal refreshes use the persistent cursor when safe, otherwise the fixed
+    60-day initialization baseline. Reconcile deliberately bypasses the cursor
+    for this attempt only; both paths still merge, analyze, retain, and save
+    atomically through the same worker.
     """
-    days = parse_days(days)
+    requested_days = parse_days(days)
+    legacy_plan = mode is None
+    mode = "normal" if legacy_plan else mode
+    if mode not in {"normal", "reconcile"}:
+        raise ValueError("Unknown queue refresh mode.")
+    days = requested_days if mode == "reconcile" or legacy_plan else DAYS_DEFAULT
     attempt_started_at = attempt_started_at.astimezone(timezone.utc).replace(microsecond=0)
     metadata = cache_blob.get("cache_metadata", {}) if isinstance(cache_blob, dict) else {}
     raw_cursor = metadata.get("last_successful_refresh_started_at")
@@ -1038,6 +1043,12 @@ def queue_refresh_plan(cache_blob, days, attempt_started_at):
     if (raw_cursor is not None and not isinstance(raw_cursor, str)) or (
             raw_finished is not None and not isinstance(raw_finished, str)):
         raise ValueError("Queue cursor metadata is structurally unsafe.")
+    if mode == "reconcile":
+        return {
+            "refresh_mode": "reconcile", "cursor_source": "requested_days",
+            "effective_updated_since": queue_cache_timestamp(attempt_started_at - timedelta(days=days)),
+            "durable_refresh_started_at": attempt_started_at,
+        }
     if valid_cursor:
         cursor = cursor.astimezone(timezone.utc).replace(microsecond=0)
         effective = cursor - timedelta(seconds=INCREMENTAL_CURSOR_OVERLAP_SECONDS)
@@ -2450,6 +2461,8 @@ def queue():
         last_opened_rendered=any(r["last_opened"] for r in rows),
          live_cache_missing=(None is cache_age and not offline and len(raw) == 0),
          cached_days=cached_days,
+         cached_ticket_count=len(raw),
+         last_refresh_mode_display=((blob or {}).get("last_refresh_mode") or "No baseline").replace("baseline", "Baseline").replace("incremental", "Incremental").replace("reconcile", "Reconcile"),
          last_refresh_display=_last_refresh_display(cache_age, offline),
          cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
          cache_coverage_warning=(cached_days is None or (isinstance(cached_days, int) and config["days"] > cached_days)),
@@ -2458,8 +2471,17 @@ def queue():
 
 @app.route("/queue/api/refresh", methods=["POST"])
 def queue_refresh_start():
-    """Start one finite queue refresh; the worker performs the only API calls."""
-    days = parse_days(request.form.get("days"))
+    """Start one finite normal or explicit reconcile refresh."""
+    mode = request.form.get("mode", "normal").strip().lower()
+    if mode not in {"normal", "reconcile"}:
+        return jsonify({"ok": False, "message": "Invalid refresh mode."}), 400
+    raw_days = request.form.get("days")
+    if mode == "reconcile":
+        if raw_days is None or not str(raw_days).strip().isdigit() or not (DAYS_MIN <= int(str(raw_days).strip()) <= DAYS_MAX):
+            return jsonify({"ok": False, "message": f"Reconcile range must be an integer from {DAYS_MIN} to {DAYS_MAX} days."}), 400
+        days = int(str(raw_days).strip())
+    else:
+        days = DAYS_DEFAULT
     if not csrf_valid(request.form.get("csrf_token")):
         return jsonify({"ok": False, "message": "Invalid security token."}), 403
     if is_offline():
@@ -2484,9 +2506,9 @@ def queue_refresh_start():
             old_blob, incoming_tickets, progress_callback=progress_callback,
             cancel_callback=cancel_callback, attempt_started_at=attempt_started_at,
         ),
-        plan=lambda requested_days, job_attempt_started_at: queue_refresh_plan(
-            old_blob, requested_days, job_attempt_started_at),
-        attempt_started_at=attempt_started_at,
+        plan=lambda requested_days, job_attempt_started_at, requested_mode="normal": queue_refresh_plan(
+            old_blob, requested_days, job_attempt_started_at, requested_mode),
+        attempt_started_at=attempt_started_at, mode=mode,
     )
     status = queue_live.JOB.status()
     status.update({"ok": started, "message": message})
@@ -2790,20 +2812,25 @@ QUEUE_HTML = """\
 <h2 id=live-data-heading>Live Data</h2>
 <form class="controls" method=post action=/queue/api/refresh novalidate id=queue-refresh-form>
   <input type=hidden name=csrf_token value="{{ csrf_token }}">
+  <input type=hidden name=mode value="normal" id=refresh-mode>
   <div class="panel-region region-time">
+    <div class="action-buttons"><button type=submit class=apply id=queue-refresh>Refresh Tickets</button></div>
+    <p class=field-hint>{% if live_cache_missing %}No incremental baseline yet. The next normal Refresh will initialize from the last 60 days.{% else %}Checks Freshdesk for new or changed tickets since the last successful refresh.{% endif %}</p>
+  </div>
+  <div class="panel-region region-time reconcile-panel">
+    <strong>Reconcile Range</strong>
+    <p class=field-hint>Re-check a historical window and merge it into the existing cache. It does not replace your cache or local review history.</p>
     <div class=preset-group role=group aria-label="Retrieval range">
       {% for d in [7, 14, 30, 60, 90] %}<a {% if config.days == d %}class="preset preset-on active"{% else %}class=preset{% endif %} href="/queue?{{ preset_urls[d] }}"{% if config.days == d %} aria-current=page{% endif %}>{{ d }}d</a>{% endfor %}
       <button type=button class="preset{% if config.days not in [7,14,30,60,90] %} active{% endif %}" id=custom-days-toggle{% if config.days not in [7,14,30,60,90] %} aria-current=page{% endif %} aria-pressed="{{ 'true' if config.days not in [7,14,30,60,90] else 'false' }}">Custom…</button>
       <span class=custom-days id=custom-days-wrap{% if config.days in [7,14,30,60,90] %} hidden{% endif %}><label class=lbl for=custom-days>Days</label><input id=custom-days type=number name=days min={{ days_min }} max={{ days_max }} value="{{ config.days }}" aria-label="Custom days" step=1></span>
     </div>
-    <div class=action-buttons><button type=submit class=apply id=queue-refresh>Refresh Tickets</button></div>
+    <div class=action-buttons><button type=button class=apply id=queue-reconcile>Reconcile Range</button></div>
   </div>
-   <p class=live-meta>Last refreshed {{ last_refresh_display }} · cache covers {{ cache_coverage_display }}</p>
-   <p class=field-hint>Local filters never retrieve Freshdesk data. Only Refresh Tickets retrieves data.</p>
-   {% if live_cache_missing %}<p class=field-hint>Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets.</p>{% elif cache_coverage_warning %}<p class=field-hint>Refresh Tickets to retrieve the last {{ config.days }} days.</p>{% endif %}
-   {% if cache_coverage_warning %}<p class="field-hint coverage-warning">Cache coverage is unknown or narrower than the selected retrieval window.</p>{% endif %}
-  {% if not offline and cached_days is not none and config.days > cached_days %}<p class=coverage-warning role=status>Cache covers {{ cached_days }} day{{ 's' if cached_days != 1 else '' }}, while {{ config.days }} days is selected. Refresh Tickets to load the selected range.</p>{% endif %}
-</form>
+   <p class=live-meta>Last refreshed {{ last_refresh_display }} · mode {{ last_refresh_mode_display }} · cached tickets {{ cached_ticket_count }}</p>
+   <p class=field-hint>Local filters never retrieve Freshdesk data. Only Refresh Tickets or Reconcile Range retrieves data.</p>
+ {% if live_cache_missing %}<p class=field-hint>Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets.</p>{% endif %}
+ </form>
 <div id=queue-refresh-status class=banner role=status aria-live=polite></div>
 <button type=button id=queue-cancel class=reset hidden>Cancel</button>
 </section>
@@ -3131,31 +3158,39 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
       fetch('/queue/api/refresh/cancel', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: encode({ csrf_token: csrf ? csrf.value : '' }) }).then(function () { poll(); });
     });
   }
+   function startRefresh(mode) {
+      var daysEl = form.querySelector('input[name=days]');
+      var customEl = document.getElementById('custom-days');
+      var body = encode({ csrf_token: csrf ? csrf.value : '', mode: mode, days: mode === 'reconcile' ? ((customEl || daysEl) ? (customEl || daysEl).value : '60') : '60' });
+     statusEl.textContent = 'Starting refresh…';
+     if (refreshBtn) { refreshBtn.disabled = true; }
+     fetch('/queue/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+       .then(function (r) { return r.json(); }).then(function (s) { render(s); if (s.state === 'running') { poll(); } })
+       .catch(function () { statusEl.textContent = 'Refresh could not be started.'; if (refreshBtn) { refreshBtn.disabled = false; } });
+   }
    form.addEventListener('submit', function (e) {
-     e.preventDefault();
-     var daysEl = form.querySelector('input[name=days]');
-     var customEl = document.getElementById('custom-days');
-     var body = encode({ csrf_token: csrf ? csrf.value : '', days: (customEl || daysEl) ? (customEl || daysEl).value : '1' });
-    statusEl.textContent = 'Starting refresh…';
-    if (refreshBtn) { refreshBtn.disabled = true; }
-    fetch('/queue/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
-      .then(function (r) { return r.json(); }).then(function (s) { render(s); if (s.state === 'running') { poll(); } })
-      .catch(function () { statusEl.textContent = 'Refresh could not be started.'; if (refreshBtn) { refreshBtn.disabled = false; } });
-     });
-   var customToggle = document.getElementById('custom-days-toggle');
+      e.preventDefault();
+      startRefresh('normal');
+      });
+    var reconcileBtn = document.getElementById('queue-reconcile');
+    if (reconcileBtn) reconcileBtn.addEventListener('click', function () { startRefresh('reconcile'); });
+    var customToggle = document.getElementById('custom-days-toggle');
    var customWrap = document.getElementById('custom-days-wrap');
    var customInput = document.getElementById('custom-days');
-   if (customToggle && customWrap && customInput) customToggle.addEventListener('click', function () {
-     // The server renders preset ranges with the native hidden attribute.
-     // Clear that property as well as the legacy class; removing only the
-     // class leaves the [hidden] CSS rule in control in a real browser.
-     customWrap.hidden = false;
-     customWrap.classList.remove('hidden');
-     customToggle.classList.add('active');
-     customToggle.setAttribute('aria-current', 'page');
-     customToggle.setAttribute('aria-pressed', 'true');
-     customInput.focus();
-   });
+    function selectCustomRange() {
+      document.querySelectorAll('.reconcile-panel .preset').forEach(function (control) {
+        control.classList.remove('active', 'preset-on');
+        control.removeAttribute('aria-current');
+        if (control !== customToggle) { control.setAttribute('aria-pressed', 'false'); }
+      });
+      customWrap.hidden = false;
+      customWrap.classList.remove('hidden');
+      customToggle.classList.add('active');
+      customToggle.setAttribute('aria-current', 'page');
+      customToggle.setAttribute('aria-pressed', 'true');
+      customInput.focus();
+    }
+    if (customToggle && customWrap && customInput) customToggle.addEventListener('click', selectCustomRange);
 })();
 </script>
 </body></html>
@@ -3482,6 +3517,8 @@ def _queue_render(**kwargs):
     ctx.setdefault("live_cache_missing", False)
     ctx.setdefault("last_refresh_display", "Never")
     ctx.setdefault("cache_coverage_display", "Unknown")
+    ctx.setdefault("cached_ticket_count", 0)
+    ctx.setdefault("last_refresh_mode_display", "No baseline")
     return render_template_string(QUEUE_HTML, **ctx)
 
 

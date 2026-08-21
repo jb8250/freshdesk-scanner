@@ -65,12 +65,13 @@ class _Resp:
 def _fake_transport(monkeypatch, pages):
     """requests.get recorder returning the given pages (one per call).
     Fails test if called more pages than provided (unbounded pagination)."""
-    state = {"calls": 0, "urls": []}
+    state = {"calls": 0, "urls": [], "seen": {}}
     calls = list(pages)
 
     def fake_get(url, auth=None, params=None, timeout=None):
         state["calls"] += 1
         state["urls"].append(url)
+        state["seen"] = dict(params or {})
         if not calls:
             raise AssertionError(f"UNEXPECTED EXTRA FRESHDESK REQUEST: {url}")
         return _Resp(calls.pop(0))
@@ -136,23 +137,34 @@ def test_change_filters_pre_apply_zero_requests(live_client, monkeypatch):
 def test_days_window_is_sent_to_freshdesk(live_client, monkeypatch):
     fixed_now = app.datetime(2026, 8, 18, tzinfo=app.timezone.utc)
     monkeypatch.setattr(app, "now_utc", lambda: fixed_now)
-    for index, days in enumerate((1, 7, 30, 60)):
-        seen = {}
-        def fake_get(url, auth=None, params=None, timeout=None):
-            seen.update(params)
-            return _Resp([])
-        monkeypatch.setattr(requests, "get", fake_get)
-        html = live_client.get("/queue").get_data(as_text=True)
-        token = _csrf(html)
-        response = live_client.post("/queue/api/refresh", data={"days": str(days), "csrf_token": token})
-        assert response.status_code == 202
-        for _ in range(100):
-            if app.queue_live.JOB.status()["state"] != "running":
-                break
-            time.sleep(0.01)
-        expected = (app.queue_cache_timestamp(fixed_now - app.timedelta(days=days))
-                    if index == 0 else app.queue_cache_timestamp(fixed_now - app.timedelta(minutes=2)))
-        assert seen["updated_since"] == expected
+    cursor = fixed_now - app.timedelta(hours=1)
+    app.save_live_queue_cache([], days=60, refresh_started_at=cursor, refresh_finished_at=cursor)
+    seen = []
+
+    def fake_get(url, auth=None, params=None, timeout=None):
+        seen.append(params["updated_since"])
+        return _Resp([])
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    html = live_client.get("/queue?days=90").get_data(as_text=True)
+    token = _csrf(html)
+
+    normal = live_client.post("/queue/api/refresh", data={
+        "days": "90", "csrf_token": token,
+    })
+    assert normal.status_code == 202
+    app.queue_live.JOB.wait(timeout=10)
+    assert seen[-1] == app.queue_cache_timestamp(cursor - app.timedelta(seconds=120))
+
+    html = live_client.get("/queue?days=90").get_data(as_text=True)
+    token = _csrf(html)
+    reconcile = live_client.post("/queue/api/refresh", data={
+        "days": "90", "mode": "reconcile", "csrf_token": token,
+    })
+    assert reconcile.status_code == 202
+    app.queue_live.JOB.wait(timeout=10)
+    assert seen[-1] == app.queue_cache_timestamp(fixed_now - app.timedelta(days=90))
+    assert seen[-1] != app.queue_cache_timestamp(cursor - app.timedelta(seconds=120))
 
 
 def test_apply_form_is_normal_post_and_not_intercepted(live_client, monkeypatch):
@@ -190,15 +202,35 @@ def test_legacy_cache_is_safe_and_wider_window_warns_without_network(live_client
     with open(app.LIVE_QUEUE_CACHE_FILE, "w") as fh:
         json.dump({"fetched_at": app.now_utc().timestamp(), "tickets": _page_tickets(880001, 1)}, fh)
     state = _fake_transport(monkeypatch, [])
-    html = live_client.get("/queue?days=30").get_data(as_text=True)
-    assert state["calls"] == 0
-    assert "coverage is unknown" in html
 
-    app.save_live_queue_cache(_page_tickets(880101, 1), days=1)
-    html = live_client.get("/queue?days=30").get_data(as_text=True)
+    # Selecting a historical range is local-only and does not retrieve.
+    html = live_client.get("/queue?days=7").get_data(as_text=True)
     assert state["calls"] == 0
-    assert "covers the last 1 day" in html
-    assert "retrieve the last 30 days" in html
+    assert "Reconcile Range" in html
+    assert "Refresh Tickets" in html
+    assert "cache covers" not in html
+    assert "retrieve the last 7 days" not in html
+    assert "retrieve the last 90 days" not in html
+    assert "does not replace your cache or local review history" in html
+    assert "retrieve the last 7 days" not in html
+    assert "retrieve the last 90 days" not in html
+
+    # Changing the selected range remains local-only, including Custom.
+    html = live_client.get("/queue?days=90").get_data(as_text=True)
+    assert state["calls"] == 0
+    assert 'id=custom-days-toggle' in html
+    assert 'id=custom-days type=number' in html
+
+    # A normal refresh ignores the selected range and initializes from 60 days.
+    fixed_now = app.now_utc()
+    html = live_client.get("/queue?days=90").get_data(as_text=True)
+    token = _csrf(html)
+    live_client.post("/queue/api/refresh", data={"days": "90", "csrf_token": token})
+    app.queue_live.JOB.wait(timeout=10)
+    assert state["calls"] == 1
+    assert state["seen"]["updated_since"] == app.queue_cache_timestamp(
+        fixed_now - app.timedelta(days=60)
+    )
 
 
 def test_days_does_not_filter_cached_rows_without_network(live_client, monkeypatch):

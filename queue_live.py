@@ -37,7 +37,7 @@ class RefreshJobManager:
 
     def start(self, *, days: int, api_key: str, retrieve: Callable, save: Callable,
                finalize: Callable | None = None, plan: Callable | None = None,
-               attempt_started_at: datetime | None = None):
+               attempt_started_at: datetime | None = None, mode: str = "normal"):
         if not api_key:
             return False, "No Freshdesk API key is available."
         if not self._lock.acquire(blocking=False):
@@ -48,7 +48,7 @@ class RefreshJobManager:
             self._cancel.clear()
             self._state = self._idle()
             self._state.update({
-                "state": RUNNING, "days": days,
+                "state": RUNNING, "days": days, "mode": mode,
                 "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "message": "Starting Freshdesk refresh…",
                 "progress": {"state": "starting", "page": 0, "pages_completed": 0,
@@ -59,7 +59,7 @@ class RefreshJobManager:
                 "effective_updated_since": None, "cursor_source": None,
             })
             self._thread = threading.Thread(
-                target=self._run, args=(days, api_key, retrieve, save, finalize, plan, attempt_started_at),
+                target=self._run, args=(days, api_key, retrieve, save, finalize, plan, attempt_started_at, mode),
                 name="queue-refresh", daemon=True,
             )
             self._thread.start()
@@ -109,14 +109,18 @@ class RefreshJobManager:
             if time.time() > deadline:
                 return
 
-    def _run(self, days, api_key, retrieve, save, finalize=None, plan=None, attempt_started_at=None):
+    def _run(self, days, api_key, retrieve, save, finalize=None, plan=None, attempt_started_at=None, mode="normal"):
         # Capture one UTC whole-second attempt start before the first request.
         refresh_started_at = (attempt_started_at or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
         try:
-            refresh_plan = plan(days, refresh_started_at) if plan else {
-                "refresh_mode": "baseline", "cursor_source": "days_baseline",
-                "effective_updated_since": None, "durable_refresh_started_at": refresh_started_at,
-            }
+            if plan:
+                refresh_plan = (plan(days, refresh_started_at, mode) if mode != "normal"
+                                else plan(days, refresh_started_at))
+            else:
+                refresh_plan = {
+                    "refresh_mode": "baseline", "cursor_source": "days_baseline",
+                    "effective_updated_since": None, "durable_refresh_started_at": refresh_started_at,
+                }
             with self._lock:
                 self._state.update({key: refresh_plan[key] for key in (
                     "refresh_mode", "cursor_source", "effective_updated_since")})

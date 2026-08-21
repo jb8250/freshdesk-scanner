@@ -15,8 +15,8 @@ The SQLite review database is automatically protected with verified, SQLite-cons
 ## What It Does
 
 - Retrieves Freshdesk tickets only when **Refresh Tickets** is explicitly clicked
-- Lets the operator choose a 1-365 **Days** baseline; after the first successful baseline, normal Refreshes use the previous successful refresh **start** timestamp as a persistent incremental cursor instead (the Days controls remain for baseline and compatibility)
-- Uses a deliberate two-minute overlap before the prior successful refresh start, then reconciles each complete result into the existing queue cache rather than replacing it; failed or cancelled refreshes never advance the cursor
+- Normal **Refresh Tickets** uses the previous successful refresh start as a persistent incremental cursor after initialization; the first/no-cursor normal refresh safely uses a 60-day baseline. The 7/14/30/60/90 and Custom 1-365 Days controls belong only to the explicit **Reconcile Range** action.
+- Uses a deliberate two-minute overlap before the prior successful refresh start, then reconciles each complete result into the existing queue cache rather than replacing it. Reconcile Range intentionally reads the selected historical window, still merges and retains, and on success establishes the current attempt start as the next incremental cursor; failed or cancelled refreshes never advance the cursor
 - Retention pruning is not active: cached tickets are never deleted merely because of age
 - Uses only `GET /api/v2/tickets` for queue retrieval, plus targeted conversation `GET /api/v2/tickets/{id}/conversations` checks only for locally reviewed tickets whose `updated_at` became newer than their review snapshot
 - Queue cache uses a single atomic JSON envelope (schema version 2) containing tickets and refresh metadata together. Schema-less legacy queue caches remain readable without being rewritten.
