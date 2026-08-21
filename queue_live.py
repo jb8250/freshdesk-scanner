@@ -54,6 +54,7 @@ class RefreshJobManager:
                               "tickets_received": 0, "request_count": 0,
                               "rate_limit_remaining": None, "elapsed_seconds": 0,
                               "wait_seconds": 0},
+                "merge_metrics": None,
             })
             self._thread = threading.Thread(
                 target=self._run, args=(days, api_key, retrieve, save, finalize),
@@ -107,8 +108,8 @@ class RefreshJobManager:
                 return
 
     def _run(self, days, api_key, retrieve, save, finalize=None):
-        # This is cache metadata only in Phase 3A; retrieval remains a complete
-        # replacement baseline refresh. Capture before the first retrieval call.
+        # Retrieval remains complete and Days-based. Capture its descriptive
+        # metadata before the first request; reconciliation happens only after it succeeds.
         refresh_started_at = datetime.now(timezone.utc)
         try:
             tickets = retrieve(days=days, api_key=api_key,
@@ -118,10 +119,19 @@ class RefreshJobManager:
                 self._finish(CANCELLED, "Refresh cancelled. The cached results were left unchanged.")
                 return
             if finalize:
-                tickets, finalize_after_save = finalize(
+                finalized = finalize(
                     tickets, progress_callback=self._progress,
                     cancel_callback=self._cancel.is_set,
                 )
+                if len(finalized) == 3:
+                    tickets, finalize_after_save, merge_metrics = finalized
+                    with self._lock:
+                        self._state["merge_metrics"] = {
+                            "received_count": merge_metrics.incoming_count,
+                            **vars(merge_metrics),
+                        }
+                else:
+                    tickets, finalize_after_save = finalized
                 if self._cancel.is_set():
                     self._finish(CANCELLED, "Refresh cancelled. The cached results were left unchanged.")
                     return

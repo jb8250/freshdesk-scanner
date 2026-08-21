@@ -390,8 +390,8 @@ def test_apply_again_fetches_again(live_client, monkeypatch):
     assert resp1.status_code == 202
     app.queue_live.JOB.wait(timeout=10)
     assert state["calls"] == 1
-    # second Apply -> second explicit retrieval; the cache is replaced by the
-    # newly fetched pool.
+    # second Apply performs another explicit retrieval and reconciles its
+    # results with the existing cache.
     resp2 = live_client.post("/queue/api/refresh",
                               data={"days": "60", "csrf_token": token})
     assert resp2.status_code == 202
@@ -399,7 +399,7 @@ def test_apply_again_fetches_again(live_client, monkeypatch):
     assert state["calls"] == 2
     html2 = live_client.get("/queue").get_data(as_text=True)
     assert "#850001" in html2
-    assert "#800001" not in html2  # old pool replaced by the fresh retrieval
+    assert "#800001" in html2  # old pool is preserved by reconciliation
 
 
 def test_refresh_of_redirected_results_zero_requests(live_client, monkeypatch):

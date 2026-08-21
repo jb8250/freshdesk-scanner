@@ -80,6 +80,7 @@ import review_backups
 # closed_retriever lazily, so there is no import cycle.
 import closed_live
 import queue_live
+from queue_merge import merge_queue_tickets
 
 app = Flask(__name__, static_folder=None)
 # Per-process random key: used only for the loopback CSRF token and flash
@@ -153,7 +154,7 @@ CACHE_TTL_SECONDS = 30 * 60  # informational only in live mode (never auto-fetch
 # Phase 3A continues to replace the entire cache after every successful refresh.
 QUEUE_CACHE_SCHEMA_VERSION = 2
 ROLLING_RETENTION_DAYS = 60
-QUEUE_CACHE_REFRESH_MODES = frozenset({"legacy", "baseline", "incremental", "full_rebuild"})
+QUEUE_CACHE_REFRESH_MODES = frozenset({"legacy", "baseline", "reconcile", "incremental", "full_rebuild"})
 
 UPDATED_SINCE_DAYS = 60  # ~2 months
 
@@ -1010,8 +1011,9 @@ def load_live_queue_cache():
     return normalize_live_queue_cache(blob)
 
 
-def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, refresh_finished_at=None):
-    """Atomically replace the queue cache after a successful baseline retrieval.
+def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, refresh_finished_at=None,
+                          refresh_mode="reconcile"):
+    """Atomically save a successfully reconciled queue-cache envelope.
 
     ``fetched_at`` remains a compatibility Unix timestamp and denotes the same
     completion instant as ``last_successful_refresh_finished_at``.
@@ -1026,7 +1028,7 @@ def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, r
         "fetched_at": finished_dt.timestamp(),
         "last_successful_refresh_started_at": started,
         "last_successful_refresh_finished_at": finished,
-        "last_refresh_mode": "baseline",
+        "last_refresh_mode": refresh_mode,
         "last_refresh_requested_days": days,
         "rolling_retention_days": ROLLING_RETENTION_DAYS,
         "tickets": list(tickets),
@@ -1187,8 +1189,25 @@ def _advance_review_snapshot(ticket_id, updated_at, backup=True):
         conn.close()
 
 
+def _reconcile_queue_refresh(old_blob, incoming_tickets, progress_callback=None,
+                             cancel_callback=None):
+    """Merge a complete retrieval, then prepare review changes for actual cache changes."""
+    existing_tickets = old_blob["tickets"] if old_blob else []
+    merged = merge_queue_tickets(existing_tickets, incoming_tickets)
+    old_by_id = {ticket["id"]: ticket for ticket in existing_tickets}
+    effective_changes = [
+        ticket for ticket in merged.tickets
+        if old_by_id.get(ticket["id"]) != ticket
+    ]
+    _, finalize_after_save = _prepare_conversation_review_updates(
+        effective_changes, old_blob, progress_callback=progress_callback,
+        cancel_callback=cancel_callback,
+    )
+    return merged.tickets, finalize_after_save, merged.metrics
+
+
 def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=None,
-                                         cancel_callback=None):
+                                          cancel_callback=None):
     """Classify narrow reviewed/newer candidates before cache commit."""
     old_tickets = (old_blob or {}).get("tickets") if isinstance(old_blob, dict) else None
     old_by_id = {t.get("id"): t for t in old_tickets or [] if isinstance(t, dict)}
@@ -2367,16 +2386,16 @@ def queue_refresh_start():
     if not api_key:
         return jsonify({"ok": False, "message": "No Freshdesk API key is available."}), 503
     old_blob = load_live_queue_cache()
-    def phase2_finalize(tickets, progress_callback=None, cancel_callback=None):
-        return _prepare_conversation_review_updates(
-            tickets, old_blob, progress_callback=progress_callback,
-            cancel_callback=cancel_callback,
-        )
+    if old_blob is None and os.path.exists(LIVE_QUEUE_CACHE_FILE):
+        return jsonify({"ok": False, "message": "Existing queue cache is malformed; refresh was not started."}), 409
     started, message = queue_live.JOB.start(
         days=days, api_key=api_key,
         retrieve=fetch_live_queue,
         save=save_live_queue_cache,
-        finalize=phase2_finalize,
+        finalize=lambda incoming_tickets, progress_callback=None, cancel_callback=None: _reconcile_queue_refresh(
+            old_blob, incoming_tickets, progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+        ),
     )
     status = queue_live.JOB.status()
     status.update({"ok": started, "message": message})

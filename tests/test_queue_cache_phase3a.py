@@ -59,7 +59,7 @@ def test_versioned_envelope_round_trip_persists_contract():
     assert raw["schema_version"] == app.QUEUE_CACHE_SCHEMA_VERSION == 2
     assert raw["rolling_retention_days"] == app.ROLLING_RETENTION_DAYS == 60
     assert raw["days"] == raw["last_refresh_requested_days"] == 60
-    assert raw["last_refresh_mode"] == "baseline"
+    assert raw["last_refresh_mode"] == "reconcile"
     assert raw["tickets"] == _tickets()
     assert raw["last_successful_refresh_started_at"] == "2026-08-21T00:12:34Z"
     assert raw["last_successful_refresh_finished_at"] == "2026-08-21T00:12:42Z"

@@ -14,6 +14,7 @@ The SQLite review database is automatically protected with verified, SQLite-cons
 
 - Retrieves Freshdesk tickets only when **Refresh Tickets** is explicitly clicked
 - Lets the operator choose the live retrieval window (1-365 rolling days); **Days** controls Freshdesk retrieval only, it never re-filters the already-cached rows
+- Reconciles each complete successful Days-based retrieval into the existing queue cache rather than replacing it, preserving cached tickets omitted from the requested window; persistent cursor-based incremental retrieval and retention pruning are not active yet
 - Uses only `GET /api/v2/tickets` for queue retrieval, plus targeted conversation `GET /api/v2/tickets/{id}/conversations` checks only for locally reviewed tickets whose `updated_at` became newer than their review snapshot
 - Queue cache uses a single atomic JSON envelope (schema version 2) containing tickets and refresh metadata together. Schema-less legacy queue caches remain readable without being rewritten.
 - Version-2 queue-cache metadata records canonical UTC refresh start/finish timestamps, the requested Days value, and the future rolling-retention setting (60 days). `fetched_at` remains a compatible completion-time Unix timestamp for the existing freshness display.
