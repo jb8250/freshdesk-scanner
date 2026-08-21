@@ -2812,7 +2812,7 @@ QUEUE_HTML = """\
 <h1>Review Queue</h1>
 <div class=queue-status><span class=status-chip>● Live</span><span class="status-chip readonly">Read-only</span></div>
 {% if offline %}<div class=sub><strong>OFFLINE MODE</strong> — Offline fixture data · no network access.</div>{% elif live_cache_missing %}<div class=sub>Live mode — no Freshdesk data retrieved yet.</div>{% endif %}
-{% if not offline and live_cache_missing %}<div class=live-meta>Choose a range and click Refresh Tickets to load Freshdesk tickets.</div>{% endif %}
+{% if not offline and live_cache_missing %}<div class=live-meta>Refresh Tickets performs the initial 60-day baseline when no usable cursor exists. Reconcile Range is reserved for an explicit historical window.</div>{% endif %}
 
 {% if flash %}
 <div class="banner {{ 'ok' if flash[0] == 'ok' else 'err' }}" role=status>{{ flash[1] }}</div>
@@ -2827,7 +2827,7 @@ QUEUE_HTML = """\
   <input type=hidden name=mode value="normal" id=refresh-mode>
   <div class="panel-region region-time">
     <div class="action-buttons"><button type=submit class=apply id=queue-refresh>Refresh Tickets</button></div>
-    <p class=field-hint>{% if live_cache_missing %}No incremental baseline yet. The next normal Refresh will initialize from the last 60 days.{% else %}Checks Freshdesk for new or changed tickets since the last successful refresh.{% endif %}</p>
+    <p class=field-hint>{% if live_cache_missing %}No usable cursor yet. The next normal Refresh will safely initialize from the last 60 days.{% else %}Checks Freshdesk incrementally for new or changed tickets since the last successful attempt start, with the automatic 120-second overlap.{% endif %}</p>
   </div>
   <div class="panel-region region-time reconcile-panel">
     <strong>Reconcile Range</strong>
@@ -2841,7 +2841,7 @@ QUEUE_HTML = """\
   </div>
    <p class=live-meta>Last refreshed {{ last_refresh_display }} · mode {{ last_refresh_mode_display }} · cached tickets {{ cached_ticket_count }}</p>
    <p class=field-hint>Local filters never retrieve Freshdesk data. Only Refresh Tickets or Reconcile Range retrieves data.</p>
- {% if live_cache_missing %}<p class=field-hint>Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets.</p>{% endif %}
+ {% if live_cache_missing %}<p class=field-hint>Refresh Tickets uses the safe 60-day baseline when no usable cursor exists. Choose Days only when you intentionally use Reconcile Range.</p>{% endif %}
  </form>
 <div id=queue-refresh-status class=banner role=status aria-live=polite></div>
 <button type=button id=queue-cancel class=reset hidden>Cancel</button>

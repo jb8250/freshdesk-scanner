@@ -969,7 +969,7 @@ def test_live_429_returns_error_flash_on_apply(monkeypatch):
     html = r0.get_data(as_text=True)
     assert r0.status_code == 200
     assert "no freshdesk data retrieved yet" in html.lower()
-    assert "Choose a range and click Refresh Tickets to load Freshdesk tickets." in html
+    assert "Refresh Tickets performs the initial 60-day baseline when no usable cursor exists." in html
     # Extract the CSRF token that the page rendered (same token the form expects).
     token = _csrf_from_html(html)
     # Refresh starts a background job and returns 202 immediately; the fake 429

@@ -112,7 +112,8 @@ def test_live_startup_and_initial_get_zero_requests(live_client, monkeypatch):
     assert state["calls"] == 0
     assert "no freshdesk data retrieved yet" in html.lower()
     assert "Local filters never retrieve Freshdesk data." in html
-    assert "Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets." in html
+    assert "Refresh Tickets uses the safe 60-day baseline when no usable cursor exists." in html
+    assert "Choose Days only when you intentionally use Reconcile Range." in html
 
 
 def test_refresh_get_zero_requests(live_client, monkeypatch):

@@ -6,6 +6,20 @@ Read-only Freshdesk triage page that surfaces tickets needing attention: custome
 
 This branch is a safe local-development milestone. It supports an explicit offline mode backed by synthetic fixtures. Offline mode never reads the API key and never makes HTTP requests.
 
+## Refresh and reconcile controls
+
+### Normal Refresh
+
+**Refresh Tickets** is the standard day-to-day operation. When a valid successful cursor exists, it retrieves new or changed tickets incrementally from the prior successful attempt start minus the automatic 120-second overlap. With a fresh, legacy, or unusable cursor, it safely bootstraps from a 60-day baseline. Users do not need to choose a Days value for normal Refresh.
+
+### Reconcile Range
+
+**Reconcile Range** is an explicit historical re-check. Choose 7, 14, 30, 60, 90 days, or Custom. The selected window is merged into the existing cache; it does not replace the cache or erase local review history. After a successful Reconcile, its attempt start becomes the cursor for the next normal incremental Refresh.
+
+### Local-only controls
+
+Opening `/queue`, loading the page, applying filters, selecting a Reconcile preset, entering Custom days, switching workflow tabs, **Show All Cached Tickets**, and **Reset to Default Review Scope** are local-only actions. They do not retrieve from Freshdesk.
+
 Successful **Refresh Tickets** applies a rolling 60-day retention policy after reconciliation and before its atomic cache commit. Retention measures ticket `updated_at` against the refresh attempt start time, keeping the exact 60-day cutoff inclusively. Tickets in `Opened / In Review`, `Needs Follow-Up`, or `Needs Supervisor Review` remain cached beyond the window; expired non-active ticket objects may be pruned. Closed tickets follow those same normal age and active-state rules—there is no immediate Closed pruning. Cache retention never deletes or modifies SQLite local review-state rows. If retention validation fails, the existing cache and successful-refresh cursor remain unchanged.
 
 ## Local review-state backup protection
