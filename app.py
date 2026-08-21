@@ -148,6 +148,13 @@ LIVE_QUEUE_CACHE_FILE = os.path.join(CACHE_DIR, "queue_live_tickets.json")
 CACHE_FILE = LIVE_QUEUE_CACHE_FILE
 CACHE_TTL_SECONDS = 30 * 60  # informational only in live mode (never auto-fetches)
 
+# Queue-cache envelope v2 is deliberately separate from ticket data.  Future
+# phases may use the successful refresh start timestamp as their cursor, but
+# Phase 3A continues to replace the entire cache after every successful refresh.
+QUEUE_CACHE_SCHEMA_VERSION = 2
+ROLLING_RETENTION_DAYS = 60
+QUEUE_CACHE_REFRESH_MODES = frozenset({"legacy", "baseline", "incremental", "full_rebuild"})
+
 UPDATED_SINCE_DAYS = 60  # ~2 months
 
 # Scanner keyword set — matches Chrome extension logic (word-boundary regex).
@@ -920,15 +927,79 @@ def offline_paginate_tickets():
             yield t
 
 
-def load_live_queue_cache():
-    """Read the LIVE queue cache (cache/queue_live_tickets.json).
+def queue_cache_timestamp(value=None):
+    """Return a canonical cache-metadata timestamp: UTC, whole seconds, trailing Z."""
+    value = now_utc() if value is None else value
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Queue cache timestamps must be timezone-aware datetimes.")
+    return value.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    Render-only, network-free, never reads the API key. Returns None when the
-    cache is absent, malformed, or wrong-shape — so offline fixtures can NEVER
-    satisfy a live cache read (they live in fixtures/ and are addressed
-    separately here). TTL is NOT evaluated: missing/stale cache is a valid
-    render state, it never triggers a fetch.
+
+def _valid_queue_cache_timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return queue_cache_timestamp(parsed.replace(tzinfo=timezone.utc)) == value
+
+
+def _valid_queue_cache_days(value):
+    return isinstance(value, int) and not isinstance(value, bool) and DAYS_MIN <= value <= DAYS_MAX
+
+
+def normalize_live_queue_cache(blob):
+    """Validate one queue-cache envelope without mutating or migrating it.
+
+    A schema-less envelope is legacy: its metadata remains explicitly unknown.
+    Unsupported versions and malformed v2 envelopes fail closed (``None``).
     """
+    if not isinstance(blob, dict) or not isinstance(blob.get("tickets"), list):
+        return None
+    schema_version = blob.get("schema_version")
+    if schema_version is None:
+        return {**blob, "cache_metadata": {
+            "schema_version": None,
+            "last_successful_refresh_started_at": None,
+            "last_successful_refresh_finished_at": None,
+            "last_refresh_mode": "legacy",
+            "last_refresh_requested_days": None,
+            "rolling_retention_days": None,
+        }}
+    if (not isinstance(schema_version, int) or isinstance(schema_version, bool)
+            or schema_version != QUEUE_CACHE_SCHEMA_VERSION):
+        return None
+    required = (
+        "days", "fetched_at", "last_successful_refresh_started_at",
+        "last_successful_refresh_finished_at", "last_refresh_mode",
+        "last_refresh_requested_days", "rolling_retention_days",
+    )
+    if any(key not in blob for key in required):
+        return None
+    if (not _valid_queue_cache_days(blob["days"])
+            or not isinstance(blob["fetched_at"], (int, float))
+            or isinstance(blob["fetched_at"], bool)
+            or not _valid_queue_cache_timestamp(blob["last_successful_refresh_started_at"])
+            or not _valid_queue_cache_timestamp(blob["last_successful_refresh_finished_at"])
+            or blob["last_refresh_mode"] not in QUEUE_CACHE_REFRESH_MODES
+            or blob["last_refresh_mode"] == "legacy"
+            or not _valid_queue_cache_days(blob["last_refresh_requested_days"])
+            or not isinstance(blob["rolling_retention_days"], int)
+            or isinstance(blob["rolling_retention_days"], bool)
+            or blob["rolling_retention_days"] <= 0):
+        return None
+    return {**blob, "cache_metadata": {
+        key: blob[key] for key in (
+            "schema_version", "last_successful_refresh_started_at",
+            "last_successful_refresh_finished_at", "last_refresh_mode",
+            "last_refresh_requested_days", "rolling_retention_days",
+        )
+    }}
+
+
+def load_live_queue_cache():
+    """Read and validate the single LIVE queue-cache envelope without rewriting it."""
     if not os.path.exists(LIVE_QUEUE_CACHE_FILE):
         return None
     try:
@@ -936,20 +1007,30 @@ def load_live_queue_cache():
             blob = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(blob, dict) or not isinstance(blob.get("tickets"), list):
-        return None
-    return blob
+    return normalize_live_queue_cache(blob)
 
 
-def save_live_queue_cache(tickets, days=DAYS_DEFAULT):
-    """Write the LIVE queue cache atomically with its retrieval window.
+def save_live_queue_cache(tickets, days=DAYS_DEFAULT, refresh_started_at=None, refresh_finished_at=None):
+    """Atomically replace the queue cache after a successful baseline retrieval.
 
-    Called ONLY by the explicit queue Refresh Tickets worker after complete success. Older
-    cache files without ``days`` remain readable as legacy/unknown coverage.
+    ``fetched_at`` remains a compatibility Unix timestamp and denotes the same
+    completion instant as ``last_successful_refresh_finished_at``.
     """
     days = parse_days(days)
-    now_ts = now_utc().timestamp()
-    payload = {"fetched_at": now_ts, "days": days, "tickets": list(tickets)}
+    started = queue_cache_timestamp(refresh_started_at)
+    finished_dt = now_utc() if refresh_finished_at is None else refresh_finished_at
+    finished = queue_cache_timestamp(finished_dt)
+    payload = {
+        "schema_version": QUEUE_CACHE_SCHEMA_VERSION,
+        "days": days,
+        "fetched_at": finished_dt.timestamp(),
+        "last_successful_refresh_started_at": started,
+        "last_successful_refresh_finished_at": finished,
+        "last_refresh_mode": "baseline",
+        "last_refresh_requested_days": days,
+        "rolling_retention_days": ROLLING_RETENTION_DAYS,
+        "tickets": list(tickets),
+    }
     directory = os.path.dirname(os.path.abspath(LIVE_QUEUE_CACHE_FILE)) or "."
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".queue_live_tickets.", suffix=".tmp", dir=directory)

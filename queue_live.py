@@ -107,6 +107,9 @@ class RefreshJobManager:
                 return
 
     def _run(self, days, api_key, retrieve, save, finalize=None):
+        # This is cache metadata only in Phase 3A; retrieval remains a complete
+        # replacement baseline refresh. Capture before the first retrieval call.
+        refresh_started_at = datetime.now(timezone.utc)
         try:
             tickets = retrieve(days=days, api_key=api_key,
                                progress_callback=self._progress,
@@ -125,7 +128,10 @@ class RefreshJobManager:
             else:
                 finalize_after_save = None
             self._progress({"current_stage": "Saving cache", "state": "running"})
-            save(tickets, days=days)
+            # Completion is captured after successful retrieval/finalization and
+            # immediately before the atomic cache commit.
+            save(tickets, days=days, refresh_started_at=refresh_started_at,
+                 refresh_finished_at=datetime.now(timezone.utc))
             if finalize_after_save:
                 finalize_after_save()
             self._finish(SUCCEEDED, f"Refresh complete — {len(tickets)} tickets cached.", written=True)
