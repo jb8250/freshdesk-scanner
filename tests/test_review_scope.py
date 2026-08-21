@@ -366,7 +366,8 @@ def test_initial_get_defaults_scope_on_manual_off(client, monkeypatch):
     assert 'name=hide_reviewed_tags value=1 checked' in html
     for name in ("overdue", "responded", "waiting", "missing_tags"):
         assert f'name={name} value=1 checked' not in html, name
-    assert '<option value=all selected>' in html
+    assert 'name=workflow_tab value="main"' in html
+    assert 'workflow-tab active' in html
     assert "Review Scope" in html
     assert state["calls"] == 0
 
@@ -376,7 +377,7 @@ def test_initial_get_displays_only_default_scope(client):
     assert "500006" not in ids  # "Vendor painted..." non-photo subject hidden
     assert "500028" not in ids  # "Delivery schedule confirmation" hidden
     assert "500001" in ids      # "Customer sent photo..." visible
-    assert len(ids) == 23
+    assert len(ids) == 22
 
 
 def test_show_all_link_rendered(client):
@@ -400,7 +401,7 @@ def test_reset_restores_default_scope(client, monkeypatch):
     html = _html(client, "/queue?photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all")
     assert 'name=photo_video_only value=1 checked' in html
     assert 'name=hide_reviewed_tags value=1 checked' in html
-    assert len(_ids(html)) == 23
+    assert len(_ids(html)) == 22  # closed-status ticket excluded from the workflow queue
     assert state["calls"] == 0
 
 
@@ -442,6 +443,8 @@ def test_status_polling_is_local_only(client, monkeypatch):
     assert state["calls"] == 0
 
 
-def test_review_view_select_preserved_under_scope(client):
-    html = _html(client, "/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=active")
-    assert '<option value=active selected>' in html
+def test_workflow_tab_replaces_review_view_select_under_scope(client):
+    html = _html(client, "/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&workflow_tab=followup")
+    assert 'workflow-tab active' in html
+    assert 'Follow-Up' in html
+    assert 'id=review_view name=review_view' not in html

@@ -46,6 +46,10 @@ def clean_state(monkeypatch, tmp_path):
     monkeypatch.delenv("FRESHDESK_OFFLINE", raising=False)
     monkeypatch.delenv("FRESHDESK_API_KEY", raising=False)
     monkeypatch.delenv("REVIEW_DB_PATH", raising=False)
+    monkeypatch.delenv("REVIEW_BACKUP_DIR", raising=False)
+    monkeypatch.setenv("REVIEW_BACKUP_DIR", str(tmp_path / "review_backups"))
+    monkeypatch.delenv("REVIEW_BACKUP_KEEP", raising=False)
+    monkeypatch.setattr(scanner_app, "_STARTUP_BACKUP_DONE", False)
     monkeypatch.setattr(scanner_app, "FRESHDESK_API_KEY", "")
     # Tests must never consult an operator-provisioned external key file. This
     # keeps missing-key behavior deterministic and prevents credential reads.

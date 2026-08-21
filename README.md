@@ -6,6 +6,10 @@ Read-only Freshdesk triage page that surfaces tickets needing attention: custome
 
 This branch is a safe local-development milestone. It supports an explicit offline mode backed by synthetic fixtures. Offline mode never reads the API key and never makes HTTP requests.
 
+## Local review-state backup protection
+
+The SQLite review database is automatically protected with verified, SQLite-consistent backups in `~/FreshdeskScannerBackups/review_state` by default. Set `REVIEW_BACKUP_DIR` to override the location and `REVIEW_BACKUP_KEEP` to configure retention (default: 200 automatic generations; malformed values use the safe default). A startup baseline and successful queue review, acknowledge-update, automatic review advancement, opened-state, and closed-review mutation create backups. Each backup uses SQLite's backup API, integrity verification, SHA-256 metadata, a temporary file, and atomic finalization. Manual/recovery files are never pruned; only the feature's automatic filename pattern is rotated. If backup work fails, the local database mutation remains committed and the failure is logged (with a concise warning where practical). Tests always use temporary `REVIEW_DB_PATH` and `REVIEW_BACKUP_DIR`; backup protection makes no Freshdesk requests.
+
 ## What It Does
 
 - Retrieves Freshdesk tickets only when **Refresh Tickets** is explicitly clicked
@@ -21,7 +25,9 @@ This branch is a safe local-development milestone. It supports an explicit offli
 - **Default Review Scope** (visible in the UI, defaults ON): the default queue shows photo/video subjects only, and hides tickets carrying any reviewed/closed Freshdesk tag (Parts needed, Exchange, No Service Needed, Closed, Schedule Service, Delivery special needed)
 - Photo/video matching is case-insensitive and word-boundary aware on the ticket **subject** only (Photo, Photos, Picture, Pictures, Pic, Pics, Video, Videos, Vid, Vids)
 - Tag comparison for the reviewed/closed exclusions is case-insensitive and leading/trailing-whitespace-insensitive for comparison only; stored Freshdesk tags are never modified
-- Optional manual local filters stay independent and remain opt-in: Overdue, Customer Responded, Waiting on Customer, Missing Tags, and Review View (all default OFF / All)
+- Optional manual local filters stay independent and remain opt-in: Overdue, Customer Responded, Waiting on Customer, and Missing Tags (all default OFF)
+- The queue is organized by local workflow tabs: Main Queue, Supervisor Review, Follow-Up, Resolved, and No Action. The `Needs Supervisor Review` state is local-only; workflow tabs and review actions never call Freshdesk. Actual Freshdesk `Closed` tickets are excluded from normal workflow tabs and appear only through the explicit Show All Cached Tickets view.
+- `workflow_tab` is the canonical bookmarkable queue URL parameter; older `review_view` links remain accepted for compatibility. Changing tabs, filters, presets, or review state is local-only; only Refresh Tickets retrieves data.
 - **Reset to Default Review Scope** restores the scoped default queue; **Show All Cached Tickets** turns the scope controls and every manual filter off to display the complete current cache (deduped only) — both are local-only and never contact Freshdesk
 - A successful data refresh reloads the queue back into the default Review Scope view
 - Has no Freshdesk ticket mutation actions

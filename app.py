@@ -73,6 +73,8 @@ import requests
 from flask import (Flask, jsonify, redirect, render_template_string, request,
                    session)
 
+import review_backups
+
 # Live Closed dashboard support (Prompt 24): separate cache, atomic writes and
 # the single-slot refresh job. Importing it here is safe — closed_live imports
 # closed_retriever lazily, so there is no import cycle.
@@ -331,15 +333,22 @@ DEFAULT_FILTERS = {
     "waiting": False,            # opt-in: status == 6 (Waiting on customer)
     "missing_tags": False,       # opt-in: tags absent or empty
     "days": 60,                  # Freshdesk retrieval window (1-365)
-    "review_view": "all",        # neutral local review-state view
+    "review_view": "all",        # legacy compatibility; workflow_tab is canonical
+    "workflow_tab": "main",      # default workflow tab
 }
 DAYS_MIN, DAYS_MAX, DAYS_DEFAULT = 1, 365, 60
 REVIEW_VIEWS = ("active", "completed", "all")
+WORKFLOW_TABS = ("main", "supervisor", "followup", "resolved", "no_action")
+WORKFLOW_LABELS = {
+    "main": "Main Queue", "supervisor": "Supervisor Review", "followup": "Follow-Up",
+    "resolved": "Resolved", "no_action": "No Action",
+}
 
 # Local review results (stored in SQLite only — never sent to Freshdesk).
 REVIEW_STATES = [
     "Unreviewed",
     "Opened / In Review",
+    "Needs Supervisor Review",
     "Resolved",
     "Not Applicable to Me",
     "No Action Needed",
@@ -348,9 +357,49 @@ REVIEW_STATES = [
 # States that snapshot the ticket's updated_at at review time. A later ticket
 # update compared against that snapshot produces the "UPDATED SINCE REVIEW"
 # flag, and such tickets are treated as Active again.
-REVIEWED_STATES = {"Resolved", "Not Applicable to Me", "No Action Needed", "Needs Follow-Up"}
-ACTIVE_STATES = {"Unreviewed", "Opened / In Review", "Needs Follow-Up"}
+REVIEWED_STATES = {"Resolved", "Not Applicable to Me", "No Action Needed", "Needs Follow-Up", "Needs Supervisor Review"}
+ACTIVE_STATES = {"Unreviewed", "Opened / In Review", "Needs Follow-Up", "Needs Supervisor Review"}
 COMPLETED_STATES = {"Resolved", "Not Applicable to Me", "No Action Needed"}
+
+
+def parse_workflow_tab(value):
+    return value if value in WORKFLOW_TABS else "main"
+
+
+def workflow_destination(state, updated=False):
+    """Return the local workflow destination; updates always route to Main."""
+    if updated:
+        return "main"
+    return {
+        "Unreviewed": "main", "Opened / In Review": "main",
+        "Needs Supervisor Review": "supervisor", "Needs Follow-Up": "followup",
+        "Resolved": "resolved", "No Action Needed": "no_action",
+        "Not Applicable to Me": "no_action",
+    }.get(state, "main")
+
+
+def workflow_tab_includes(state_row, updated_flag, tab):
+    state = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
+    return workflow_destination(state, updated_flag) == tab
+
+
+def human_age(seconds):
+    """Compact, deterministic age label for cache metadata."""
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "Unknown"
+    if seconds < 0 or not math.isfinite(seconds):
+        return "Unknown"
+    if seconds < 60:
+        return "Just now"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
 
 # ---------------------------------------------------------------------------
 # Time helpers (monkeypatchable in tests)
@@ -436,7 +485,7 @@ def filters_from_args(args, submitted=False):
         value = _last_value(args, name)
         default = checkbox_default if submitted else DEFAULT_FILTERS[name]
         return parse_bool(value, default)
-    return {
+    cfg = {
         "photo_video_only": checkbox("photo_video_only"),
         "hide_reviewed_tags": checkbox("hide_reviewed_tags"),
         "overdue": checkbox("overdue"),
@@ -446,6 +495,12 @@ def filters_from_args(args, submitted=False):
         "days": parse_days(_last_value(args, "days")),
         "review_view": parse_review_view(_last_value(args, "review_view")),
     }
+    try:
+        has_tab = "workflow_tab" in dict(args)
+    except (TypeError, ValueError):
+        has_tab = False
+    cfg["workflow_tab"] = parse_workflow_tab(_last_value(args, "workflow_tab")) if has_tab else DEFAULT_FILTERS["workflow_tab"]
+    return cfg
 
 
 def filter_query_string(config):
@@ -461,6 +516,7 @@ def filter_query_string(config):
         "missing_tags": "1" if config.get("missing_tags") else "0",
         "days": str(config.get("days", DAYS_DEFAULT)),
         "review_view": config.get("review_view", "all"),
+        "workflow_tab": parse_workflow_tab(config.get("workflow_tab", "main")),
     })
 
 
@@ -470,22 +526,13 @@ _VIEW_LABEL = {"active": "Active", "completed": "Completed", "all": "All"}
 def _last_refresh_display(cache_age, offline):
     if offline or cache_age is None:
         return "Never"
-    mins = max(0, int(cache_age) // 60)
-    if mins < 1:
-        return "just now"
-    if mins < 60:
-        return f"{mins} minute{'s' if mins != 1 else ''} ago"
-    hrs = mins // 60
-    if hrs < 24:
-        return f"{hrs} hour{'s' if hrs != 1 else ''} ago"
-    days = hrs // 24
-    return f"{days} day{'s' if days != 1 else ''} ago"
+    return human_age(cache_age)
 
 
 def _cache_coverage_display(cached_days, selected_days):
     if not isinstance(cached_days, int):
         return "Unknown"
-    label = f"Last {cached_days} day{'s' if cached_days != 1 else ''}"
+    label = f"Last {cached_days} day{'s' if cached_days != 1 else ''} (covers the last {cached_days} day{'s' if cached_days != 1 else ''})"
     if isinstance(selected_days, int) and selected_days > cached_days:
         return f"{label} (selected {selected_days})"
     return label
@@ -1012,7 +1059,31 @@ def fetch_ticket_conversations(ticket_id, reviewed_at, api_key=None, clock=None,
     return conversations, False, remaining
 
 
-def _advance_review_snapshot(ticket_id, updated_at):
+def _backup_after_mutation(reason):
+    try:
+        review_backups.create_backup(reason=reason)
+        return None
+    except Exception as exc:
+        review_backups.LOGGER.error("Local review-state backup failed after %s: %s", reason, exc, exc_info=True)
+        return "Review saved, but local backup failed."
+
+
+_STARTUP_BACKUP_DONE = False
+
+
+@app.before_request
+def _protect_review_state_at_startup():
+    global _STARTUP_BACKUP_DONE
+    if _STARTUP_BACKUP_DONE:
+        return
+    try:
+        review_backups.ensure_startup_backup()
+    except Exception:
+        review_backups.LOGGER.error("Startup review-state backup failed", exc_info=True)
+    _STARTUP_BACKUP_DONE = True
+
+
+def _advance_review_snapshot(ticket_id, updated_at, backup=True):
     """Advance one existing queue review snapshot, preserving every field."""
     if parse_dt(updated_at) is None:
         return False
@@ -1028,6 +1099,8 @@ def _advance_review_snapshot(ticket_id, updated_at):
             (updated_at, iso_now(), ticket_id),
         )
         conn.commit()
+        if backup:
+            _backup_after_mutation("automatic-review-advance")
         return True
     finally:
         conn.close()
@@ -1091,12 +1164,15 @@ def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=No
                            "private_note_updates_suppressed": len(updates),
                            "conversation_checks_inconclusive": inconclusive})
     def apply_updates():
+        changed = False
         for tid, timestamp in updates.items():
             try:
-                _advance_review_snapshot(tid, timestamp)
+                changed = _advance_review_snapshot(tid, timestamp, backup=False) or changed
             except Exception:
                 # Cache remains valid; this ticket simply remains flagged.
                 continue
+        if changed:
+            _backup_after_mutation("automatic-review-advance")
     return list(tickets), apply_updates
 
 
@@ -1345,6 +1421,7 @@ def _mark_opened(table: str, ticket_id):
                 (result, first, now, now if changed else row["last_review_change_at"], now, ticket_id),
             )
         conn.commit()
+        _backup_after_mutation("closed-review-change" if table == "closed_review_state" else "review-change")
         return result
     finally:
         conn.close()
@@ -1389,6 +1466,7 @@ def _set_review_result(table: str, ticket_id, result, reviewed_updated_at=None):
                  now, ticket_id),
             )
         conn.commit()
+        _backup_after_mutation("closed-review-change" if table == "closed_review_state" else "review-change")
     finally:
         conn.close()
 
@@ -2116,17 +2194,34 @@ def queue():
     # no longer suppresses rows.
     all_categories_off = not (config["overdue"] or config["responded"] or config["waiting"])
     tickets = apply_queue_filters(raw, config)
+    # Normal workflow excludes actual Freshdesk Closed status. Show All Cached
+    # Tickets is the explicit diagnostic escape hatch and retains full-cache semantics.
+    show_all_cached = not any((config["photo_video_only"], config["hide_reviewed_tags"], config["overdue"], config["responded"], config["waiting"], config["missing_tags"]))
+    if not show_all_cached:
+        tickets = [t for t in tickets if t.get("status") != CLOSED_STATUS and str(t.get("status")) != str(CLOSED_STATUS)]
 
     state_rows = load_review_rows()
     last_opened_id = last_opened_ticket_id()  # focus state, independent of filters
 
-    # Per-ticket view decision + row data (single row per ticket, sorted by id).
+    # Per-ticket workflow decision + row data. Closed tickets are omitted from
+    # normal workflow tabs, while explicit Show All remains diagnostic. The
+    # legacy review_view URL is still understood internally (it controls its own
+    # classic mapping) but the visible Review View control is superseded by the
+    # workflow tabs, so the normal render routes entirely by workflow_tab.
+    legacy_view_routing = "review_view" in request.args and "workflow_tab" not in request.args
     rows = []
-    for t in sorted(tickets, key=lambda x: (x.get("id") is None, x.get("id") or 0)):
+    workflow_counts = {tab: 0 for tab in WORKFLOW_TABS}
+    ordered_tickets = sorted(tickets, key=lambda x: (not updated_since_review(x, state_rows.get(x.get("id"))), x.get("id") is None, x.get("id") or 0))
+    for t in ordered_tickets:
         tid = t["id"]
         state_row = state_rows.get(tid)
         updated_flag = updated_since_review(t, state_row)
-        if not review_view_includes(state_row, updated_flag, config["review_view"]):
+        destination = workflow_destination(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", updated_flag)
+        workflow_counts[destination] += 1
+        if legacy_view_routing:
+            if not review_view_includes(state_row, updated_flag, config["review_view"]):
+                continue
+        elif not show_all_cached and destination != config["workflow_tab"]:
             continue
         sid = t.get("status")
         pid = t.get("priority", 0)
@@ -2153,14 +2248,16 @@ def queue():
             "result": state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
             "row_class": row_class,
             "last_opened": is_last_opened,
-            "badges": ticket_badges(t, state_row, updated_flag),
-            "can_acknowledge": bool(state_row and state_row.get("review_result") in REVIEWED_STATES and updated_flag),
+             "updated_flag": updated_flag,
+             "badges": ticket_badges(t, state_row, updated_flag),
+             "can_acknowledge": bool(state_row and state_row.get("review_result") in REVIEWED_STATES and updated_flag),
         })
 
     flash_msg = session.pop("flash", None)
 
     return _queue_render(
         tickets=rows, total=len(rows), error=missing_key_msg,
+        workflow_counts=workflow_counts,
         offline=offline, cache_age=cache_age, config=config,
         csrf_token=get_csrf_token(), flash=flash_msg,
         all_categories_off=all_categories_off,
@@ -2170,6 +2267,7 @@ def queue():
          cached_days=cached_days,
          last_refresh_display=_last_refresh_display(cache_age, offline),
          cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
+         cache_coverage_warning=(cached_days is None or (isinstance(cached_days, int) and config["days"] > cached_days)),
     )
 
 
@@ -2358,8 +2456,24 @@ def resolve_bind_host(host):
 _SHARED_CSS = """
  :root{--fd-customer-responded:#09218D;--fd-customer-responded-text:#FFFFFF;--fd-waiting-customer:#E9AE3D;--fd-waiting-customer-text:#1A1A1A;--fd-last-opened:#6A1B9A;--fd-last-opened-text:#FFFFFF}
  body{font-family:system-ui,Arial,sans-serif;max-width:1100px;margin:auto;padding:16px;background:#f5f5f5;color:#222}
- h1{font-size:22px;margin:0 0 4px}
- .sub{color:#666;font-size:13px;margin-bottom:16px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#666;font-size:13px;margin-bottom:16px}
+  .queue-status{display:inline-flex;gap:7px;margin:0 0 14px}
+  .status-chip{border-radius:999px;padding:4px 9px;font-size:12px;font-weight:650;background:#e8f5e9;color:#245b31}
+  .status-chip.readonly{background:#eef1f5;color:#4d5968}
+  .workflow-tabs{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid #ddd;margin:18px 0 14px}
+  .workflow-tab{padding:9px 13px;border:1px solid transparent;border-bottom:3px solid transparent;color:#4b5563;text-decoration:none;font-weight:650;font-size:13px}
+  .workflow-tab:hover,.workflow-tab.active{color:#173b72;background:#fff;border-color:#e1e5ea;border-bottom-color:#2f6fca}
+  .workflow-tab-count{font-weight:500;color:#6b7280}
+  .updated-section{margin-top:10px}
+  .workflow-section-label{font-size:12px;letter-spacing:.08em;font-weight:750;color:#536273;margin:16px 0 7px}
+  .live-meta{font-size:13px;color:#667085;margin:0 0 12px}
+  .coverage-warning{margin:0 0 12px;padding:8px 11px;border:1px solid #e0c060;border-radius:6px;background:#fff8df;font-size:13px;color:#624d12}
+  .empty{padding:24px;text-align:center;color:#667085;background:#fff;border:1px dashed #d5dbe3;border-radius:8px}
+  /* Keep the range editor's native hidden state authoritative.  The
+     !important guard prevents a later layout rule from masking it. */
+  [hidden]{display:none!important}
+  .custom-days.hidden{display:none}
  .banner{background:#fff3cd;border:1px solid #e0c060;padding:8px 12px;border-radius:6px;font-size:13px;margin-bottom:14px}
  .banner.err{background:#fdecea;border-color:#d66;color:#8a1f1f}
  .banner.ok{background:#e8f5e9;border-color:#6a9;color:#1e4d2b}
@@ -2470,19 +2584,10 @@ QUEUE_HTML = """\
 <title>Freshdesk Review Queue</title>
 <style>{{ shared_css|safe }}</style></head><body>
 {{ nav|safe }}
-<h1>Freshdesk Review Queue</h1>
-
-<div class=sub>{% if offline %}<strong>OFFLINE MODE</strong> — using mock/offline fixture data. No network access.{% elif live_cache_missing %}Live mode — <strong>no Freshdesk data retrieved yet</strong>.{% else %}Live mode — read-only ticket list.{% if cache_age is not none %} · cache {{ cache_age }}s old{% endif %}{% endif %}</div>
-{% if not offline and live_cache_missing %}
-<div class=banner role=status>
-  <strong>Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets.</strong>
-  <span class=meta>Local filters never retrieve Freshdesk data.</span>
-</div>
-{% elif not offline and cached_days is none %}
-<div class=banner role=status>Current live cache coverage is unknown (legacy cache). Click Refresh Tickets to retrieve a verified {{ config.days }}-day window.</div>
-{% elif not offline and config.days > cached_days %}
-<div class=banner role=status>Current live cache covers the last {{ cached_days }} day{{ 's' if cached_days != 1 else '' }}. Click Refresh Tickets to retrieve the last {{ config.days }} days.</div>
-{% endif %}
+<h1>Review Queue</h1>
+<div class=queue-status><span class=status-chip>● Live</span><span class="status-chip readonly">Read-only</span></div>
+{% if offline %}<div class=sub><strong>OFFLINE MODE</strong> — Offline fixture data · no network access.</div>{% elif live_cache_missing %}<div class=sub>Live mode — no Freshdesk data retrieved yet.</div>{% endif %}
+{% if not offline and live_cache_missing %}<div class=live-meta>Choose a range and click Refresh Tickets to load Freshdesk tickets.</div>{% endif %}
 
 {% if flash %}
 <div class="banner {{ 'ok' if flash[0] == 'ok' else 'err' }}" role=status>{{ flash[1] }}</div>
@@ -2495,21 +2600,18 @@ QUEUE_HTML = """\
 <form class="controls" method=post action=/queue/api/refresh novalidate id=queue-refresh-form>
   <input type=hidden name=csrf_token value="{{ csrf_token }}">
   <div class="panel-region region-time">
-    <span class=field><span class=lbl>Tickets updated in the last</span>
-      <input type=number name=days min=1 max=365 value="{{ config.days }}" aria-label="Days back">
-      <span class=lbl>days</span>
-      <span class=meta>Last successful refresh: {{ last_refresh_display }}</span>
-      <span class=meta>Cache coverage: {{ cache_coverage_display }}</span>
-    </span>
-    <div class=preset-group role=group aria-label="Quick time presets">
-      {% for d in [7, 14, 30, 60, 90] %}<a class=preset href="/queue?{{ preset_urls[d] }}" {% if config.days == d %}aria-current=page{% endif %}>{% if config.days == d %}<span class=preset-mark aria-hidden=true>&#10003;</span> {% endif %}{{ d }}d</a>{% endfor %}
+    <div class=preset-group role=group aria-label="Retrieval range">
+      {% for d in [7, 14, 30, 60, 90] %}<a {% if config.days == d %}class="preset preset-on active"{% else %}class=preset{% endif %} href="/queue?{{ preset_urls[d] }}"{% if config.days == d %} aria-current=page{% endif %}>{{ d }}d</a>{% endfor %}
+      <button type=button class="preset{% if config.days not in [7,14,30,60,90] %} active{% endif %}" id=custom-days-toggle{% if config.days not in [7,14,30,60,90] %} aria-current=page{% endif %} aria-pressed="{{ 'true' if config.days not in [7,14,30,60,90] else 'false' }}">Custom…</button>
+      <span class=custom-days id=custom-days-wrap{% if config.days in [7,14,30,60,90] %} hidden{% endif %}><label class=lbl for=custom-days>Days</label><input id=custom-days type=number name=days min={{ days_min }} max={{ days_max }} value="{{ config.days }}" aria-label="Custom days" step=1></span>
     </div>
+    <div class=action-buttons><button type=submit class=apply id=queue-refresh>Refresh Tickets</button></div>
   </div>
-  <div class="panel-region region-actions">
-    <div class=action-buttons>
-      <button type=submit class=apply id=queue-refresh>Refresh Tickets</button>
-    </div>
-  </div>
+   <p class=live-meta>Last refreshed {{ last_refresh_display }} · cache covers {{ cache_coverage_display }}</p>
+   <p class=field-hint>Local filters never retrieve Freshdesk data. Only Refresh Tickets retrieves data.</p>
+   {% if live_cache_missing %}<p class=field-hint>Choose a Days window and click Refresh Tickets to retrieve Freshdesk tickets.</p>{% elif cache_coverage_warning %}<p class=field-hint>Refresh Tickets to retrieve the last {{ config.days }} days.</p>{% endif %}
+   {% if cache_coverage_warning %}<p class="field-hint coverage-warning">Cache coverage is unknown or narrower than the selected retrieval window.</p>{% endif %}
+  {% if not offline and cached_days is not none and config.days > cached_days %}<p class=coverage-warning role=status>Cache covers {{ cached_days }} day{{ 's' if cached_days != 1 else '' }}, while {{ config.days }} days is selected. Refresh Tickets to load the selected range.</p>{% endif %}
 </form>
 <div id=queue-refresh-status class=banner role=status aria-live=polite></div>
 <button type=button id=queue-cancel class=reset hidden>Cancel</button>
@@ -2543,19 +2645,19 @@ QUEUE_HTML = """\
     </fieldset>
   </div>
   <div class="panel-region region-actions">
-    <span class=view-field><label for=review_view>Review view</label>
-      <select id=review_view name=review_view>
-        {% for v in ['active','completed','all'] %}<option value={{ v }} {{ 'selected' if config.review_view == v }}>{% if v == 'active' %}Active{% elif v == 'completed' %}Completed{% else %}All{% endif %}</option>{% endfor %}
-      </select></span>
+    <input type=hidden name=workflow_tab value="{{ config.workflow_tab }}">
     <div class=action-buttons>
       <button type=submit class=apply>Apply Filters</button>
-      <a class=reset href="/queue?photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
-      <a class=reset href="/queue?photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all" role=button aria-label="Show every cached ticket">Show All Cached Tickets</a>
+      <a class=reset href="/queue?photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
+      <a class=reset href="/queue?photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Show every cached ticket">Show All Cached Tickets</a>
     </div>
   </div>
 </form>
 <p class=filter-summary role=status>{{ active_summary }}</p>
 
+<nav class=workflow-tabs aria-label="Review workflow">
+{% for tab in ['main','supervisor','followup','resolved','no_action'] %}<a class="workflow-tab{% if config.workflow_tab == tab %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, workflow_tab=tab)) }}" {% if config.workflow_tab == tab %}aria-current=page{% endif %}>{{ {'main':'Main Queue','supervisor':'Supervisor Review','followup':'Follow-Up','resolved':'Resolved','no_action':'No Action'}[tab] }} <span class=workflow-tab-count>({{ workflow_counts[tab] }})</span></a>{% endfor %}
+</nav>
 <p class=count>{{ total }} tickets displayed from the current cache</p>
 {% if last_opened_id is not none %}
   {% if last_opened_rendered %}
@@ -2565,6 +2667,9 @@ QUEUE_HTML = """\
   {% endif %}
 {% endif %}
 {% if tickets %}
+{% set updated_tickets = tickets|selectattr('updated_flag')|list %}
+{% set ordinary_tickets = tickets|rejectattr('updated_flag')|list %}
+{% if config.workflow_tab == 'main' and updated_tickets %}<div class=workflow-section-label>UPDATED SINCE REVIEW</div>{% endif %}
 <div class=tablewrap>
 <table id=queue-table>
 <caption class=visually-hidden>Freshdesk review queue</caption>
@@ -2590,7 +2695,8 @@ QUEUE_HTML = """\
       <input type=hidden name=waiting value="{{ '1' if config.waiting else '0' }}">
       <input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}">
       <input type=hidden name=days value="{{ config.days }}">
-      <input type=hidden name=review_view value="{{ config.review_view }}">
+       <input type=hidden name=review_view value="{{ config.review_view }}">
+       <input type=hidden name=workflow_tab value="{{ config.workflow_tab }}">
       <select name=review_result aria-label="Review result for ticket {{ t.id }}" onchange="this.form.submit()">
         {% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}
        </select>
@@ -2606,7 +2712,7 @@ QUEUE_HTML = """\
 </table>
 </div>
 {% else %}
-<div class=empty>No tickets match the current filter.</div>
+<div class=empty>{% if config.workflow_tab == 'main' %}No tickets need review.{% elif config.workflow_tab == 'supervisor' %}No tickets are waiting for supervisor review.{% elif config.workflow_tab == 'followup' %}No tickets need follow-up.{% elif config.workflow_tab == 'resolved' %}No resolved tickets in current view.{% else %}No no-action tickets in current view.{% endif %}</div>
 {% endif %}
 
 <div class=foot>Review results are stored locally only (SQLite) and are never sent to Freshdesk. Ticket links open Freshdesk in a new tab; opening a ticket marks it as Opened / In Review locally.</div>
@@ -2834,16 +2940,31 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
       fetch('/queue/api/refresh/cancel', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: encode({ csrf_token: csrf ? csrf.value : '' }) }).then(function () { poll(); });
     });
   }
-  form.addEventListener('submit', function (e) {
-    e.preventDefault();
-    var daysEl = form.querySelector('input[name=days]');
-    var body = encode({ csrf_token: csrf ? csrf.value : '', days: daysEl ? daysEl.value : '1' });
+   form.addEventListener('submit', function (e) {
+     e.preventDefault();
+     var daysEl = form.querySelector('input[name=days]');
+     var customEl = document.getElementById('custom-days');
+     var body = encode({ csrf_token: csrf ? csrf.value : '', days: (customEl || daysEl) ? (customEl || daysEl).value : '1' });
     statusEl.textContent = 'Starting refresh…';
     if (refreshBtn) { refreshBtn.disabled = true; }
     fetch('/queue/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
       .then(function (r) { return r.json(); }).then(function (s) { render(s); if (s.state === 'running') { poll(); } })
       .catch(function () { statusEl.textContent = 'Refresh could not be started.'; if (refreshBtn) { refreshBtn.disabled = false; } });
-  });
+     });
+   var customToggle = document.getElementById('custom-days-toggle');
+   var customWrap = document.getElementById('custom-days-wrap');
+   var customInput = document.getElementById('custom-days');
+   if (customToggle && customWrap && customInput) customToggle.addEventListener('click', function () {
+     // The server renders preset ranges with the native hidden attribute.
+     // Clear that property as well as the legacy class; removing only the
+     // class leaves the [hidden] CSS rule in control in a real browser.
+     customWrap.hidden = false;
+     customWrap.classList.remove('hidden');
+     customToggle.classList.add('active');
+     customToggle.setAttribute('aria-current', 'page');
+     customToggle.setAttribute('aria-pressed', 'true');
+     customInput.focus();
+   });
 })();
 </script>
 </body></html>
@@ -3121,6 +3242,7 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     fetch('/closed/api/refresh/cancel', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:encode({csrf_token:CSRF_TOKEN})})
       .then(function(r){return r.json();}).then(function(s){output.textContent=s.message || ''; poll();});
   });
+
   // No page-load poll: opening or reloading /closed performs zero requests.
   // Status polling starts only from the explicit Refresh/Cancel actions above.
 })();
@@ -3151,6 +3273,7 @@ def _queue_render(**kwargs):
     """Render QUEUE_HTML with the shared context merged in."""
     ctx = dict(kwargs)
     cfg = ctx.get("config") or dict(DEFAULT_FILTERS)
+    cfg.setdefault("workflow_tab", "main")
     ctx.setdefault("config", cfg)
     ctx.setdefault("shared_css", _SHARED_CSS)
     ctx.setdefault("nav", _nav_html("queue"))
@@ -3159,8 +3282,12 @@ def _queue_render(**kwargs):
     token = ctx["csrf_token"]
     ctx.setdefault("csrf_token_json", json.dumps(token))
     ctx.setdefault("review_states", REVIEW_STATES)
+    ctx.setdefault("days_min", DAYS_MIN)
+    ctx.setdefault("days_max", DAYS_MAX)
     ctx.setdefault("preset_urls", {d: filter_query_string(dict(cfg, days=d)) for d in (7, 14, 30, 60, 90)})
     ctx.setdefault("active_summary", filter_summary_text(cfg))
+    ctx.setdefault("filter_query_string", filter_query_string)
+    ctx.setdefault("workflow_counts", {tab: 0 for tab in WORKFLOW_TABS})
     ctx.setdefault("live_cache_missing", False)
     ctx.setdefault("last_refresh_display", "Never")
     ctx.setdefault("cache_coverage_display", "Unknown")
