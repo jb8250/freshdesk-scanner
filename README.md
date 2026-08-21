@@ -6,6 +6,8 @@ Read-only Freshdesk triage page that surfaces tickets needing attention: custome
 
 This branch is a safe local-development milestone. It supports an explicit offline mode backed by synthetic fixtures. Offline mode never reads the API key and never makes HTTP requests.
 
+Phase 3D1 defines a pure in-memory 60-day retention policy for validated queue ticket objects. Tickets with active local review states are protected beyond the age window; the policy engine is not yet connected to Refresh Tickets, so cache pruning is not active.
+
 ## Local review-state backup protection
 
 The SQLite review database is automatically protected with verified, SQLite-consistent backups in `~/FreshdeskScannerBackups/review_state` by default. Set `REVIEW_BACKUP_DIR` to override the location and `REVIEW_BACKUP_KEEP` to configure retention (default: 200 automatic generations; malformed values use the safe default). A startup baseline and successful queue review, acknowledge-update, automatic review advancement, opened-state, and closed-review mutation create backups. Each backup uses SQLite's backup API, integrity verification, SHA-256 metadata, a temporary file, and atomic finalization. Manual/recovery files are never pruned; only the feature's automatic filename pattern is rotated. If backup work fails, the local database mutation remains committed and the failure is logged (with a concise warning where practical). Tests always use temporary `REVIEW_DB_PATH` and `REVIEW_BACKUP_DIR`; backup protection makes no Freshdesk requests.
