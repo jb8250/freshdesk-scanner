@@ -72,6 +72,64 @@ def test_valid_cursor_uses_exact_two_minute_overlap_and_ignores_days():
     assert app.queue_refresh_plan(cache(), 45, at(12))["effective_updated_since"] == "2026-08-21T09:58:00Z"
 
 
+def production_v2_cache(cursor="2026-08-21T19:43:20Z", finished="2026-08-21T20:02:04Z", **extra):
+    value = {
+        "schema_version": 2,
+        "days": 60,
+        "fetched_at": 1,
+        "last_successful_refresh_started_at": cursor,
+        "last_successful_refresh_finished_at": finished,
+        "last_refresh_mode": "baseline",
+        "last_refresh_requested_days": 60,
+        "rolling_retention_days": 60,
+        "tickets": [],
+    }
+    value.update(extra)
+    return value
+
+
+def test_raw_schema_v2_production_shape_uses_top_level_cursor():
+    plan = app.queue_refresh_plan(production_v2_cache(), 60, at(21))
+    assert plan["refresh_mode"] == "incremental"
+    assert plan["cursor_source"] == "previous_successful_start"
+    assert plan["effective_updated_since"] == "2026-08-21T19:41:20Z"
+
+
+@pytest.mark.parametrize("metadata", [None, {"schema_version": 2,
+                                                 "last_successful_refresh_started_at": "2026-08-20T10:00:00Z",
+                                                 "last_successful_refresh_finished_at": "2026-08-20T10:01:00Z"},
+                                       {"schema_version": 2,
+                                        "last_successful_refresh_started_at": "2026-08-22T10:00:00Z",
+                                        "last_successful_refresh_finished_at": "2026-08-22T10:01:00Z"}])
+def test_valid_top_level_cursor_is_authoritative_over_compatibility_metadata(metadata):
+    plan = app.queue_refresh_plan(production_v2_cache(cache_metadata=metadata), 60, at(21))
+    assert plan["refresh_mode"] == "incremental"
+    assert plan["effective_updated_since"] == "2026-08-21T19:41:20Z"
+
+
+def test_compatibility_metadata_is_used_only_when_top_level_cursor_is_absent():
+    raw = production_v2_cache()
+    raw.pop("last_successful_refresh_started_at")
+    raw.pop("last_successful_refresh_finished_at")
+    raw["cache_metadata"] = {
+        "schema_version": 2,
+        "last_successful_refresh_started_at": "2026-08-21T10:00:00Z",
+        "last_successful_refresh_finished_at": "2026-08-21T10:01:00Z",
+    }
+    plan = app.queue_refresh_plan(raw, 60, at(12))
+    assert plan["refresh_mode"] == "incremental"
+    assert plan["effective_updated_since"] == "2026-08-21T09:58:00Z"
+
+
+def test_writer_raw_json_and_loader_round_trip_plan_incrementally():
+    start = at(10)
+    app.save_live_queue_cache([], days=60, refresh_started_at=start, refresh_finished_at=at(10, 1))
+    raw = _raw_cache()
+    assert "cache_metadata" not in raw
+    assert app.queue_refresh_plan(raw, 60, at(12))["refresh_mode"] == "incremental"
+    assert app.queue_refresh_plan(app.load_live_queue_cache(), 60, at(12))["refresh_mode"] == "incremental"
+
+
 @pytest.mark.parametrize("cursor, mode", [
     ("2026-08-21T09:59:59Z", "incremental"),
     ("2026-08-21T10:00:00Z", "incremental"),
@@ -97,6 +155,26 @@ def test_no_cursor_and_invalid_cursor_use_days_baseline():
     assert app.queue_refresh_plan({"tickets": [], "cache_metadata": {"schema_version": None}}, 45, at(12))["effective_updated_since"] == "2026-07-07T12:00:00Z"
     for bad in (None, "bad", "2026-08-21T10:00:00"):
         assert app.queue_refresh_plan(cache(bad, "2026-08-21T10:01:00Z"), 7, at(12))["refresh_mode"] == "baseline"
+
+
+@pytest.mark.parametrize("cursor", [None, "bad", "2026-08-21T10:00:00"])
+def test_raw_schema_v2_missing_or_invalid_top_level_cursor_uses_baseline(cursor):
+    plan = app.queue_refresh_plan(production_v2_cache(cursor=cursor), 60, at(21))
+    assert plan["refresh_mode"] == "baseline"
+    assert plan["effective_updated_since"] == "2026-06-22T21:00:00Z"
+
+
+@pytest.mark.parametrize("cursor", ["2026-08-21T21:00:01Z", "2026-08-21T21:01:00Z",
+                                     "2026-08-21T21:02:00Z", "2026-08-21T21:05:00Z"])
+def test_raw_schema_v2_future_top_level_cursor_uses_baseline(cursor):
+    assert app.queue_refresh_plan(production_v2_cache(cursor=cursor, finished=cursor), 60, at(21))["refresh_mode"] == "baseline"
+
+
+def test_raw_schema_v2_cursor_equal_to_attempt_start_remains_valid():
+    plan = app.queue_refresh_plan(production_v2_cache(cursor="2026-08-21T21:00:00Z",
+                                                       finished="2026-08-21T21:00:00Z"), 60, at(21))
+    assert plan["refresh_mode"] == "incremental"
+    assert plan["effective_updated_since"] == "2026-08-21T20:58:00Z"
 
 
 def test_future_cursor_production_fallback_passes_days_and_replaces_cursor_after_merge():
@@ -140,6 +218,24 @@ def test_attempt_start_precedes_retrieval_and_actual_cursor_horizon_is_passed():
     manager.wait()
     assert manager.status()["state"] == queue_live.SUCCEEDED
     assert events == [("plan", at(12)), ("retrieve", "2026-08-21T09:58:00Z")]
+
+
+def test_successful_reconcile_persists_attempt_cursor_for_next_normal_plan():
+    old_blob = production_v2_cache(cursor="2026-08-21T10:00:00Z", finished="2026-08-21T10:01:00Z")
+    manager = queue_live.RefreshJobManager()
+    assert manager.start(
+        days=30, api_key="fake", retrieve=lambda **kwargs: [ticket(1)],
+        save=app.save_live_queue_cache,
+        finalize=lambda records, **kwargs: app._reconcile_queue_refresh(old_blob, records, **kwargs),
+        plan=lambda requested_days, started, mode: app.queue_refresh_plan(
+            old_blob, requested_days, started, mode),
+        attempt_started_at=at(12), mode="reconcile",
+    )[0]
+    manager.wait()
+    assert manager.status()["state"] == queue_live.SUCCEEDED
+    next_plan = app.queue_refresh_plan(app.load_live_queue_cache(), 60, at(14))
+    assert next_plan["refresh_mode"] == "incremental"
+    assert next_plan["effective_updated_since"] == "2026-08-21T11:58:00Z"
 
 
 def test_multi_refresh_sequence_persists_only_successful_attempt_starts():

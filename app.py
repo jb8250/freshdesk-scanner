@@ -1020,9 +1020,21 @@ def queue_refresh_plan(cache_blob, days, attempt_started_at, mode=None):
         raise ValueError("Unknown queue refresh mode.")
     days = requested_days if mode == "reconcile" or legacy_plan else DAYS_DEFAULT
     attempt_started_at = attempt_started_at.astimezone(timezone.utc).replace(microsecond=0)
-    metadata = cache_blob.get("cache_metadata", {}) if isinstance(cache_blob, dict) else {}
-    raw_cursor = metadata.get("last_successful_refresh_started_at")
-    raw_finished = metadata.get("last_successful_refresh_finished_at")
+    # Schema-v2 cache metadata is durable at the top level.  The loader
+    # synthesizes cache_metadata only for legacy/compatibility callers, so it
+    # may fill an absent top-level field but must never override one.
+    envelope = cache_blob if isinstance(cache_blob, dict) else {}
+    compatibility_metadata = envelope.get("cache_metadata")
+    if not isinstance(compatibility_metadata, dict):
+        compatibility_metadata = {}
+
+    def planning_metadata(field):
+        return (envelope[field] if field in envelope
+                else compatibility_metadata.get(field))
+
+    schema_version = planning_metadata("schema_version")
+    raw_cursor = planning_metadata("last_successful_refresh_started_at")
+    raw_finished = planning_metadata("last_successful_refresh_finished_at")
     cursor = parse_dt(raw_cursor)
     finished = parse_dt(raw_finished)
     # A cursor later than this attempt is future metadata, including after a
@@ -1031,7 +1043,7 @@ def queue_refresh_plan(cache_blob, days, attempt_started_at, mode=None):
     # successful atomic cache commit.
     cursor_not_future = cursor is not None and cursor <= attempt_started_at
     valid_cursor = (
-        metadata.get("schema_version") == QUEUE_CACHE_SCHEMA_VERSION
+        schema_version == QUEUE_CACHE_SCHEMA_VERSION
         and _valid_queue_cache_timestamp(raw_cursor)
         and _valid_queue_cache_timestamp(raw_finished)
         and cursor is not None and finished is not None
