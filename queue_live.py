@@ -55,7 +55,7 @@ class RefreshJobManager:
                               "tickets_received": 0, "request_count": 0,
                               "rate_limit_remaining": None, "elapsed_seconds": 0,
                               "wait_seconds": 0},
-                "merge_metrics": None, "refresh_mode": None,
+                "merge_metrics": None, "retention_metrics": None, "refresh_mode": None,
                 "effective_updated_since": None, "cursor_source": None,
             })
             self._thread = threading.Thread(
@@ -130,8 +130,17 @@ class RefreshJobManager:
                 finalized = finalize(
                     tickets, progress_callback=self._progress,
                     cancel_callback=self._cancel.is_set,
+                    attempt_started_at=refresh_started_at,
                 )
-                if len(finalized) == 3:
+                if len(finalized) == 4:
+                    tickets, finalize_after_save, merge_metrics, retention_metrics = finalized
+                    with self._lock:
+                        self._state["merge_metrics"] = {
+                            "received_count": merge_metrics.incoming_count,
+                            **vars(merge_metrics),
+                        }
+                        self._state["retention_metrics"] = vars(retention_metrics)
+                elif len(finalized) == 3:
                     tickets, finalize_after_save, merge_metrics = finalized
                     with self._lock:
                         self._state["merge_metrics"] = {

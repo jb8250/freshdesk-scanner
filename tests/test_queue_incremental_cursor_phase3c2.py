@@ -114,8 +114,9 @@ def test_future_cursor_production_fallback_passes_days_and_replaces_cursor_after
     assert manager.status()["state"] == queue_live.SUCCEEDED
     assert events == ["2026-08-14T10:00:00Z"]
     assert saved["last_successful_refresh_started_at"] == "2026-08-21T10:00:00Z"
-    assert [row["id"] for row in saved["tickets"]] == [1, 2, 3]
-    assert saved["tickets"][0] == old[0]
+    # Future-cursor fallback preserves baseline retrieval semantics; Phase 3D2
+    # then prunes the expired non-active cached object from the merged cache.
+    assert [row["id"] for row in saved["tickets"]] == [2, 3]
 
 
 def test_attempt_start_precedes_retrieval_and_actual_cursor_horizon_is_passed():

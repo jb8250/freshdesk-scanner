@@ -81,6 +81,7 @@ import review_backups
 import closed_live
 import queue_live
 from queue_merge import merge_queue_tickets
+from queue_retention import apply_queue_retention
 
 app = Flask(__name__, static_folder=None)
 # Per-process random key: used only for the loopback CSRF token and flash
@@ -1247,8 +1248,12 @@ def _advance_review_snapshot(ticket_id, updated_at, backup=True):
 
 
 def _reconcile_queue_refresh(old_blob, incoming_tickets, progress_callback=None,
-                             cancel_callback=None):
-    """Merge a complete retrieval, then prepare review changes for actual cache changes."""
+                              cancel_callback=None, attempt_started_at=None):
+    """Merge, analyze effective changes, retain, then defer review snapshots.
+
+    Retention reads local review state only.  Its retained ticket list is the
+    sole cache-save input; review rows are neither created nor removed here.
+    """
     existing_tickets = old_blob["tickets"] if old_blob else []
     merged = merge_queue_tickets(existing_tickets, incoming_tickets)
     old_by_id = {ticket["id"]: ticket for ticket in existing_tickets}
@@ -1260,7 +1265,28 @@ def _reconcile_queue_refresh(old_blob, incoming_tickets, progress_callback=None,
         effective_changes, old_blob, progress_callback=progress_callback,
         cancel_callback=cancel_callback,
     )
-    return merged.tickets, finalize_after_save, merged.metrics
+    # Load once, read-only, after conversation preparation. The pure engine
+    # validates the complete merged cache and canonical state mapping before it
+    # can classify any object. Attempt start is supplied by the refresh job.
+    review_states = {
+        ticket_id: row.get("review_result")
+        for ticket_id, row in load_review_rows().items()
+    }
+    retention = apply_queue_retention(
+        merged.tickets, review_states,
+        reference_time=attempt_started_at if attempt_started_at is not None else now_utc(),
+    )
+    retained_ids = {ticket["id"] for ticket in retention.tickets}
+
+    def finalize_retained_after_save():
+        # A snapshot advance for an object omitted from the durable cache would
+        # falsely imply that its corresponding cached state was preserved.
+        # Keep it conservatively stale instead; its review row remains intact.
+        if finalize_after_save:
+            finalize_after_save(retained_ids)
+
+    return retention.tickets, finalize_retained_after_save, merged.metrics, retention.metrics
+
 
 
 def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=None,
@@ -1320,9 +1346,11 @@ def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=No
                            "conversation_checks_completed": len(candidates),
                            "private_note_updates_suppressed": len(updates),
                            "conversation_checks_inconclusive": inconclusive})
-    def apply_updates():
+    def apply_updates(retained_ids=None):
         changed = False
         for tid, timestamp in updates.items():
+            if retained_ids is not None and tid not in retained_ids:
+                continue
             try:
                 changed = _advance_review_snapshot(tid, timestamp, backup=False) or changed
             except Exception:
@@ -2451,9 +2479,10 @@ def queue_refresh_start():
         days=days, api_key=api_key,
         retrieve=fetch_live_queue,
         save=save_live_queue_cache,
-        finalize=lambda incoming_tickets, progress_callback=None, cancel_callback=None: _reconcile_queue_refresh(
+        finalize=lambda incoming_tickets, progress_callback=None, cancel_callback=None,
+                        attempt_started_at=None: _reconcile_queue_refresh(
             old_blob, incoming_tickets, progress_callback=progress_callback,
-            cancel_callback=cancel_callback,
+            cancel_callback=cancel_callback, attempt_started_at=attempt_started_at,
         ),
         plan=lambda requested_days, job_attempt_started_at: queue_refresh_plan(
             old_blob, requested_days, job_attempt_started_at),

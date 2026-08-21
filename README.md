@@ -6,7 +6,7 @@ Read-only Freshdesk triage page that surfaces tickets needing attention: custome
 
 This branch is a safe local-development milestone. It supports an explicit offline mode backed by synthetic fixtures. Offline mode never reads the API key and never makes HTTP requests.
 
-Phase 3D1 defines a pure in-memory 60-day retention policy for validated queue ticket objects. Tickets with active local review states are protected beyond the age window; the policy engine is not yet connected to Refresh Tickets, so cache pruning is not active.
+Successful **Refresh Tickets** applies a rolling 60-day retention policy after reconciliation and before its atomic cache commit. Retention measures ticket `updated_at` against the refresh attempt start time, keeping the exact 60-day cutoff inclusively. Tickets in `Opened / In Review`, `Needs Follow-Up`, or `Needs Supervisor Review` remain cached beyond the window; expired non-active ticket objects may be pruned. Closed tickets follow those same normal age and active-state rules—there is no immediate Closed pruning. Cache retention never deletes or modifies SQLite local review-state rows. If retention validation fails, the existing cache and successful-refresh cursor remain unchanged.
 
 ## Local review-state backup protection
 

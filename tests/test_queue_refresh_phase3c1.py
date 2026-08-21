@@ -86,11 +86,12 @@ def test_reconciliation_preserves_same_id_policy_and_untouched_very_old_ticket()
     manager, _ = run_refresh(existing, incoming)
     result = {row["id"]: row for row in cache_tickets()}
     assert manager.status()["state"] == queue_live.SUCCEEDED
-    assert set(result) == {1, 2, 3, 4, 5}
+    # Phase 3D2 retention prunes this expired, non-active cached object only
+    # after the complete merged set has been reconciled.
+    assert set(result) == {1, 2, 3, 5}
     assert result[1]["subject"] == "newer"
     assert result[2]["subject"] == "equal-incoming"
     assert result[3]["subject"] == "newest"
-    assert result[4]["updated_at"] == "2020-01-01T00:00:00Z"
 
 
 def test_legacy_cache_reconciles_to_v2_without_read_rewrite():
@@ -105,7 +106,7 @@ def test_legacy_cache_reconciles_to_v2_without_read_rewrite():
     assert manager.status()["state"] == queue_live.SUCCEEDED
     assert payload["schema_version"] == 2
     assert payload["last_refresh_mode"] == "baseline"
-    assert [row["id"] for row in payload["tickets"]] == [1, 2, 3]
+    assert [row["id"] for row in payload["tickets"]] == [1, 3]
 
 
 def test_no_cache_initializes_reconcile_envelope():
@@ -182,9 +183,10 @@ def test_only_effective_changes_reach_conversation_preparation(monkeypatch):
     observed = []
     monkeypatch.setattr(app, "_prepare_conversation_review_updates",
                         lambda records, *args, **kwargs: (observed.extend(records), lambda: None))
-    result, _, _ = app._reconcile_queue_refresh(old_blob, [ticket(1, NEW, subject="reviewed unchanged"),
-                                                             ticket(2, OLD, subject="reviewed stale"),
-                                                             ticket(3, NEW)])
+    result, _, _, _ = app._reconcile_queue_refresh(old_blob, [ticket(1, NEW, subject="reviewed unchanged"),
+                                                                 ticket(2, OLD, subject="reviewed stale"),
+                                                                 ticket(3, NEW)])
+
     assert [row["id"] for row in result] == [1, 2, 3]
     assert [row["id"] for row in observed] == [3]
 
