@@ -168,7 +168,9 @@ def test_live_page_exact_half_open_boundaries_and_queue_cache_untouched(monkeypa
         days=8, start=start, end=end, summary={"pages_completed": 1}, fetched_at=NOW)
     closed_live.write_cache_atomic(payload)
     monkeypatch.setattr(app, "now_utc", lambda: NOW)
-    page = app.app.test_client().get("/closed?days=8&missing_tags=0&review_view=all")
+    # The synthetic live-cache tickets have no photo/video subject; turn scope
+    # OFF to include them in the rendered results.
+    page = app.app.test_client().get("/closed?days=8&missing_tags=0&photo_video_only=0&review_view=all")
     text = page.get_data(as_text=True)
     assert page.status_code == 200 and 'data-ticket-id="1"' in text and 'data-ticket-id="2"' not in text
     assert queue_path.read_text() == "queue-good"

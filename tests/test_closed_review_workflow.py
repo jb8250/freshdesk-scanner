@@ -175,7 +175,8 @@ def test_review_result_renders_badge_and_selected(client, fixed_clock_fix):
     csrf = _csrf_from(client)
     _post_review(client, 810001, "Not Applicable to Me", csrf=csrf)
     set_closed_review_result(810001, "Not Applicable to Me")
-    html = _page(client, "?review_view=all&missing_tags=0")
+    # 810001 has no photo/video subject, so we must turn the scope OFF to see it.
+    html = _page(client, "?review_view=all&missing_tags=0&photo_video_only=0")
     assert 'class="badge b-review rv-na"' in html
     assert re.search(r'<option value="Not Applicable to Me" selected>', html)
 
@@ -236,12 +237,13 @@ def test_closed_page_url_preserves_review_view():
 
 
 def test_review_view_filters_rendered_rows(client, fixed_clock_fix):
-    csrf = _csrf_from(client, "?review_view=all&missing_tags=0")
+    csrf = _csrf_from(client, "?review_view=all&missing_tags=0&photo_video_only=0")
     _post_review(client, 810003, "Resolved", csrf=csrf)
-    html_active = _page(client, "?review_view=active&missing_tags=0")
+    # 810003 has no photo/video subject; turn scope OFF to include it.
+    html_active = _page(client, "?review_view=active&missing_tags=0&photo_video_only=0")
     # 810003 is now completed -> hidden from active view.
     assert re.search(r'data-ticket-id="810003"', html_active) is None
-    html_completed = _page(client, "?review_view=completed&missing_tags=0")
+    html_completed = _page(client, "?review_view=completed&missing_tags=0&photo_video_only=0")
     assert re.search(r'data-ticket-id="810003"', html_completed)
 
 
@@ -251,7 +253,8 @@ def test_review_view_filters_rendered_rows(client, fixed_clock_fix):
 
 def test_last_opened_marker_renders_jump(client, fixed_clock_fix):
     _post_opened(client, 810001)
-    html = _page(client, "?missing_tags=0")
+    # 810001 has no photo/video subject; turn scope OFF to include it.
+    html = _page(client, "?missing_tags=0&photo_video_only=0")
     assert "Jump to Last Opened" in html
     assert re.search(r'class="[^"]*\brv-last-opened\b[^"]*" data-ticket-id="810001"', html)
     assert 'id=last-opened-jump' in html
@@ -269,25 +272,28 @@ def test_last_opened_survives_reload(client, fixed_clock_fix):
     """Marker persists on a fresh request — state lives in the DB, not the
     page or session."""
     _post_opened(client, 810002)
-    html = _page(client, "?missing_tags=0")
+    # 810002 has no photo/video subject; turn scope OFF to include it.
+    html = _page(client, "?missing_tags=0&photo_video_only=0")
     assert re.search(r'class="[^"]*\brv-last-opened\b[^"]*" data-ticket-id="810002"', html)
-    html2 = _page(client, "?missing_tags=0")  # reload
+    html2 = _page(client, "?missing_tags=0&photo_video_only=0")  # reload
     assert re.search(r'class="[^"]*\brv-last-opened\b[^"]*" data-ticket-id="810002"', html2)
 
 
 def test_last_opened_moves_on_new_click(client, fixed_clock_fix):
     _post_opened(client, 810001)
     _post_opened(client, 810002)
-    html = _page(client, "?missing_tags=0")
+    # Both have no photo/video subject; turn scope OFF to include them.
+    html = _page(client, "?missing_tags=0&photo_video_only=0")
     assert re.search(r'class="[^"]*\brv-last-opened\b[^"]*" data-ticket-id="810002"', html)
     assert re.search(r'data-ticket-id="810001"', html)  # still listed
 
 
 def test_last_opened_hidden_banner_when_filtered_out(client, fixed_clock_fix):
-    # 810002 is tagged; the default Missing Tags Only view hides it, so the
-    # marker banner explains the hidden state instead of showing the row.
+    # 810002 is tagged and has no photo/video subject; the default
+    # Missing Tags Only view hides it, so the marker banner explains the hidden
+    # state instead of showing the row.
     _post_opened(client, 810002)
-    html = _page(client)  # default missing_tags=1 hides tagged 810002
+    html = _page(client)  # default missing_tags=1 + photo scope ON hides it
     assert "Last opened ticket is hidden by the current filters." in html
 
 

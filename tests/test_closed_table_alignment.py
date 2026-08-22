@@ -163,7 +163,8 @@ def test_closed_date_columns_use_compact_display(client):
     """closed_at renders in the Closed column as compact 'YYYY-MM-DD HH:MM'
     (queue date-column style), never raw ISO. Missing/malformed values show
     an em dash."""
-    html = _html(client, "/closed")
+    # 810001 has no photo/video subject; turn scope OFF to include it.
+    html = _html(client, "/closed?photo_video_only=0")
     tab = _table_body(html, "closed-table")
     # Untagged fixture 810001: closed 2026-08-04T09:00 -> "2026-08-04 09:00"
     m = re.search(r'<tr class="[^"]*" data-ticket-id="810001">(.*?)</tr>', tab, re.S)
@@ -214,17 +215,17 @@ def test_last_opened_badge_in_badges_column(client, fixed_clock):
     """LAST OPENED is a Badges-column badge (moved from the Prompt-13
     Subject metadata), so the queue badge pattern is shared. Uses the real
     /closed/api/opened endpoint (JSON, X-CSRF-Token) to set the local
-    last-opened state, then re-renders. 810002 has tags, so the page is
-    loaded with missing_tags=0 (the default view is Missing-Tags-Only)."""
+    last-opened state, then re-renders. 810002 has tags and no photo/video
+    subject, so the page is loaded with missing_tags=0 AND photo scope OFF."""
     import re
-    html = _html(client, "/closed?missing_tags=0")
+    html = _html(client, "/closed?missing_tags=0&photo_video_only=0")
     m = re.search(r'name=csrf_token value="([^"]+)"', html)
     assert m, "no csrf token rendered"
     token = m.group(1)
     resp = client.post("/closed/api/opened",
                        json={"csrf_token": token, "ticket_id": 810002})
     assert resp.status_code == 200
-    tab2 = _table_body(_html(client, "/closed?missing_tags=0"), "closed-table")
+    tab2 = _table_body(_html(client, "/closed?missing_tags=0&photo_video_only=0"), "closed-table")
     row = re.search(r'<tr class="[^"]*rv-last-opened[^"]*" data-ticket-id="810002">(.*?)</tr>', tab2, re.S)
     assert row, "last-opened row class missing"
     badges = re.search(r'<div class=badges>.*?</div>', row.group(1), re.S)
@@ -258,8 +259,9 @@ def test_tags_column_uses_queue_presentation(client):
 def test_tags_column_renders_actual_tag(client):
     """The synthetic tagged ticket (810002, tags: parts) shows its tag in
     the Tags column when the Missing-Tags-Only filter is off (the default
-    view excludes tagged tickets by design)."""
-    tab = _table_body(_html(client, "/closed?missing_tags=0"), "closed-table")
+    view excludes tagged tickets by design). 810002 has no photo/video
+    subject, so the Photo/Video scope must be turned OFF to include it."""
+    tab = _table_body(_html(client, "/closed?missing_tags=0&photo_video_only=0"), "closed-table")
     row = re.search(r'<tr class="[^"]*" data-ticket-id="810002">(.*?)</tr>', tab, re.S)
     assert row, "fixture 810002 missing"
     assert re.search(r"<td>parts</td>", row.group(1)), "tag not rendered in Tags column"

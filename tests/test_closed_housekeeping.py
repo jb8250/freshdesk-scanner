@@ -136,9 +136,11 @@ def test_closed_route_invalid_and_toggle(monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     client = app.app.test_client()
     assert 'value="60"' in client.get("/closed?days=-1").get_data(as_text=True)
-    off = client.get("/closed?days=60&missing_tags=0").get_data(as_text=True)
+    # 810002 "Synthetic closed tagged" has no photo/video subject; turn scope
+    # OFF to include it (default Photo/Video Review Scope is ON).
+    off = client.get("/closed?days=60&missing_tags=0&photo_video_only=0").get_data(as_text=True)
     assert "Synthetic closed tagged" in off
-    submitted_off = client.get("/closed?days=60&missing_tags=0").get_data(as_text=True)
+    submitted_off = client.get("/closed?days=60&missing_tags=0&photo_video_only=0").get_data(as_text=True)
     assert "All tag states" in submitted_off
 
 

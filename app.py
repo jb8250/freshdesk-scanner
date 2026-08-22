@@ -1886,9 +1886,16 @@ def closed_filters_from_args(args):
     # final value so checked 1 wins when Werkzeug exposes both values.
     values = args.getlist("missing_tags") if hasattr(args, "getlist") else []
     raw_missing = values[-1] if values else args.get("missing_tags", "1")
+    # Photo/Video Review Scope defaults ON for Closed Ticket Housekeeping,
+    # matching the main queue's default Review Scope. The closed page uses the
+    # same canonical photo_video_only parameter and the same subject-matching
+    # semantics (subject_matches_photo_video); no second keyword list.
+    pv_values = args.getlist("photo_video_only") if hasattr(args, "getlist") else []
+    raw_pv = pv_values[-1] if pv_values else args.get("photo_video_only", "1")
     return {
         "days": parse_closed_days(args.get("days", CLOSED_DEFAULT_DAYS)),
         "missing_tags": parse_bool(raw_missing),
+        "photo_video_only": parse_bool(raw_pv, default=True),
         "review_view": parse_review_view(args.get("review_view"), default="active"),
     }
 
@@ -1905,14 +1912,19 @@ def closed_query_string(start: date, end: date, missing_tags_only: bool) -> str:
 
 
 def closed_page_url(config) -> str:
-    """Canonical /closed URL preserving days + missing_tags + review_view.
+    """Canonical /closed URL preserving days + missing_tags + review_view +
+    photo_video_only.
 
     The review_view is a local dashboard filter only (it never appears in the
     Freshdesk search query); keeping it here makes every /closed URL
-    bookmarkable and filter-preserving, exactly like /queue.
+    bookmarkable and filter-preserving, exactly like /queue. The
+    Photo/Video Review Scope is local-only as well and survives navigation.
     """
     missing = "1" if config.get("missing_tags") else "0"
-    return f"/closed?days={config.get('days', CLOSED_DEFAULT_DAYS)}&missing_tags={missing}&review_view={config.get('review_view', 'active')}"
+    pv = "1" if config.get("photo_video_only", True) else "0"
+    return (f"/closed?days={config.get('days', CLOSED_DEFAULT_DAYS)}"
+            f"&missing_tags={missing}&photo_video_only={pv}"
+            f"&review_view={config.get('review_view', 'active')}")
 
 
 def closed_search_url_params(start: date, end: date, missing_tags_only: bool, page: int):
@@ -1959,6 +1971,18 @@ def _synthetic_closed_tickets():
         {"id": 810005, "subject": "Synthetic resolved excluded", "status": 4, "closed_at": "2026-08-01T10:00:00Z", "tags": []},
         {"id": 810006, "subject": "Synthetic missing date", "status": 5, "tags": []},
         {"id": 810007, "subject": "Synthetic malformed date", "status": 5, "closed_at": "not-a-date", "updated_at": "2026-08-03T12:00:00Z", "created_at": "2026-07-18T09:00:00Z", "tags": []},
+        # Phase 4A: photo/video-subject closed tickets so the default Photo/Video
+        # Review Scope has content on /closed. Subjects cover the canonical
+        # keyword family (case-insensitive, word-boundary aware) and a couple of
+        # non-photo/video subjects to prove the filter excludes them.
+        {"id": 810010, "subject": "Customer sent photo of damage", "status": 5, "closed_at": "2026-08-04T08:00:00Z", "updated_at": "2026-08-04T09:00:00Z", "created_at": "2026-07-25T09:00:00Z", "tags": []},
+        {"id": 810011, "subject": "Re: Photos of broken hinge", "status": 5, "closed_at": "2026-08-04T07:00:00Z", "updated_at": "2026-08-04T08:00:00Z", "created_at": "2026-07-25T09:00:00Z", "tags": ["parts"]},
+        {"id": 810012, "subject": "Picture of scratched surface", "status": 5, "closed_at": "2026-08-03T08:00:00Z", "updated_at": "2026-08-03T09:00:00Z", "created_at": "2026-07-20T09:00:00Z", "tags": []},
+        {"id": 810013, "subject": "Video of wobbling table leg", "status": 5, "closed_at": "2026-08-03T07:00:00Z", "updated_at": "2026-08-03T08:00:00Z", "created_at": "2026-07-20T09:00:00Z", "tags": []},
+        {"id": 810014, "subject": "VID of damaged drawer", "status": 5, "closed_at": "2026-08-02T08:00:00Z", "updated_at": "2026-08-02T09:00:00Z", "created_at": "2026-07-15T09:00:00Z", "tags": []},
+        {"id": 810015, "subject": "Pics attached for review", "status": 5, "closed_at": "2026-08-02T07:00:00Z", "updated_at": "2026-08-02T08:00:00Z", "created_at": "2026-07-15T09:00:00Z", "tags": []},
+        {"id": 810016, "subject": "No photo here, just a question", "status": 5, "closed_at": "2026-08-01T08:00:00Z", "updated_at": "2026-08-01T09:00:00Z", "created_at": "2026-07-10T09:00:00Z", "tags": []},
+        {"id": 810017, "subject": "Delivery schedule inquiry", "status": 5, "closed_at": "2026-08-01T07:00:00Z", "updated_at": "2026-08-01T08:00:00Z", "created_at": "2026-07-10T09:00:00Z", "tags": []},
         {"id": 810008, "subject": "Synthetic outside range", "status": 5, "closed_at": "2025-01-01T10:00:00Z", "updated_at": "2025-01-01T11:00:00Z", "created_at": "2024-12-01T09:00:00Z", "tags": []},
     ]
     # 301 tickets across two dates proves planner splitting without a 300-row file.
@@ -2190,6 +2214,14 @@ def closed_housekeeping():
     # Closed-housekeeping local review state (Prompt 12) — separate namespace
     # from /queue (closed_review_state table), applied after retrieval so the
     # retrieval metadata (windows/pages/dupes/sorting) stays intact.
+    #
+    # Photo/Video Review Scope (Phase 4A): an additional local-only layer
+    # applied alongside the existing review_view filter. Uses the SAME
+    # subject_matches_photo_video matcher as the main queue — subject field
+    # only, word-boundary aware, case-insensitive. Defaults ON (see
+    # closed_filters_from_args). OFF shows the full closed population that
+    # satisfies the remaining filters. Never triggers retrieval, never writes
+    # cache, never changes review state.
     closed_rows = load_closed_review_rows()
     closed_last_opened = closed_last_opened_ticket_id()
     reviewed = []
@@ -2198,6 +2230,8 @@ def closed_housekeeping():
         state_row = closed_rows.get(tid)
         result_state = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
         if not closed_review_view_includes(state_row, config["review_view"]):
+            continue
+        if config.get("photo_video_only") and not subject_matches_photo_video(t):
             continue
         row_class = REVIEW_CLASS.get(result_state, "rv-unreviewed")
         is_last_opened = closed_last_opened is not None and tid == closed_last_opened
@@ -3246,10 +3280,15 @@ CLOSED_HTML = """\
       <span class=lbl>days</span>
     </span>
     <div class=preset-group role=group aria-label="Closed date presets">
-      {% for d in [30, 60, 90, 180, 365] %}<a class=preset href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}&amp;review_view={{ config.review_view }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}d</a>{% endfor %}
+      {% for d in [30, 60, 90, 180, 365] %}<a class=preset href="/closed?days={{d}}&amp;missing_tags={{ 1 if config.missing_tags else 0 }}&amp;photo_video_only={{ 1 if config.photo_video_only else 0 }}&amp;review_view={{ config.review_view }}" {% if config.days == d %}aria-current=page{% endif %}>{{d}}d</a>{% endfor %}
     </div>
   </div>
   <div class="panel-region region-groups">
+    <fieldset class="filter-group scope-group">
+      <legend class=group-lbl>Review Scope</legend>
+      <div class=field><input type=hidden name=photo_video_only value=0><label for=closed-filter-photo-video><input type=checkbox id=closed-filter-photo-video name=photo_video_only value=1 {{ 'checked' if config.photo_video_only }}> Photo/Video Review Scope: ON</label></div>
+      <p class=field-hint>Show only closed tickets whose subject indicates photos or video. Local display filter only — does not change Freshdesk or review state.</p>
+    </fieldset>
     <fieldset class=filter-group>
       <legend class=group-lbl>Tags</legend>
       <div class=field><label for=closed-missing><input type=hidden name=missing_tags value=0><input type=checkbox id=closed-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags Only</label></div>
@@ -3266,7 +3305,7 @@ CLOSED_HTML = """\
   <div class="panel-region region-actions">
     <div class=action-buttons>
       <button type=submit class=apply>Apply Filters</button>
-      <a class=reset href="/closed?days=60&amp;missing_tags=1&amp;review_view=active" role=button aria-label="Reset to defaults">Reset to Defaults</a>
+      <a class=reset href="/closed?days=60&amp;missing_tags=1&amp;photo_video_only=1&amp;review_view=active" role=button aria-label="Reset to defaults">Reset to Defaults</a>
     </div>
   </div>
 </form>
@@ -3279,7 +3318,7 @@ CLOSED_HTML = """\
   <th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Status</th>
   <th scope=col>Badges</th><th scope=col>Review</th><th scope=col>Closed</th>
   <th scope=col>Updated</th><th scope=col>Created</th><th scope=col>Tags</th>
-</tr>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td><td>{{ t.status_label }}</td><td><div class=badges>{% if t.last_opened %}<span class="badge b-last-opened">LAST OPENED</span>{% endif %}{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td><td><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td><td class=meta>{{ t.closed_display }}</td><td class=meta>{{ t.updated_display }}</td><td class=meta>{{ t.created_display }}</td><td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<em style=color:#bbb>none</em>{% endif %}</td></tr>{% endfor %}</table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
+</tr>{% for t in result.tickets %}<tr class="{{ t.row_class }}" data-ticket-id="{{ t.id }}"><td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td><td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td><td>{{ t.status_label }}</td><td><div class=badges>{% if t.last_opened %}<span class="badge b-last-opened">LAST OPENED</span>{% endif %}{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td><td><form class=rvform method=post action=/closed/api/review><input type=hidden name=csrf_token value="{{ csrf_token }}"><input type=hidden name=ticket_id value="{{ t.id }}"><input type=hidden name=days value="{{ config.days }}"><input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}"><input type=hidden name=photo_video_only value="{{ '1' if config.photo_video_only else '0' }}"><input type=hidden name=review_view value="{{ config.review_view }}"><select name=review_result aria-label="Review result for closed ticket {{ t.id }}" onchange="this.form.submit()">{% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}</select></form></td><td class=meta>{{ t.closed_display }}</td><td class=meta>{{ t.updated_display }}</td><td class=meta>{{ t.created_display }}</td><td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<em style=color:#bbb>none</em>{% endif %}</td></tr>{% endfor %}</table></div>{% else %}<p class=closed-empty>No matching closed tickets were found in this view.</p>{% endif %}
 <script>
 var CSRF_TOKEN = {{ csrf_token_json | safe }};
 var REVIEW_CLASS = {
