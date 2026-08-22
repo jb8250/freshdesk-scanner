@@ -161,12 +161,14 @@ INCREMENTAL_CURSOR_OVERLAP_SECONDS = 120
 UPDATED_SINCE_DAYS = 60  # ~2 months
 
 # Scanner keyword set — matches Chrome extension logic (word-boundary regex).
-# Used by the default Review Scope to show photo/video subjects only.
+# Used by the default Review Scope to qualify photo/video ticket subjects or tags.
 KEYWORDS = [
     "photo", "photos", "picture", "pictures",
     "pic", "pics", "video", "videos", "vid", "vids",
 ]
-KEYWORD_RE = re.compile(r"\b(" + "|".join(KEYWORDS) + r")\b", re.IGNORECASE)
+# Underscore is treated as a separator alongside punctuation/whitespace so tags
+# such as ``Video_photo request`` qualify without allowing loose substrings.
+KEYWORD_RE = re.compile(r"(?<![^\W_])(" + "|".join(KEYWORDS) + r")(?![^\W_])", re.IGNORECASE)
 
 # Reviewed/closed Freshdesk tags (human-applied). Any ONE of these removes a
 # ticket from the DEFAULT review queue. Comparison is case-insensitive and
@@ -214,10 +216,10 @@ def keyword_filter_hits(text):
 # ---------------------------------------------------------------------------
 # Default Review Scope (Phase 1): two visible, independent scope layers.
 #
-# Layer 1 — photo/video subjects only: the ticket SUBJECT must contain one of
-# the recognized photo/video keywords (case-insensitive, word-boundary aware).
-# Only the subject field is inspected; description/body/notes/conversations/
-# attachments/requester data are never consulted for this rule.
+# Layer 1 — photo/video scope: the ticket SUBJECT or any valid Freshdesk TAG
+# must contain one of the recognized photo/video keywords (case-insensitive,
+# word-boundary aware). Description/body/notes/conversations/attachments/
+# requester data are never consulted for this rule.
 #
 # Layer 2 — reviewed/closed tag exclusions: a ticket carrying ANY one of the
 # six REVIEWED_EXCLUSION_TAGS is hidden from the default review queue.
@@ -228,14 +230,32 @@ def keyword_filter_hits(text):
 # ---------------------------------------------------------------------------
 
 
+def text_matches_photo_video(text):
+    """True when text contains a recognized photo/video keyword.
+
+    Missing, None, and non-string text fail safely. The shared regex remains
+    case-insensitive and word-boundary aware.
+    """
+    return isinstance(text, str) and bool(KEYWORD_RE.search(text))
+
+
 def subject_matches_photo_video(ticket):
-    """True when the ticket's SUBJECT contains a recognized photo/video
-    keyword. Subject field only. Missing/None/non-string subject fails safely
-    (no match)."""
-    subject = ticket.get("subject")
-    if not isinstance(subject, str):
+    """Backward-compatible subject-only photo/video matcher."""
+    return isinstance(ticket, dict) and text_matches_photo_video(ticket.get("subject"))
+
+
+def ticket_matches_photo_video(ticket):
+    """True when a ticket's subject or any valid Freshdesk tag matches.
+
+    Tags must be a list; missing, malformed, and non-string tag values are
+    ignored safely without mutating the source ticket.
+    """
+    if not isinstance(ticket, dict):
         return False
-    return bool(KEYWORD_RE.search(subject))
+    if text_matches_photo_video(ticket.get("subject")):
+        return True
+    tags = ticket.get("tags")
+    return isinstance(tags, list) and any(text_matches_photo_video(tag) for tag in tags)
 
 
 def normalized_ticket_tags(ticket):
@@ -273,7 +293,7 @@ def passes_review_scope(ticket, config):
     """
     photo_video_only = config.get("photo_video_only", True)
     hide_reviewed_tags = config.get("hide_reviewed_tags", True)
-    if photo_video_only and not subject_matches_photo_video(ticket):
+    if photo_video_only and not ticket_matches_photo_video(ticket):
         return False
     if hide_reviewed_tags and has_reviewed_exclusion_tag(ticket):
         return False
@@ -1888,8 +1908,8 @@ def closed_filters_from_args(args):
     raw_missing = values[-1] if values else args.get("missing_tags", "1")
     # Photo/Video Review Scope defaults ON for Closed Ticket Housekeeping,
     # matching the main queue's default Review Scope. The closed page uses the
-    # same canonical photo_video_only parameter and the same subject-matching
-    # semantics (subject_matches_photo_video); no second keyword list.
+     # same canonical photo_video_only parameter and ticket-level matching
+     # semantics (ticket_matches_photo_video); no second keyword list.
     pv_values = args.getlist("photo_video_only") if hasattr(args, "getlist") else []
     raw_pv = pv_values[-1] if pv_values else args.get("photo_video_only", "1")
     return {
@@ -2215,13 +2235,12 @@ def closed_housekeeping():
     # from /queue (closed_review_state table), applied after retrieval so the
     # retrieval metadata (windows/pages/dupes/sorting) stays intact.
     #
-    # Photo/Video Review Scope (Phase 4A): an additional local-only layer
-    # applied alongside the existing review_view filter. Uses the SAME
-    # subject_matches_photo_video matcher as the main queue — subject field
-    # only, word-boundary aware, case-insensitive. Defaults ON (see
-    # closed_filters_from_args). OFF shows the full closed population that
-    # satisfies the remaining filters. Never triggers retrieval, never writes
-    # cache, never changes review state.
+    # Photo/Video Review Scope: an additional local-only layer applied alongside
+    # the existing review_view filter. Uses the SAME ticket_matches_photo_video
+    # matcher as the main queue — subject or valid tag, word-boundary aware,
+    # case-insensitive. Defaults ON (see closed_filters_from_args). OFF shows
+    # the full closed population that satisfies the remaining filters. Never
+    # triggers retrieval, never writes cache, never changes review state.
     closed_rows = load_closed_review_rows()
     closed_last_opened = closed_last_opened_ticket_id()
     reviewed = []
@@ -2231,7 +2250,7 @@ def closed_housekeeping():
         result_state = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
         if not closed_review_view_includes(state_row, config["review_view"]):
             continue
-        if config.get("photo_video_only") and not subject_matches_photo_video(t):
+        if config.get("photo_video_only") and not ticket_matches_photo_video(t):
             continue
         row_class = REVIEW_CLASS.get(result_state, "rv-unreviewed")
         is_last_opened = closed_last_opened is not None and tid == closed_last_opened
