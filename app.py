@@ -2412,11 +2412,16 @@ def queue():
     last_opened_id = last_opened_ticket_id()  # focus state, independent of filters
 
     # Per-ticket workflow decision + row data. Closed tickets are omitted from
-    # normal workflow tabs, while explicit Show All remains diagnostic. The
-    # legacy review_view URL is still understood internally (it controls its own
-    # classic mapping) but the visible Review View control is superseded by the
-    # workflow tabs, so the normal render routes entirely by workflow_tab.
-    legacy_view_routing = "review_view" in request.args and "workflow_tab" not in request.args
+    # normal workflow tabs, while explicit Show All remains diagnostic.
+    #
+    # WORKFLOW ROUTING IS AUTHORITATIVE. The legacy review_view URL parameter
+    # is still parsed and preserved for backward compatibility (it is emitted
+    # by the filter form, preset links, and the refresh-completion redirect),
+    # but it must NEVER override the active workflow-tab routing. Without
+    # this guarantee, a post-refresh URL like "/queue?review_view=all" (no
+    # workflow_tab) would display every reviewed ticket in the Main Queue
+    # table while the Main Queue tab count correctly read 0 — the exact
+    # production bug this guard prevents.
     rows = []
     workflow_counts = {tab: 0 for tab in WORKFLOW_TABS}
     ordered_tickets = sorted(tickets, key=lambda x: (not updated_since_review(x, state_rows.get(x.get("id"))), x.get("id") is None, x.get("id") or 0))
@@ -2426,10 +2431,7 @@ def queue():
         updated_flag = updated_since_review(t, state_row)
         destination = workflow_destination(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", updated_flag)
         workflow_counts[destination] += 1
-        if legacy_view_routing:
-            if not review_view_includes(state_row, updated_flag, config["review_view"]):
-                continue
-        elif not show_all_cached and destination != config["workflow_tab"]:
+        if not show_all_cached and destination != config["workflow_tab"]:
             continue
         sid = t.get("status")
         pid = t.get("priority", 0)
@@ -3152,10 +3154,13 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
       pollTimer = window.setTimeout(poll, 1000);
     } else if (s.state === 'succeeded') {
       // A data refresh must never silently carry local filters forward. Show
-      // the newly completed cache in the neutral local view while preserving
-      // only the retrieval Days selection.
+      // the newly completed cache in the default Main Queue while preserving
+      // only the retrieval Days selection. The explicit workflow_tab=main is
+      // required: workflow routing is authoritative, so without it the legacy
+      // review_view=all fallback would override the Main Queue routing and
+      // display reviewed tickets that belong on other workflow tabs.
       var doneDays = (s.days != null ? s.days : (form.querySelector('input[name=days]') || {}).value) || 60;
-      window.location.assign('/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=' + encodeURIComponent(doneDays) + '&review_view=all');
+      window.location.assign('/queue?overdue=0&responded=0&waiting=0&missing_tags=0&days=' + encodeURIComponent(doneDays) + '&review_view=all&workflow_tab=main');
     } else if (s.state === 'failed' || s.state === 'cancelled') {
       // Leave the page as-is; the prior cache is untouched.
     }

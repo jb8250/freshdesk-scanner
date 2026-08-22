@@ -2165,7 +2165,9 @@ def test_needs_followup_and_last_opened_displayed_together(client):
 def test_resolved_and_last_opened_displayed_together(client):
     set_review_result(500003, "Resolved")
     _open(client, 500003)
-    html = client.get("/queue?review_view=all").get_data(as_text=True)
+    # workflow routing is authoritative; a Resolved ticket renders on the
+    # Resolved tab, not the legacy review_view=all fallback.
+    html = client.get("/queue?workflow_tab=resolved").get_data(as_text=True)
     row = _row_for(html, 500003)
     assert "rv-resolved" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
@@ -2176,7 +2178,8 @@ def test_resolved_and_last_opened_displayed_together(client):
 def test_no_action_needed_and_last_opened_displayed_together(client):
     set_review_result(500003, "No Action Needed")
     _open(client, 500003)
-    html = client.get("/queue?review_view=all").get_data(as_text=True)
+    # No Action Needed -> no_action tab (workflow routing is authoritative).
+    html = client.get("/queue?workflow_tab=no_action").get_data(as_text=True)
     row = _row_for(html, 500003)
     assert "rv-none" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
@@ -2205,7 +2208,8 @@ def test_changing_review_result_preserves_marker(client):
     _open(client, 500001)                       # Opened / In Review + marker
     set_review_result(500001, "Resolved")      # deliberate result change
     assert last_opened_ticket_id() == 500001   # marker keeps its focus state
-    html = client.get("/queue?review_view=completed").get_data(as_text=True)
+    # Resolved -> resolved tab (workflow routing is authoritative).
+    html = client.get("/queue?workflow_tab=resolved").get_data(as_text=True)
     row = _row_for(html, 500001)
     assert "rv-last-opened" in row.split('>', 1)[0]
 
@@ -2275,8 +2279,10 @@ def test_marker_visible_in_default_view_shows_jump(client):
 
 
 def test_marker_hidden_by_completed_view_shows_message(client):
-    _open(client, 500001)                      # Opened / In Review -> active only
-    html = client.get("/queue?review_view=completed").get_data(as_text=True)
+    # An Opened/In Review ticket is hidden on the Resolved tab; the page
+    # must render the "last opened is hidden" notice instead of the row.
+    _open(client, 500001)                      # Opened / In Review -> main tab
+    html = client.get("/queue?workflow_tab=resolved").get_data(as_text=True)
     assert _opened_rows(html) == []            # no falsely marked row
     assert "id=last-opened-jump" not in html   # no jump control
     assert "id=last-opened-hidden" in html     # server-rendered notice element
@@ -2285,24 +2291,28 @@ def test_marker_hidden_by_completed_view_shows_message(client):
 def test_resolved_marker_hidden_from_active_view(client):
     set_review_result(500001, "Resolved")
     _open(client, 500001)
-    html_active = client.get("/queue?review_view=active").get_data(as_text=True)
+    # Resolved ticket is hidden on the main (Unreviewed) tab.
+    html_active = client.get("/queue?workflow_tab=main").get_data(as_text=True)
     assert "id=last-opened-hidden" in html_active
-    html_completed = client.get("/queue?review_view=completed").get_data(as_text=True)
+    # It appears on the resolved tab with the focus marker intact.
+    html_completed = client.get("/queue?workflow_tab=resolved").get_data(as_text=True)
     assert "rv-last-opened" in _row_for(html_completed, 500001).split('>', 1)[0]
     assert "id=last-opened-jump" in html_completed
 
 
 def test_marker_visible_in_all_view(client):
     _open(client, 500001)
-    html = client.get("/queue?review_view=all").get_data(as_text=True)
+    # An Opened/In Review ticket lives on the main tab and is visible there.
+    html = client.get("/queue?workflow_tab=main").get_data(as_text=True)
     assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
     assert "id=last-opened-hidden" not in html
 
 
 def test_hidden_by_filters_does_not_move_marker(client):
     _open(client, 500001)
-    client.get("/queue?review_view=completed")  # hidden here...
-    assert last_opened_ticket_id() == 500001    # ...but focus state unchanged
+    # Opening a non-main tab where 500001 is hidden does not move the marker.
+    client.get("/queue?workflow_tab=resolved")
+    assert last_opened_ticket_id() == 500001
     html = client.get("/queue").get_data(as_text=True)
     assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
 
