@@ -2614,6 +2614,16 @@ def test_pageshow_resyncs_controls_from_url(client):
     assert "pageshow" in html
     assert "syncControlsFromURL" in html
     assert "location.search" in html
+    assert "if (el && q.has(n)) { el.checked = (q.get(n) === '1'); }" in html
+    assert "if (el) { el.checked = (q.get(n) === '1'); }" not in html
+
+
+def test_normal_return_fallback_is_canonical(client):
+    html = client.get("/queue").get_data(as_text=True)
+    assert "missing_tags: '0'" in html
+    assert "review_view: 'all'" in html
+    assert "workflow_tab: 'main'" in html
+    assert "q.has('normal_' + name) ? q.get('normal_' + name) : canonical[name]" in html
 
 
 def test_apply_filters_button_inside_filter_form(client):

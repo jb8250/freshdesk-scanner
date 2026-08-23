@@ -3231,7 +3231,15 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     return input ? input.value : fallback;
   }
   function normalReturnValue(q, name) {
-    return q.get('normal_' + name) || (name === 'photo_video_only' || name === 'hide_reviewed_tags' ? '1' : name === 'days' ? '60' : name === 'workflow_tab' ? 'main' : 'all');
+    var canonical = {
+      photo_video_only: '1',
+      hide_reviewed_tags: '1',
+      missing_tags: '0',
+      days: '60',
+      review_view: 'all',
+      workflow_tab: 'main'
+    };
+    return q.has('normal_' + name) ? q.get('normal_' + name) : canonical[name];
   }
   form.addEventListener('submit', function (e) {
     var targetMode = modeEl ? modeEl.value : renderedMode;
@@ -3254,7 +3262,9 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     var q = new URLSearchParams(window.location.search);
     ['photo_video_only', 'hide_reviewed_tags', 'overdue', 'responded', 'waiting', 'missing_tags'].forEach(function (n) {
       var el = form.querySelector('input[type=checkbox][name="' + n + '"]');
-      if (el) { el.checked = (q.get(n) === '1'); }
+      // An absent URL key means the server-rendered default is authoritative.
+      // Only explicit 0/1 values should override the control state.
+      if (el && q.has(n)) { el.checked = (q.get(n) === '1'); }
     });
     var daysEl = form.querySelector('input[name=days]');
     if (daysEl) { daysEl.value = String(normDays(q.get('days'))); }
