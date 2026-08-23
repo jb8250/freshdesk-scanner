@@ -64,6 +64,7 @@ from app import (
     passes_filters,
     passes_review_scope,
     resolve_bind_host,
+    format_eastern_timestamp,
     review_view_includes,
     set_review_result,
     sla_unavailable,
@@ -1532,6 +1533,39 @@ def test_updated_since_review_malformed_fails_safe():
     assert updated_since_review(t, _state("2026-08-03T12:00:00Z")) is False
     t2 = _ticket(updated_at="2026-08-04T12:00:00Z")
     assert updated_since_review(t2, _state("garbage")) is False
+
+
+# ---------------------------------------------------------------------------
+# Eastern Updated-time display (presentation-only)
+# ---------------------------------------------------------------------------
+
+
+def test_format_eastern_timestamp_summer_edt():
+    """Summer UTC input renders as EDT with the desired M/D/YY h:mm AM/PM TZ format."""
+    assert format_eastern_timestamp("2026-08-23T18:05:00Z") == "8/23/26 2:05 PM EDT"
+
+
+def test_format_eastern_timestamp_summer_offset_form():
+    """Explicit +00:00 offset form yields the same Eastern result as the Z form."""
+    assert format_eastern_timestamp("2026-08-23T18:05:00+00:00") == "8/23/26 2:05 PM EDT"
+
+
+def test_format_eastern_timestamp_winter_est():
+    """Winter UTC input renders as EST (DST tracks automatically)."""
+    assert format_eastern_timestamp("2026-01-15T18:05:00Z") == "1/15/26 1:05 PM EST"
+
+
+@pytest.mark.parametrize("value", [None, "", "garbage", "2026-08-23T18:05:00", 123])
+def test_format_eastern_timestamp_invalid_returns_em_dash(value):
+    """Missing, empty, malformed, timezone-less, or non-string values render safely."""
+    assert format_eastern_timestamp(value) == "—"
+
+
+def test_format_eastern_timestamp_does_not_mutate_input():
+    """Presentation-only: the raw value passed in must be returned untouched."""
+    raw = "2026-08-23T18:05:00Z"
+    format_eastern_timestamp(raw)
+    assert raw == "2026-08-23T18:05:00Z"
 
 
 def test_review_view_includes():

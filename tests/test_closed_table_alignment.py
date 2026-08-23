@@ -161,16 +161,17 @@ def test_status_label_is_closed_and_raw_5_never_rendered(client):
 
 def test_closed_date_columns_use_compact_display(client):
     """closed_at renders in the Closed column as compact 'YYYY-MM-DD HH:MM'
-    (queue date-column style), never raw ISO. Missing/malformed values show
-    an em dash."""
+    (queue date-column style), never raw ISO; Updated renders in Eastern local
+    time. Missing/malformed values show an em dash."""
     # 810001 has no photo/video subject; turn scope OFF to include it.
     html = _html(client, "/closed?photo_video_only=0")
     tab = _table_body(html, "closed-table")
-    # Untagged fixture 810001: closed 2026-08-04T09:00 -> "2026-08-04 09:00"
+    # Untagged fixture 810001: closed 2026-08-04T09:00 -> "2026-08-04 09:00";
+    # updated 2026-08-04T10:00Z -> Eastern "8/4/26 6:00 AM EDT" (summer).
     m = re.search(r'<tr class="[^"]*" data-ticket-id="810001">(.*?)</tr>', tab, re.S)
     assert m, "fixture 810001 missing"
     metas = re.findall(r'<td class=meta>([^<]*)</td>', m.group(1))
-    assert metas[:3] == ["2026-08-04 09:00", "2026-08-04 10:00", "2026-07-20"], metas
+    assert metas[:3] == ["2026-08-04 09:00", "8/4/26 6:00 AM EDT", "2026-07-20"], metas
     assert "not-a-date" not in html, "raw malformed date leaked"
 
 
@@ -184,7 +185,7 @@ def test_missing_and_malformed_dates_never_render_junk(client):
     assert "not-a-date" not in tab
     assert "810007" not in tab and "810006" not in tab
     # A well-formed fixture date renders compact, proving the column works.
-    assert '<td class=meta>2026-08-04 09:00</td>' in tab
+    assert '<td class=meta>2026-08-04 08:00</td>' in tab
 
 
 def test_subject_cell_contains_subject_only(client):

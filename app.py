@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from math import ceil
 from typing import Callable, Optional
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
 import requests
@@ -2170,6 +2171,24 @@ def closed_display(value: str) -> str:
     return s[:16]
 
 
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def format_eastern_timestamp(value) -> str:
+    """ISO-8601 UTC timestamp -> Eastern local time as 'M/D/YY h:mm AM/PM TZ'.
+
+    Presentation-only: the raw ``value`` is never mutated. Uses
+    ``America/New_York`` so the abbreviation (EDT/EST) tracks DST
+    automatically. Missing, empty, malformed, or timezone-less values render as
+    an em dash and never crash."""
+    parsed = parse_dt(value)
+    if parsed is None:
+        return "—"
+    local = parsed.astimezone(_EASTERN)
+    # M/D/YY h:mm AM/PM with no leading zeros on month/day/hour.
+    return f"{local.month}/{local.day}/{local.year % 100:02d} {local.strftime('%I:%M %p %Z').lstrip('0')}"
+
+
 CLOSED_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
@@ -2318,7 +2337,7 @@ def closed_housekeeping():
             "status_label": STATUS_LABELS.get(t.get("status"), f"Status {t.get('status')}"),
             "closed_at": t.get("closed_at", ""),
             "closed_display": closed_display(t.get("closed_at", "")),
-            "updated_display": (t.get("updated_at") or "")[:16].replace("T", " ") or "—",
+            "updated_display": format_eastern_timestamp(t.get("updated_at")),
             "created_display": (t.get("created_at") or "")[:10] or "—",
             "tags": t.get("tags") or [],
             "result": result_state,
@@ -2567,7 +2586,7 @@ def queue():
             "status_label": STATUS_LABELS.get(sid, f"Status {sid}"),
             "priority_label": PRIORITY_LABELS.get(pid, f"P{pid}"),
             "due_display": fmt_due(due),
-            "updated_display": (updated_at or "")[:16].replace("T", " ") or "—",
+            "updated_display": format_eastern_timestamp(updated_at),
             "created_display": (t.get("created_at") or "")[:10] or "—",
             "tags": (t.get("tags") or []) if isinstance(t.get("tags"), list) else [],
             "type": t.get("type"),
