@@ -46,12 +46,14 @@ def test_queue_tabs_are_local_only(client, monkeypatch):
         assert calls == []
 
 
-def test_queue_normal_tabs_exclude_closed_and_show_all_can_include(client):
-    normal = client.get("/queue?photo_video_only=1&hide_reviewed_tags=1&workflow_tab=main").get_data(as_text=True)
+def test_normal_mode_excludes_closed_and_closed_mode_includes_them(client):
+    # Normal default (photo/video scope ON) excludes Closed tickets.
+    normal = client.get("/queue?workflow_tab=main").get_data(as_text=True)
     assert 'data-ticket-id="500005"' not in normal
     assert CLOSED_STATUS == 5
-    explicit = client.get("/queue?photo_video_only=0&hide_reviewed_tags=0&overdue=0&responded=0&waiting=0&missing_tags=0&workflow_tab=main").get_data(as_text=True)
-    assert 'data-ticket-id="500005"' in explicit
+    # Closed Housekeeping mode uses the master cache's status=5 records only.
+    closed = client.get("/queue?mode=closed&photo_video_only=0&missing_tags=0&workflow_tab=main").get_data(as_text=True)
+    assert 'data-ticket-id="500005"' in closed
 
 
 def test_queue_range_controls_render_custom_state_and_safe_wiring(client):

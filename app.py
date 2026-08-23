@@ -356,6 +356,7 @@ CLOSED_MAX_DAYS = 3650
 # independent; the explicit "Show All Cached Tickets" control turns both scope
 # fields plus every manual filter off to display the complete cache.
 DEFAULT_FILTERS = {
+    "mode": "normal",
     "photo_video_only": True,    # default Review Scope: subject matches photo/video keyword
     "hide_reviewed_tags": True,  # default Review Scope: no reviewed/closed exclusions
     "overdue": False,            # opt-in: due_by is a valid timestamp earlier than now
@@ -466,7 +467,10 @@ def parse_dt(value):
 
 def _last_value(args, key):
     """Last occurrence wins for repeated query values."""
-    vals = args.getlist(key)
+    try:
+        vals = args.getlist(key)
+    except (KeyError, AttributeError):
+        return None
     return vals[-1] if vals else None
 
 
@@ -503,34 +507,42 @@ def parse_review_view(value, default=None):
     return DEFAULT_FILTERS["review_view"]  # queue invalid/missing -> neutral All
 
 
-def filters_from_args(args, submitted=False):
-    """Build a canonical filter config from query or submitted form values.
+def parse_queue_mode(value):
+    """Return a stable queue mode; missing and invalid values stay normal."""
+    return "closed" if value == "closed" else "normal"
 
-    GET/query parsing retains documented defaults. A submitted HTML form uses
-    false for an absent checkbox because unchecked checkboxes are omitted by the
-    browser; this distinction is intentional and must not change defaults.
+
+def filters_from_args(args, submitted=False):
+    """Build a canonical local queue configuration from request values.
+
+    The removed overdue/responded/waiting controls remain accepted as inert URL
+    parameters so old bookmarks cannot restrict or break the unified queue.
     """
+    mode = parse_queue_mode(_last_value(args, "mode"))
     checkbox_default = False if submitted else None
-    def checkbox(name):
+
+    def checkbox(name, default=None):
         value = _last_value(args, name)
-        default = checkbox_default if submitted else DEFAULT_FILTERS[name]
-        return parse_bool(value, default)
+        fallback = checkbox_default if submitted else (DEFAULT_FILTERS[name] if default is None else default)
+        return parse_bool(value, fallback)
+
     cfg = {
-        "photo_video_only": checkbox("photo_video_only"),
-        "hide_reviewed_tags": checkbox("hide_reviewed_tags"),
+        "mode": mode,
+        "photo_video_only": checkbox("photo_video_only", True if mode == "closed" else None),
+        "hide_reviewed_tags": checkbox("hide_reviewed_tags", False if mode == "closed" else None),
+        # Retain legacy values for canonical bookmarked URLs. Queue filtering
+        # deliberately ignores them; their controls no longer exist.
         "overdue": checkbox("overdue"),
         "responded": checkbox("responded"),
         "waiting": checkbox("waiting"),
-        "missing_tags": checkbox("missing_tags"),
+        "missing_tags": checkbox("missing_tags", True if mode == "closed" else None),
         "days": parse_days(_last_value(args, "days")),
         "review_view": parse_review_view(_last_value(args, "review_view")),
     }
-    try:
-        has_tab = "workflow_tab" in dict(args)
-    except (TypeError, ValueError):
-        has_tab = False
-    cfg["workflow_tab"] = parse_workflow_tab(_last_value(args, "workflow_tab")) if has_tab else DEFAULT_FILTERS["workflow_tab"]
+    workflow_tab = _last_value(args, "workflow_tab")
+    cfg["workflow_tab"] = parse_workflow_tab(workflow_tab) if workflow_tab is not None else DEFAULT_FILTERS["workflow_tab"]
     return cfg
+
 
 
 def filter_query_string(config):
@@ -538,6 +550,7 @@ def filter_query_string(config):
     + review_view). Used by the form action, preset links, and redirects so
     every URL-backed state can be reproduced exactly."""
     return urlencode({
+        "mode": parse_queue_mode(config.get("mode")),
         "photo_video_only": "1" if config.get("photo_video_only", True) else "0",
         "hide_reviewed_tags": "1" if config.get("hide_reviewed_tags", True) else "0",
         "overdue": "1" if config.get("overdue") else "0",
@@ -2453,13 +2466,29 @@ def queue():
     # manual control off for a complete-cache view.
     # ``all_categories_off`` is retained as template/context compatibility but
     # no longer suppresses rows.
-    all_categories_off = not (config["overdue"] or config["responded"] or config["waiting"])
-    tickets = apply_queue_filters(raw, config)
-    # Normal workflow excludes actual Freshdesk Closed status. Show All Cached
-    # Tickets is the explicit diagnostic escape hatch and retains full-cache semantics.
-    show_all_cached = not any((config["photo_video_only"], config["hide_reviewed_tags"], config["overdue"], config["responded"], config["waiting"], config["missing_tags"]))
-    if not show_all_cached:
-        tickets = [t for t in tickets if t.get("status") != CLOSED_STATUS and str(t.get("status")) != str(CLOSED_STATUS)]
+    all_categories_off = True  # retained template compatibility; obsolete selectors are inert.
+    closed_mode = config["mode"] == "closed"
+    show_all_cached = False
+    if closed_mode:
+        # The master 60-day queue cache is the sole Closed Housekeeping source.
+        # No closed_at window and no closed_tickets.json lookup are involved.
+        tickets = [t for t in raw if t.get("status") == CLOSED_STATUS or str(t.get("status")) == str(CLOSED_STATUS)]
+        if config["missing_tags"]:
+            tickets = [t for t in tickets if not isinstance(t.get("tags"), list) or not t.get("tags")]
+        if config["photo_video_only"]:
+            tickets = [t for t in tickets if ticket_matches_photo_video(t)]
+    else:
+        # Obsolete legacy URL fields are retained for bookmark serialization,
+        # but must not reintroduce their former queue restrictions.
+        normal_config = dict(config, overdue=False, responded=False, waiting=False)
+        tickets = apply_queue_filters(raw, normal_config)
+        # The explicit "Show All Cached Tickets" diagnostic escape hatch is
+        # every remaining local scope/filter control OFF; it retains full-cache
+        # semantics including Closed tickets. Otherwise Normal Review excludes
+        # actual Freshdesk Closed status.
+        show_all_cached = not any((config["photo_video_only"], config["hide_reviewed_tags"], config["missing_tags"]))
+        if not show_all_cached:
+            tickets = [t for t in tickets if t.get("status") != CLOSED_STATUS and str(t.get("status")) != str(CLOSED_STATUS)]
 
     state_rows = load_review_rows()
     last_opened_id = last_opened_ticket_id()  # focus state, independent of filters
@@ -2908,33 +2937,27 @@ QUEUE_HTML = """\
   <input type=hidden name=days value="{{ config.days }}">
   <div class="panel-region region-groups">
     <fieldset class="filter-group scope-group">
-      <legend class=group-lbl>Review Scope</legend>
+      <legend class=group-lbl>Review Mode</legend>
+      <div class=field><label for=queue-mode>Mode</label><select id=queue-mode name=mode><option value=normal {{ 'selected' if config.mode == 'normal' }}>Normal Review</option><option value=closed {{ 'selected' if config.mode == 'closed' }}>Closed Ticket Housekeeping</option></select></div>
+      {% if config.mode == 'closed' %}
+      <input type=hidden name=hide_reviewed_tags value=0>
+      <p class=field-hint>Closed tickets from the current 60-day master queue cache only. No separate retrieval or closed-date window.</p>
+      <div class=field><input type=hidden name=photo_video_only value=0><label for=filter-photo-video><input type=checkbox id=filter-photo-video name=photo_video_only value=1 {{ 'checked' if config.photo_video_only }}> Photo/Video Review Scope</label></div>
+      <div class=field><input type=hidden name=missing_tags value=0><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags Only</label></div>
+      {% else %}
       <div class=field><input type=hidden name=photo_video_only value=0><label for=filter-photo-video><input type=checkbox id=filter-photo-video name=photo_video_only value=1 {{ 'checked' if config.photo_video_only }}> Photo/video subjects only</label></div>
       <div class=field><input type=hidden name=hide_reviewed_tags value=0><label for=filter-hide-reviewed><input type=checkbox id=filter-hide-reviewed name=hide_reviewed_tags value=1 {{ 'checked' if config.hide_reviewed_tags }}> Hide tickets with reviewed/closed tags</label></div>
-      <p class=field-hint>Default working review queue. Manual filters below stay opt-in and can narrow this scope further. Use Show All Cached Tickets for the complete cache.</p>
-    </fieldset>
-    <fieldset class=filter-group>
-      <legend class=group-lbl>Ticket conditions</legend>
-      <div class=field><input type=hidden name=overdue value=0><label for=filter-overdue><input type=checkbox id=filter-overdue name=overdue value=1 {{ 'checked' if config.overdue }}> Overdue</label></div>
-      <p class=field-hint>Leave unchecked for no overdue restriction.</p>
-    </fieldset>
-    <fieldset class=filter-group>
-      <legend class=group-lbl>Freshdesk status</legend>
-      <div class=field><input type=hidden name=responded value=0><label for=filter-responded><input type=checkbox id=filter-responded name=responded value=1 {{ 'checked' if config.responded }}> Customer Responded</label></div>
-      <div class=field><input type=hidden name=waiting value=0><label for=filter-waiting><input type=checkbox id=filter-waiting name=waiting value=1 {{ 'checked' if config.waiting }}> Waiting on Customer</label></div>
-      <p class=field-hint>Select one or both statuses, or leave both unchecked for any status.</p>
-    </fieldset>
-    <fieldset class=filter-group>
-      <legend class=group-lbl>Additional filters</legend>
       <div class=field><input type=hidden name=missing_tags value=0><label for=filter-missing><input type=checkbox id=filter-missing name=missing_tags value=1 {{ 'checked' if config.missing_tags }}> Missing Tags</label></div>
+      <p class=field-hint>Default working review queue. Use the mode selector for Closed Ticket Housekeeping.</p>
+      {% endif %}
     </fieldset>
   </div>
   <div class="panel-region region-actions">
     <input type=hidden name=workflow_tab value="{{ config.workflow_tab }}">
     <div class=action-buttons>
       <button type=submit class=apply>Apply Filters</button>
-      <a class=reset href="/queue?photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
-      <a class=reset href="/queue?photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Show every cached ticket">Show All Cached Tickets</a>
+      <a class=reset href="/queue?mode=normal&amp;photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
+      <a class=reset href="/queue?mode=normal&amp;photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Show every cached ticket">Show All Cached Tickets</a>
     </div>
   </div>
 </form>

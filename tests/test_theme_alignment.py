@@ -120,12 +120,11 @@ def test_queue_js_selectors_and_dom_ids_unchanged(client, monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
     q = _html(client, "/queue")
     # The IDs/selectors the queue JS hooks into must still exist in markup or JS.
-    for token in ("queue-table", "review_view", "filter-photo-video",
-                  "filter-hide-reviewed", "filter-overdue",
-                  "filter-responded", "filter-waiting", "filter-missing",
-                  "last-opened-jump", "last-opened-hidden",
-                  "data-ticket-id", "class=apply", "class=reset",
-                  "action=/queue"):
+    for token in ("queue-table", "review_view", "queue-mode", "filter-photo-video",
+                   "filter-hide-reviewed", "filter-missing",
+                   "last-opened-jump", "last-opened-hidden",
+                   "data-ticket-id", "class=apply", "class=reset",
+                   "action=/queue"):
         assert token in q, f"missing queue token {token}"
 
 
