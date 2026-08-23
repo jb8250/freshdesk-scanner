@@ -1104,7 +1104,8 @@ def test_only_expected_routes_registered():
                       "/queue/api/review", "/queue/api/opened", "/queue/api/acknowledge",
                      "/closed/api/review", "/closed/api/opened",
                      "/closed/api/refresh", "/closed/api/refresh/status",
-                     "/closed/api/refresh/cancel"}, f"unexpected routes: {rules}"
+                      "/closed/api/refresh/cancel", "/queue/export.xlsx"}, f"unexpected routes: {rules}"
+
 
 
 def test_no_mohawk_or_upload_routes():

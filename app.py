@@ -62,6 +62,7 @@ import secrets
 import sqlite3
 import tempfile
 import threading
+import io
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -71,8 +72,10 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
 import requests
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
 from flask import (Flask, jsonify, redirect, render_template_string, request,
-                   session)
+                   send_file, session)
 
 import review_backups
 
@@ -2529,6 +2532,65 @@ def closed_ticket_known(ticket_id):
     return any(t.get("id") == ticket_id for t in payload.get("tickets", []))
 
 
+def build_current_queue_view(raw, config):
+    """Build the exact ticket rows represented by the queue dashboard.
+
+    This helper is render-only: it reads the supplied cache tickets and local
+    review state, and never refreshes, opens, or mutates anything.
+    """
+    all_categories_off = True
+    closed_mode = config["mode"] == "closed"
+    show_all_cached = False
+    if closed_mode:
+        tickets = [t for t in raw if t.get("status") == CLOSED_STATUS or str(t.get("status")) == str(CLOSED_STATUS)]
+        if config["missing_tags"]:
+            tickets = [t for t in tickets if not isinstance(t.get("tags"), list) or not t.get("tags")]
+        if config["photo_video_only"]:
+            tickets = [t for t in tickets if ticket_matches_photo_video(t)]
+    else:
+        normal_config = dict(config, overdue=False, responded=False, waiting=False)
+        tickets = apply_queue_filters(raw, normal_config)
+        show_all_cached = not any((config["photo_video_only"], config["hide_reviewed_tags"], config["missing_tags"]))
+        if not show_all_cached:
+            tickets = [t for t in tickets if t.get("status") != CLOSED_STATUS and str(t.get("status")) != str(CLOSED_STATUS)]
+
+    state_rows = load_review_rows()
+    last_opened_id = last_opened_ticket_id()
+    rows = []
+    workflow_counts = {tab: 0 for tab in WORKFLOW_TABS}
+    ordered_tickets = sorted(tickets, key=lambda x: (not updated_since_review(x, state_rows.get(x.get("id"))), x.get("id") is None, x.get("id") or 0))
+    for t in ordered_tickets:
+        tid = t["id"]
+        state_row = state_rows.get(tid)
+        updated_flag = updated_since_review(t, state_row)
+        destination = workflow_destination(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", updated_flag)
+        workflow_counts[destination] += 1
+        if not show_all_cached and destination != config["workflow_tab"]:
+            continue
+        sid = t.get("status")
+        pid = t.get("priority", 0)
+        due = t.get("due_by") or t.get("fr_due_by")
+        updated_at = t.get("updated_at")
+        row_class = REVIEW_CLASS.get(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", "rv-unreviewed")
+        is_last_opened = last_opened_id is not None and tid == last_opened_id
+        if is_last_opened:
+            row_class += " rv-last-opened"
+        rows.append({
+            "id": tid, "url": ticket_url(tid), "subject": t.get("subject", ""),
+            "status_label": STATUS_LABELS.get(sid, f"Status {sid}"),
+            "priority_label": PRIORITY_LABELS.get(pid, f"P{pid}"),
+            "updated_display": format_eastern_timestamp(updated_at),
+            "created_display": (t.get("created_at") or "")[:10] or "—",
+            "tags": (t.get("tags") or []) if isinstance(t.get("tags"), list) else [],
+            "result": state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
+            "row_class": row_class, "last_opened": is_last_opened,
+            "updated_flag": updated_flag,
+            "badges": ticket_badges(t, state_row, updated_flag),
+            "can_acknowledge": bool(state_row and state_row.get("review_result") in REVIEWED_STATES and updated_flag),
+        })
+    return rows, workflow_counts, all_categories_off, last_opened_id, show_all_cached
+
+
 @app.route("/queue")
 def queue():
     """GET /queue — RENDER ONLY. Never fetches from Freshdesk.
@@ -2562,6 +2624,18 @@ def queue():
         cached_days = blob.get("days") if blob and isinstance(blob.get("days"), int) else None
     except OfflineDataError as e:
         return _queue_error_page(str(e), offline)
+
+    rows, workflow_counts, all_categories_off, last_opened_id, show_all_cached = build_current_queue_view(raw, config)
+    flash_msg = session.pop("flash", None)
+    return _queue_render(
+        tickets=rows, total=len(rows), error=missing_key_msg,
+        workflow_counts=workflow_counts, offline=offline, cache_age=cache_age,
+        config=config, csrf_token=get_csrf_token(), flash=flash_msg,
+        all_categories_off=all_categories_off, last_opened_id=last_opened_id,
+        last_opened_rendered=any(r["last_opened"] for r in rows),
+        live_cache_missing=(None is cache_age and not offline and len(raw) == 0),
+        cached_days=cached_days, cached_ticket_count=len(raw),
+    )
 
     # Default state: Review Scope controls are ON (photo/video subjects only +
     # reviewed/closed tag exclusions), all manual controls are OFF. The visible
@@ -2666,6 +2740,51 @@ def queue():
          cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
          cache_coverage_warning=(cached_days is None or (isinstance(cached_days, int) and config["days"] > cached_days)),
     )
+
+
+@app.route("/queue/export.xlsx")
+def queue_export_xlsx():
+    """Download the exact current queue view as a read-only XLSX workbook."""
+    config = filters_from_args(request.args)
+    try:
+        raw, _cache_age = get_ticket_pool()
+    except OfflineDataError as e:
+        return _queue_error_page(str(e), is_offline())
+    rows, _counts, _all_categories_off, _last_opened_id, _show_all = build_current_queue_view(raw, config)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Current View"
+    headers = ["Ticket #", "Subject", "Status", "Priority", "Updated", "Created", "Tags", "Review Result", "Freshdesk URL"]
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        values = [
+            row["id"], row["subject"], row["status_label"], row["priority_label"],
+            row["updated_display"], row["created_display"], ", ".join(str(tag) for tag in row["tags"]),
+            row["result"], row["url"],
+        ]
+        sheet.append(values)
+        url_cell = sheet.cell(sheet.max_row, 9)
+        url_cell.hyperlink = row["url"]
+        url_cell.style = "Hyperlink"
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:I{max(sheet.max_row, 1)}"
+    widths = {"A": 11, "B": 42, "C": 22, "D": 12, "E": 24, "F": 14, "G": 35, "H": 24, "I": 55}
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    for row in sheet.iter_rows(min_row=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+        row[6].alignment = Alignment(wrap_text=True, vertical="top")
+        row[8].alignment = Alignment(wrap_text=True, vertical="top")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"freshdesk-current-view-{date.today().isoformat()}.xlsx"
+    return send_file(output, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/queue/api/refresh", methods=["POST"])
@@ -3079,8 +3198,10 @@ QUEUE_HTML = """\
   <div class="panel-region region-actions">
     <input type=hidden name=workflow_tab value="{{ config.workflow_tab }}">
     <div class=action-buttons>
-      <button type=submit class=apply>Apply Filters</button>
-      <a class=reset href="/queue?mode=normal&amp;photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
+       <button type=submit class=apply>Apply Filters</button>
+       <a class=reset href="/queue/export.xlsx?{{ filter_query_string(config) }}" role=button aria-label="Export the current queue view">Export Current View</a>
+       <a class=reset href="/queue?mode=normal&amp;photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Reset to the default Review Scope">Reset to Default Review Scope</a>
+
       <a class=reset href="/queue?mode=normal&amp;photo_video_only=0&amp;hide_reviewed_tags=0&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days={{ config.days }}&amp;review_view=all&amp;workflow_tab=main" role=button aria-label="Show every cached ticket">Show All Cached Tickets</a>
     </div>
   </div>
