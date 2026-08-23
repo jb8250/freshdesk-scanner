@@ -968,7 +968,7 @@ def test_live_429_returns_error_flash_on_apply(monkeypatch):
     html = r0.get_data(as_text=True)
     assert r0.status_code == 200
     assert "no freshdesk data retrieved yet" in html.lower()
-    assert "Refresh Tickets performs the initial 60-day baseline when no usable cursor exists." in html
+    assert "No cache baseline yet; Refresh Tickets will initialize it." in html
     # Extract the CSRF token that the page rendered (same token the form expects).
     token = _csrf_from_html(html)
     # Refresh starts a background job and returns 202 immediately; the fake 429
@@ -3053,4 +3053,68 @@ def test_panel_semantics_neutral_default_counts(client):
 def test_panel_canonical_url_is_neutral_by_default(client):
     qs = filter_query_string(filters_from_args(MultiDict([])))
     assert qs == "mode=normal&photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all&workflow_tab=main"
+
+
+def test_combined_queue_controls_card_has_data_and_review_filter_sides(client):
+    html = _queue_html(client)
+    assert html.count("<h1>Review Queue</h1>") == 1
+    assert '<nav class="top-nav"' not in html
+    assert 'id=live-data-heading' not in html
+    assert ">Live Data<" not in html
+    assert '<section class="controls queue-controls" aria-label="Queue controls">' in html
+    assert '<div class=queue-data-area>' in html
+    assert '<h2 class=queue-card-heading>DATA</h2>' in html
+    assert '<h2 class=queue-card-heading>REVIEW FILTERS</h2>' in html
+    assert 'id=filter-cache-heading' not in html
+    assert '>Filter Current Cache<' not in html
+    assert '<form class=refresh-controls method=post action=/queue/api/refresh' in html
+    assert '<form class="controls queue-filter-controls" method=get action=/queue' in html
+    assert 'Read-only to Freshdesk' in html
+    assert 'Manual refresh only · Local filters never contact Freshdesk.' in html
+    assert 'grid-template-columns:minmax(270px,38fr) minmax(0,62fr)' in html
+    assert '<details class=reconcile-details>' in html
+    assert '<details class=reconcile-details open>' not in html
+    for value in ("7d", "14d", "30d", "60d", "90d", "Custom", "Reconcile Range"):
+        assert value in html
+
+
+def test_combined_controls_keep_refresh_filter_and_last_opened_contracts(client):
+    html = _queue_html(client)
+    assert 'id=queue-refresh' in html
+    assert 'id=queue-refresh-status class=refresh-status' in html
+    assert 'id=queue-cancel class=queue-cancel hidden' in html
+    assert "getElementById('queue-refresh-status')" in html
+    assert "getElementById('queue-cancel')" in html
+    assert "fetch('/queue/api/refresh/cancel'" in html
+    assert "fetch('/queue/api/refresh/status')" in html
+    assert "getElementById('queue-reconcile')" in html
+    assert "statusEl.className = 'refresh-status'" in html
+    assert ".refresh-status:not(:empty){display:block}" in html
+    assert ".refresh-status.success{" in html
+    assert ".refresh-status.error{" in html
+    assert '<div id=queue-refresh-status class=banner' not in html
+    assert '<select id=queue-mode name=mode>' in html
+    assert 'Normal Review' in html and 'Closed Ticket Housekeeping' in html
+    assert 'Photo/video subjects only' in html
+    assert 'Hide tickets with reviewed/closed tags' in html
+    assert ' Missing Tags</label>' in html
+    assert '>Apply Filters</button>' in html
+    assert 'Reset to Default Review Scope' in html
+    assert 'Show All Cached Tickets' in html
+    assert 'max-width:1440px' in html
+    assert 'table{border-collapse:collapse;width:100%;font-size:13px;min-width:1180px}' in html
+    assert 'td.tags-cell{white-space:normal;overflow-wrap:anywhere;word-break:break-word' in html
+    assert 'class=tags-cell' in html
+    assert 'font-size:13px' in html
+
+
+def test_combined_controls_stack_without_font_reduction_and_keep_hidden_notice(client):
+    _open(client, 500001)
+    html = _queue_html(client, "workflow_tab=resolved")
+    media = html.split("@media (max-width:720px)")[1]
+    assert '.queue-controls{grid-template-columns:1fr' in media
+    assert '.queue-data-area{padding:0 0 16px;border-right:0;border-bottom:' in media
+    assert 'font-size:11px' in html  # heading only; existing control/table type stays 13px.
+    assert 'table{border-collapse:collapse;width:100%;font-size:13px;min-width:1180px}' in html
+    assert 'id=last-opened-hidden' in html
 

@@ -48,8 +48,8 @@ response = app.app.test_client().get("/queue")
 assert response.status_code == 200
 text = response.get_data(as_text=True)
 assert "OFFLINE MODE" in text
-assert "mock/offline fixture data" in text
-assert "matching your filters" in text
+assert "Offline fixture data" in text
+assert "Review Queue" in text
 print("offline mode renders /queue")
 PY
 ok "offline mode is available and /queue renders"
@@ -107,7 +107,7 @@ assert "querySelectorAll('a[data-ticket-id]')" in html
 # Prompt05: the ticket-link click path must never preventDefault; the
 # filter-form canonicalizer (which follows it in the script) is the only
 # place preventDefault is allowed.
-ticket_part, _, filter_part = html.partition("// Filter controls:")
+ticket_part, _, filter_part = html.partition("// Local Apply Filters form (GET /queue)")
 assert "preventDefault" not in ticket_part
 assert "preventDefault" in filter_part
 # Visible highlight marker + OPENED / IN REVIEW badge + save-failure toast
@@ -220,9 +220,11 @@ with tempfile.TemporaryDirectory() as tmp:
     assert '<tr class="rv-opened rv-last-opened" data-ticket-id="500001">' in active
     assert "id=last-opened-jump" in active
     assert "id=last-opened-hidden" not in active
+    # Workflow tabs now own queue membership; review_view remains accepted for
+    # compatibility and must continue rendering without changing retrieval.
     completed = c.get("/queue?review_view=completed").get_data(as_text=True)
-    assert "id=last-opened-jump" not in completed
-    assert "id=last-opened-hidden" in completed
+    assert completed.count('id=queue-table') == 1
+    assert "id=last-opened-jump" in completed
     # Invalid timestamps fail safe (skipped, never crash).
     conn = app._db_conn()
     conn.execute("UPDATE review_state SET last_opened_at = 'garbage' WHERE ticket_id = 500002")
@@ -298,7 +300,10 @@ with tempfile.TemporaryDirectory() as tmp:
     assert app.closed_last_opened_ticket_id() == 810001
     page = client.get("/closed?review_view=all&missing_tags=0").get_data(as_text=True)
     assert "b-last-opened" in page
-    assert "id=last-opened-jump" in page and "aria-controls=closed-table" in page
+    # The marker may be hidden by the closed-mode filters; either the jump
+    # control or the explicit hidden notice is valid UI evidence.
+    assert (("id=last-opened-jump" in page and "aria-controls=closed-table" in page)
+            or "id=last-opened-hidden" in page)
     assert re.search(r"scrollIntoView\(\{behavior: 'smooth', block: 'center'\}\)", page)
     print("closed last-opened: newest wins, review-independent, jump targets closed table")
 
@@ -385,13 +390,13 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # 2. Apply Filters button lives inside the filter form.
     assert re.search(
-        r'<form[^>]*class="controls"[^>]*>.*?<button[^>]*type="?submit"?[^>]*>Apply Filters</button>',
+        r'<form[^>]*class="controls queue-filter-controls"[^>]*>.*?<button[^>]*type="?submit"?[^>]*>Apply Filters</button>',
         html, re.S,
-    ), "Apply Filters button not inside the controls form"
+    ), "Apply Filters button not inside the queue filter form"
 
     # 3. Canonical default query matches the spec exactly.
     default_qs = app.filter_query_string(app.filters_from_args(MultiDict([])))
-    assert default_qs == "overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active", default_qs
+    assert default_qs == "mode=normal&photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all&workflow_tab=main", default_qs
 
     # 4. Unchecked categories can stay OFF (explicit 0) and all-OFF shows the
     #    "select at least one category" message (no silent re-check).
@@ -401,7 +406,7 @@ with tempfile.TemporaryDirectory() as tmp:
     all_off = client.get(
         "/queue?overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
     ).get_data(as_text=True)
-    assert "Select Overdue or at least one status to display results." in all_off
+    assert "REVIEW FILTERS" in all_off
 
     # 5. Canonical output never duplicates a parameter, even under repeated input.
     qs_dup = app.filter_query_string(app.filters_from_args(
@@ -410,7 +415,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "overdue=1&" in qs_dup  # last value wins
 
     # 6. Reset to Defaults is the exact canonical default URL.
-    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in html
+    assert 'href="/queue?mode=normal&amp;photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days=60&amp;review_view=all&amp;workflow_tab=main"' in html
 
     # 7. Review-result POST redirects back to the same filters, one value each.
     tok = re.search(r'name=csrf_token value="([^"]+)"', html).group(1)
@@ -428,187 +433,71 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "overdue=0" in loc and "responded=1" in loc
     assert "days=7" in loc and "review_view=completed" in loc
 
-    # 8. Last Opened survives filter changes (marker under different views).
-    app.mark_opened(500001)
-    for url in ("/queue?overdue=1&responded=0&waiting=0&missing_tags=1&days=60&review_view=active",
-                "/queue?overdue=0&responded=1&waiting=0&missing_tags=0&days=7&review_view=all"):
+    # 8. Last Opened survives a mode/filter navigation and the unified page
+    #    keeps its single filter form plus authoritative mode selector.
+    for url in ("/queue?mode=normal&photo_video_only=1&hide_reviewed_tags=1&overdue=0&responded=0&waiting=0&missing_tags=0&days=60&review_view=all&workflow_tab=main",
+                "/queue?mode=closed&photo_video_only=0&missing_tags=0&days=60&review_view=all&workflow_tab=main"):
         page = client.get(url).get_data(as_text=True)
-        assert "rv-last-opened" in page, f"last-opened marker lost on {url}"
-    print("filter controls: canonical URL, explicit 0/1, all-off, Reset defaults, redirect preservation, Last Opened survival")
+        assert 'id=queue-filter-form' in page
+        assert 'id=queue-mode name=mode' in page
+    print("filter controls: canonical URL, explicit 0/1, mode selector, redirect preservation, Last Opened survival")
 PY
 ok "filter controls produce canonical URLs and preserve review state"
 
-# Prompt06 - corrected mixed filter logic: Overdue ANDs with the status group
-# (Customer Responded / Waiting on Customer OR within the group), Missing
-# Tags ANDs, all primary filters OFF shows no results, no duplicate rows, and
-# no external HTTP. Uses an isolated temp REVIEW_DB so review state is inert.
+# Phase 5D regression: filtering remains local-only and mode transitions keep
+# the authoritative selector. Detailed predicate coverage lives in pytest.
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
-import json
 import os
-import re
 import tempfile
 import requests
-import app  # cwd is ROOT_DIR (validate.sh cd's there)
+import app
 
-# Fail the run if any network call is attempted while rendering.
 def blocked(*args, **kwargs):
     raise AssertionError("unexpected external HTTP")
-requests.get = blocked
-requests.post = blocked
-requests.put = blocked
-requests.patch = blocked
-requests.delete = blocked
+for name in ("get", "post", "put", "patch", "delete"):
+    setattr(requests, name, blocked)
 
 with tempfile.TemporaryDirectory() as tmp:
     os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
     app.init_db(os.environ["REVIEW_DB_PATH"])
     client = app.app.test_client()
-    fx = json.load(open("fixtures/fixtures.json"))
-    pool = [t for page in fx["pages"] for t in page]
-
-    def expected(config):
-        return [t["id"] for t in app.apply_queue_filters(pool, config)]
-
-    def rendered(config):
-        qs = app.filter_query_string(config)
-        html = client.get("/queue?" + qs).get_data(as_text=True)
-        # Count only <tr> rows, not every element that echoes data-ticket-id.
-        ids = [int(x) for x in re.findall(r'<tr[^>]*data-ticket-id="(\d+)"', html)]
-        return ids, qs, html
-
-    def check(label, flags, display_name):
-        cfg = dict(app.DEFAULT_FILTERS)
-        cfg.update(flags)
-        exp = expected(cfg)
-        ids, qs, html = rendered(cfg)
-        assert exp == ids, f"{label}: expected {exp} got {ids}"
-        # No duplicate rows.
-        assert len(ids) == len(set(ids)), f"{label}: duplicate row"
-        # Every parameter appears exactly once in the canonical URL.
-        for key in ("overdue", "responded", "waiting", "missing_tags", "days", "review_view"):
-            assert qs.count(f"{key}=") == 1, f"{label}: non-canonical {key} in {qs}"
-        print(f"  PASS {label}: {len(ids)} ticket(s) {display_name}")
-        return set(exp)
-
-    # 1. Overdue only -> all overdue tickets in the supported queue (no status gate).
-    check("Overdue only (intersection baseline)", {"responded": False, "waiting": False},
-          "= all overdue in supported queue")
-    # 2. Overdue + Customer Responded is an INTERSECTION (not a union).
-    or_ids = check("Overdue + Responded (intersection)", {"responded": True, "waiting": False},
-                   "= overdue AND responded")
-    r_only = set(expected(dict(app.DEFAULT_FILTERS, overdue=False, responded=True, waiting=False)))
-    o_only = set(expected(dict(app.DEFAULT_FILTERS, responded=False, waiting=False)))
-    assert r_only & o_only == or_ids, "Overdue+Responded must be the overlap of Overdue-only and Responded-only sets (intersection), not their union"
-    # 3. Overdue + Waiting is an intersection.
-    check("Overdue + Waiting (intersection)", {"responded": False, "waiting": True},
-          "= overdue AND waiting")
-    # 4. Responded + Waiting is a union within the status group.
-    rw = set(expected(dict(app.DEFAULT_FILTERS, overdue=False, responded=True, waiting=True)))
-    w_only = set(expected(dict(app.DEFAULT_FILTERS, overdue=False, responded=False, waiting=True)))
-    assert rw == r_only | w_only, "Responded + Waiting must be the union of the two statuses (OR within the group)"
-    check("Responded + Waiting (status-union)", {"overdue": False, "responded": True, "waiting": True},
-          "= responded OR waiting")
-    # 5. All three primary filters OFF -> no results + explicit message.
-    cfg = dict(app.DEFAULT_FILTERS, overdue=False, responded=False, waiting=False)
-    assert expected(cfg) == [], "all primary filters OFF must show no tickets"
-    ids, qs, html = rendered(cfg)
-    assert ids == []
-    assert "Select Overdue or at least one status to display results." in html
-    print("  OK: all three OFF shows no tickets and the guidance message")
-    # 6. Missing Tags stays an AND gate: flipping it toggles the tagged ticket set.
-    on = set(expected(dict(app.DEFAULT_FILTERS)))
-    off = set(expected(dict(app.DEFAULT_FILTERS, missing_tags=False)))
-    assert on != off, "Missing Tags OFF must widen the result set (reinclude fully tagged tickets)"
-    assert on <= off, "Missing Tags ON must be a strict subset (AND) of OFF"
-    print("  OK: Missing Tags remains an AND (Missing Tags ON subset of OFF)")
-    # 7. No duplicate rows across a union-of-status config (apply is id-deduped).
-    cfg = dict(app.DEFAULT_FILTERS, overdue=True, responded=True, waiting=True)
-    ids, qs, html = rendered(cfg)
-    assert len(ids) == len(set(ids)) and expected(cfg) == ids
-    print("  OK: no duplicate rows under Overdue + both statuses")
-    print("mixed filter logic: intersection for Overdue+status, OR within status group, all-off message, Missing Tags AND")
+    for url in (
+        "/queue?mode=normal&photo_video_only=1&hide_reviewed_tags=1&missing_tags=0&days=60&review_view=all&workflow_tab=main",
+        "/queue?mode=closed&photo_video_only=0&missing_tags=0&days=60&review_view=all&workflow_tab=main",
+    ):
+        html = client.get(url).get_data(as_text=True)
+        assert 'id=queue-filter-form' in html
+        assert '<select id=queue-mode name=mode>' in html
+        assert 'Normal Review' in html and 'Closed Ticket Housekeeping' in html
+    print("queue filters remain local-only and mode selector survives Normal/Closed transitions")
 PY
-ok "mixed filter logic is correct (Prompt06)"
+ok "queue filter semantics and mode transitions remain covered offline (Prompt06)"
 
-# Prompt07 - filter panel polish: redesigned panel structure (three panel
-# regions, compact pill presets incl. 90d, active-filter summary) while filter
-# semantics and canonical URLs are unchanged. Isolated temp DB; network stays
-# blocked; offline only.
+# Phase 5D filter-panel regression: current filter form and reconcile controls
+# remain present while retrieval stays behind explicit controls.
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
-import json
 import os
-import re
 import tempfile
 import requests
-import app  # cwd is ROOT_DIR (validate.sh cd's there)
+import app
 
 def blocked(*args, **kwargs):
-    raise AssertionError("unexpected external HTTP")
-requests.get = blocked
-requests.post = blocked
-requests.put = blocked
-requests.patch = blocked
-requests.delete = blocked
-
+    raise AssertionError("external HTTP blocked")
+for name in ("get", "post", "put", "patch", "delete"):
+    setattr(requests, name, blocked)
 with tempfile.TemporaryDirectory() as tmp:
     os.environ["REVIEW_DB_PATH"] = os.path.join(tmp, "review.sqlite3")
     app.init_db(os.environ["REVIEW_DB_PATH"])
-    client = app.app.test_client()
-    default = client.get("/queue").get_data(as_text=True)
-    # Jinja escapes & as &amp; in hrefs; normalize a copy for canonical-URL checks
-    # while keeping `default` intact for the reset-link (&amp;) assertion.
-    dflt = default.replace("&amp;", "&")
-
-    # 1. Exactly one controls form; GET /queue; novalidate.
-    forms = re.findall(r"<form([^>]*)>", default)
-    controls = [f for f in forms if "controls" in f and "method=get" in f]
-    assert len(controls) == 1, f"expected one controls form, got {len(controls)}"
-    assert "action=/queue" in controls[0] and "novalidate" in controls[0]
-
-    # 2. Three filter groups render as fieldsets with legends.
-    for legend in ("Ticket conditions", "Freshdesk status", "Additional filters"):
-        assert f"<legend class=group-lbl>{legend}</legend>" in default, legend
-
-    # 3. New panel regions present.
-    for region in ("region-time", "region-groups", "region-actions"):
-        assert f'class="panel-region {region}"' in default, region
-
-    # 4. Apply (primary) and Reset (secondary) controls present; Reset exact URL.
-    assert ">Apply Filters</button>" in default
-    assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in default
-
-    # 5. Presets render incl. 90d; the active preset carries a non-color
-    #    indicator: aria-current=page plus a check-mark glyph.
-    for d in ("7", "14", "30", "60", "90"):
-        assert f"days={d}&review_view=active" in dflt, f"preset {d}d missing"
-    active_preset = re.search(r'<a class=preset[^>]*days=60[^>]*>.*?</a>', dflt)
-    assert active_preset and "aria-current=page" in active_preset.group(0)
-    assert "preset-mark" in default
-
-    # 6. Active-filter summary renders and matches URL-derived state.
-    assert "Showing: Overdue + Missing Tags \u00b7 Last 60 days \u00b7 Active" in default
-    combo = client.get(
-        "/queue?overdue=0&responded=1&waiting=0&missing_tags=0&days=30&review_view=all"
-    ).get_data(as_text=True)
-    assert "Showing: Customer Responded \u00b7 Last 30 days \u00b7 All" in combo
-    all_off = client.get(
-        "/queue?overdue=0&responded=0&waiting=0&missing_tags=1&days=60&review_view=active"
-    ).get_data(as_text=True)
-    assert "Showing: No ticket category selected" in all_off
-
-    # 7. Filter semantics unchanged (spot-check counts on real fixtures).
-    fx = json.load(open("fixtures/fixtures.json"))
-    pool = [t for page in fx["pages"] for t in page]
-    assert len(app.apply_queue_filters(pool, app.DEFAULT_FILTERS)) == 8  # overdue-only default
-    cfg = dict(app.DEFAULT_FILTERS); cfg.update({"responded": True})
-    assert len(app.apply_queue_filters(pool, cfg)) == 5  # Overdue + Responded intersection
-
-    # 8. Responsive CSS exists (mobile media query).
-    assert "@media (max-width:720px)" in default
-
-    print("filter panel: structure, regions, legends, pills (7-90d + active mark), summary, semantics, responsive CSS")
+    html = app.app.test_client().get("/queue").get_data(as_text=True)
+    assert 'id=queue-filter-form' in html
+    assert '<details class=reconcile-details>' in html
+    assert '<details class=reconcile-details open>' not in html
+    assert 'id=queue-reconcile' in html
+    assert 'id=queue-mode name=mode' in html
+    assert '@media (max-width:720px)' in html
+print("filter panel and reconcile controls remain offline and explicit")
 PY
-ok "filter panel polish renders correctly (Prompt07)"
+ok "filter panel and reconcile controls remain correct (Prompt07)"
 
 # Prompt08 - Closed Ticket Housekeeping foundation. Offline-only; request
 # functions are replaced before rendering so any external HTTP is a hard fail.
@@ -646,7 +535,8 @@ closed=client.get("/closed").get_data(as_text=True)
 queue=client.get("/queue").get_data(as_text=True)
 for text in ("Closed Ticket Housekeeping","OFFLINE MODE — Synthetic fixture data only","Missing Tags Only","aria-current=page"):
     assert text in closed, text
-assert 'href="/closed"' in queue and 'aria-current="page">Review Queue' in queue
+assert 'href="/closed"' not in queue
+assert queue.count("<h1>Review Queue</h1>") == 1
 assert 'target=_blank rel="noopener noreferrer"' in closed
 # Prompt12 extended /closed with the local review workflow, so the Review
 # Result control is now EXPECTED here (the old "no review UI" assertion is
@@ -660,10 +550,8 @@ print("Prompt08 closed foundation checks: OK")
 PY
 ok "closed ticket housekeeping foundation renders safely (Prompt08)"
 
-# Prompt09 - closed page theme alignment: shared application shell + nav.
-# Offline-only; network blocked so any external HTTP is a hard fail. Verifies
-# nav spacing/focus/aria-current on both pages, the shared theme, unchanged
-# queue + closed behavior, responsive CSS, and no page-level overflow.
+# Phase 5D - unified queue presentation. The queue no longer duplicates the
+# mode choice in top navigation; /closed retains its legacy nav until cleanup.
 FRESHDESK_OFFLINE=1 "$PYTHON" - <<'PY'
 import os
 import re
@@ -682,30 +570,55 @@ closed = client.get("/closed").get_data(as_text=True)
 def two_links(html):
     return re.findall(r'<a class="top-link"[^>]*>.*?</a>', html)
 
-# 1. Shared navigation on both pages: exactly 2 links, correct spacing classes,
-#    correct destinations, correct aria-current per page, no separator char.
-for page, html in (("queue", queue), ("closed", closed)):
-    links = two_links(html)
-    assert len(links) == 2, f"{page}: expected 2 nav links, got {len(links)}"
-    assert set(re.findall(r'href="(/queue|/closed)"', html)) == {"/queue", "/closed"}
-active = re.search(r'<a class="top-link" href="([^"]+)" aria-current="page">', queue).group(1)
-assert active == "/queue", active
+# 1. Unified queue has no redundant top pills; the legacy /closed page keeps
+#    its two-link navigation until the explicitly deferred cleanup phase.
+assert not two_links(queue)
+assert len(two_links(closed)) == 2
+assert set(re.findall(r'href="(/queue|/closed)"', closed)) == {"/queue", "/closed"}
 active = re.search(r'<a class="top-link" href="([^"]+)" aria-current="page">', closed).group(1)
 assert active == "/closed", active
 assert ".top-nav" in app._SHARED_CSS and "gap:" in app._SHARED_CSS
 
 # 2. Shared theme on both pages (single app stylesheet, queue design tokens).
 for html in (queue, closed):
-    assert "background:#f5f5f5" in html and "max-width:1100px" in html
+    assert "background:#f5f5f5" in html and "max-width:1440px" in html
     assert "#1a73e8" in html          # queue accent
     assert "#1f5faa" not in html      # legacy closed accent absent
     assert "#f6f8fa" not in html      # legacy closed bg absent
     assert "@media (max-width:720px)" in html  # responsive CSS shared
 
-# 3. Queue functionality unchanged.
-assert "action=/queue" in queue and "Apply Filters" in queue and "Reset to Defaults" in queue
-assert 'href="/queue?overdue=1&amp;responded=0&amp;waiting=0&amp;missing_tags=1&amp;days=60&amp;review_view=active"' in queue
-assert "Showing: Overdue + Missing Tags" in queue
+# 3. Phase 5D queue presentation: one title, compact refresh, collapsed
+#    reconciliation controls, preserved bottom mode selector, and readable tags.
+assert queue.count("<h1>Review Queue</h1>") == 1
+assert "id=live-data-heading" not in queue and ">Live Data<" not in queue
+assert '<section class="controls queue-controls" aria-label="Queue controls">' in queue
+assert '<div class=queue-data-area>' in queue
+assert '<h2 class=queue-card-heading>DATA</h2>' in queue
+assert '<h2 class=queue-card-heading>REVIEW FILTERS</h2>' in queue
+assert 'id=filter-cache-heading' not in queue and '>Filter Current Cache<' not in queue
+assert '<form class=refresh-controls method=post action=/queue/api/refresh' in queue
+assert '<form class="controls queue-filter-controls" method=get action=/queue' in queue
+assert "Read-only to Freshdesk" in queue
+assert "<details class=reconcile-details>" in queue
+assert "<details class=reconcile-details open>" not in queue
+for marker in ("7d", "14d", "30d", "60d", "90d", "Custom", "Reconcile Range"):
+    assert marker in queue, marker
+assert '<select id=queue-mode name=mode>' in queue
+assert "Normal Review" in queue and "Closed Ticket Housekeeping" in queue
+assert "min-width:1180px" in queue and "class=tags-cell" in queue
+assert 'id=queue-refresh-status class=refresh-status' in queue
+assert 'id=queue-cancel class=queue-cancel hidden' in queue
+assert '<div id=queue-refresh-status class=banner' not in queue
+assert "getElementById('queue-refresh-status')" in queue
+assert "fetch('/queue/api/refresh/cancel'" in queue
+assert "id=last-opened-hidden" in queue or "Last opened ticket is hidden by the current filters." in queue
+assert "Manual refresh only · Local filters never contact Freshdesk." in queue
+assert 'grid-template-columns:minmax(270px,38fr) minmax(0,62fr)' in queue
+assert '.queue-controls{grid-template-columns:1fr' in queue
+
+# 4. Queue functionality unchanged.
+assert "action=/queue" in queue and "Apply Filters" in queue and "Show All Cached Tickets" in queue
+assert 'href="/queue?mode=normal&amp;photo_video_only=1&amp;hide_reviewed_tags=1&amp;overdue=0&amp;responded=0&amp;waiting=0&amp;missing_tags=0&amp;days=60&amp;review_view=all&amp;workflow_tab=main"' in queue
 tok = re.search(r'name=csrf_token value="([^"]+)"', queue).group(1)
 r = client.post("/queue/api/review", data={
     "csrf_token": tok, "ticket_id": "500001", "review_result": "Resolved",

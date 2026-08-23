@@ -29,7 +29,7 @@ def test_both_pages_share_the_same_theme_css(client, path, monkeypatch):
     # (the /queue theme), not a per-page fork.
     assert "body{font-family:system-ui" in html
     assert "background:#f5f5f5" in html
-    assert "max-width:1100px" in html
+    assert "max-width:1440px" in html
     assert ".controls{" in html
     assert ".preset{" in html
     assert ".filter-group{" in html
@@ -38,11 +38,11 @@ def test_both_pages_share_the_same_theme_css(client, path, monkeypatch):
     assert ":focus-visible" in html
 
 
-@pytest.mark.parametrize("path", ["/queue", "/closed"])
-def test_shared_nav_has_two_spaced_links(client, path, monkeypatch):
+def test_closed_page_keeps_spaced_dashboard_nav(client, monkeypatch):
     monkeypatch.setenv("FRESHDESK_OFFLINE", "1")
-    html = _html(client, path)
-    # Exactly two nav links, correctly separated (shared component).
+    html = _html(client, "/closed")
+    # Queue is now the unified destination and intentionally has no redundant
+    # top-level mode pills; the legacy page keeps its navigation until cleanup.
     links = re.findall(r'<a class="top-link"[^>]*>.*?</a>', html)
     assert len(links) == 2, links
     hrefs = re.findall(r'href="(/queue|/closed)"', html)
@@ -61,7 +61,7 @@ def test_nav_aria_current_is_per_page(client, monkeypatch):
         m = re.search(r'<a class="top-link" href="(/queue|/closed)" aria-current="page">', html)
         return m.group(1) if m else None
 
-    assert active_page(q) == "/queue"
+    assert active_page(q) is None
     assert active_page(cl) == "/closed"
 
 
@@ -77,6 +77,8 @@ def test_nav_helper_produces_expected_markup():
     cl = _nav_html("closed")
     assert 'href="/queue" aria-current="page"' in q
     assert 'href="/closed" aria-current="page"' in cl
+    # The helper remains reusable for /closed and future navigation, even though
+    # QUEUE_HTML no longer inserts it at the top of the unified queue.
     assert cl.count("top-link") == 2 and q.count("top-link") == 2
 
 

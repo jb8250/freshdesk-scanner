@@ -2798,7 +2798,7 @@ def resolve_bind_host(host):
 # breakpoints. Navigation is rendered by _nav_html(current).
 _SHARED_CSS = """
  :root{--fd-customer-responded:#09218D;--fd-customer-responded-text:#FFFFFF;--fd-waiting-customer:#E9AE3D;--fd-waiting-customer-text:#1A1A1A;--fd-last-opened:#6A1B9A;--fd-last-opened-text:#FFFFFF}
- body{font-family:system-ui,Arial,sans-serif;max-width:1100px;margin:auto;padding:16px;background:#f5f5f5;color:#222}
+ body{font-family:system-ui,Arial,sans-serif;max-width:1440px;margin:auto;padding:16px;background:#f5f5f5;color:#222}
   h1{font-size:22px;margin:0 0 4px}
   .sub{color:#666;font-size:13px;margin-bottom:16px}
   .queue-status{display:inline-flex;gap:7px;margin:0 0 14px}
@@ -2821,8 +2821,29 @@ _SHARED_CSS = """
  .banner.err{background:#fdecea;border-color:#d66;color:#8a1f1f}
  .banner.ok{background:#e8f5e9;border-color:#6a9;color:#1e4d2b}
  .controls{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px 18px;margin-bottom:10px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+ .queue-controls{display:grid;grid-template-columns:minmax(270px,38fr) minmax(0,62fr);gap:20px;padding:16px 18px}
+ .queue-data-area{min-width:0;padding-right:20px;border-right:1px solid #e7e9ed}
+ .queue-filter-controls{min-width:0}
+ .queue-controls .controls{background:transparent;border:0;border-radius:0;box-shadow:none;padding:0;margin:0}
+ .queue-controls .panel-region{padding-bottom:12px;margin-bottom:12px}
+ .queue-data-area .panel-region{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding-bottom:0;margin-bottom:8px;border-bottom:0}
+ .queue-card-heading{font-size:11px;font-weight:750;letter-spacing:.08em;color:#536273;margin:0 0 9px}
+ .queue-data-area .live-meta{margin:0 0 8px}
+ .reconcile-details{margin-top:8px;border-top:1px solid #f0f0f0;padding-top:8px}
+ .reconcile-details summary{cursor:pointer;color:#315f9d;font-size:13px;font-weight:650;list-style-position:inside}
+ .reconcile-details[open] summary{margin-bottom:10px}
+ .reconcile-details .reconcile-panel{padding:0;border-bottom:0;margin-bottom:0}
+ .refresh-status{display:none;font-size:13px;line-height:1.4;margin:8px 0 0;padding:7px 9px;border-radius:6px;background:#f1f3f4;color:#44505f}
+ .refresh-status:not(:empty){display:block}
+ .refresh-status.success{background:#e8f5e9;color:#1e4d2b}
+ .refresh-status.warning{background:#fff8df;color:#624d12}
+ .refresh-status.error{background:#fdecea;color:#8a1f1f}
+ .queue-cancel{padding:7px 15px;font-size:13px;font-weight:500;color:#5f6368;background:#fff;border:1px solid #c6c9cf;border-radius:6px;cursor:pointer}
+ .queue-card-footer{grid-column:1 / -1;border-top:1px solid #edf0f3;padding-top:10px;color:#7a8491;font-size:12px}
  .controls .panel-region{display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid #f0f0f0}
  .controls .panel-region:last-child{padding-bottom:0;margin-bottom:0;border-bottom:0}
+ .queue-controls .queue-data-area .panel-region{padding-bottom:0;margin-bottom:8px;border-bottom:0}
+ .queue-controls .queue-filter-controls .panel-region{padding-bottom:12px;margin-bottom:12px}
  .region-time{justify-content:space-between}
  .days-field{display:inline-flex;align-items:center;gap:7px;flex-wrap:wrap}
  .days-field .lbl{font-size:13px;color:#444;white-space:nowrap}
@@ -2856,10 +2877,13 @@ _SHARED_CSS = """
  .controls a.reset:hover{border-color:#9aa0a6;color:#202124}
  .controls a.reset:focus-visible{outline:2px solid #1a73e8;outline-offset:2px}
  .filter-summary{font-size:13px;color:#3c4043;background:#f1f3f4;border:1px solid #e0e0e0;border-radius:8px;padding:7px 12px;margin:8px 0 12px}
- @media (max-width:720px){.controls{padding:14px}.region-time{flex-direction:column;align-items:flex-start;gap:10px}.region-groups{flex-direction:column}.filter-group{flex:1 1 auto;min-width:0}.region-actions{flex-direction:column;align-items:flex-start;gap:12px}.action-buttons{width:100%;justify-content:space-between}.controls button[type=submit]{flex:1 1 auto}.controls a.reset{flex:1 1 auto;text-align:center}}
+ @media (max-width:720px){.controls{padding:14px}.queue-controls{grid-template-columns:1fr;gap:16px;padding:14px}.queue-data-area{padding:0 0 16px;border-right:0;border-bottom:1px solid #e7e9ed}.region-time{flex-direction:column;align-items:flex-start;gap:10px}.region-groups{flex-direction:column}.filter-group{flex:1 1 auto;min-width:0}.region-actions{flex-direction:column;align-items:flex-start;gap:12px}.action-buttons{width:100%;justify-content:space-between}.controls button[type=submit]{flex:1 1 auto}.controls a.reset{flex:1 1 auto;text-align:center}}
  .count{font-size:13px;color:#555;margin-bottom:8px}
  .tablewrap{overflow-x:auto;background:#fff;border:1px solid #ddd;border-radius:8px}
- table{border-collapse:collapse;width:100%;font-size:13px;min-width:960px}
+ table{border-collapse:collapse;width:100%;font-size:13px;min-width:1180px}
+ #queue-table th:nth-child(2),#queue-table td:nth-child(2){min-width:250px}
+ #queue-table th:nth-child(9),#queue-table td:nth-child(9){min-width:240px}
+ td.tags-cell{white-space:normal;overflow-wrap:anywhere;word-break:break-word;line-height:1.45}
  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #eee;vertical-align:top}
  th{background:#fafafa;font-size:12px;color:#666;white-space:nowrap}
  tr.rv-unreviewed{background:#fff}
@@ -2926,11 +2950,9 @@ QUEUE_HTML = """\
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Freshdesk Review Queue</title>
 <style>{{ shared_css|safe }}</style></head><body>
-{{ nav|safe }}
 <h1>Review Queue</h1>
-<div class=queue-status><span class=status-chip>● Live</span><span class="status-chip readonly">Read-only</span></div>
+<div class=queue-status><span class=status-chip>{{ '● Offline' if offline else '● Live' }}</span><span class="status-chip readonly">Read-only to Freshdesk</span></div>
 {% if offline %}<div class=sub><strong>OFFLINE MODE</strong> — Offline fixture data · no network access.</div>{% elif live_cache_missing %}<div class=sub>Live mode — no Freshdesk data retrieved yet.</div>{% endif %}
-{% if not offline and live_cache_missing %}<div class=live-meta>Refresh Tickets performs the initial 60-day baseline when no usable cursor exists. Reconcile Range is reserved for an explicit historical window.</div>{% endif %}
 
 {% if flash %}
 <div class="banner {{ 'ok' if flash[0] == 'ok' else 'err' }}" role=status>{{ flash[1] }}</div>
@@ -2938,36 +2960,33 @@ QUEUE_HTML = """\
 {% if error %}
 <div class="banner err" role=alert>{{ error }}</div>
 {% endif %}
-<section aria-labelledby=live-data-heading>
-<h2 id=live-data-heading>Live Data</h2>
-<form class="controls" method=post action=/queue/api/refresh novalidate id=queue-refresh-form>
+<section class="controls queue-controls" aria-label="Queue controls">
+<div class=queue-data-area>
+<h2 class=queue-card-heading>DATA</h2>
+<form class=refresh-controls method=post action=/queue/api/refresh novalidate id=queue-refresh-form>
   <input type=hidden name=csrf_token value="{{ csrf_token }}">
   <input type=hidden name=mode value="normal" id=refresh-mode>
-  <div class="panel-region region-time">
-    <div class="action-buttons"><button type=submit class=apply id=queue-refresh>Refresh Tickets</button></div>
-    <p class=field-hint>{% if live_cache_missing %}No usable cursor yet. The next normal Refresh will safely initialize from the last 60 days.{% else %}Checks Freshdesk incrementally for new or changed tickets since the last successful attempt start, with the automatic 120-second overlap.{% endif %}</p>
-  </div>
-  <div class="panel-region region-time reconcile-panel">
-    <strong>Reconcile Range</strong>
-    <p class=field-hint>Re-check a historical window and merge it into the existing cache. It does not replace your cache or local review history.</p>
-    <div class=preset-group role=group aria-label="Retrieval range">
-      {% for d in [7, 14, 30, 60, 90] %}<a {% if config.days == d %}class="preset preset-on active"{% else %}class=preset{% endif %} href="/queue?{{ preset_urls[d] }}"{% if config.days == d %} aria-current=page{% endif %}>{{ d }}d</a>{% endfor %}
-      <button type=button class="preset{% if config.days not in [7,14,30,60,90] %} active{% endif %}" id=custom-days-toggle{% if config.days not in [7,14,30,60,90] %} aria-current=page{% endif %} aria-pressed="{{ 'true' if config.days not in [7,14,30,60,90] else 'false' }}">Custom…</button>
-      <span class=custom-days id=custom-days-wrap{% if config.days in [7,14,30,60,90] %} hidden{% endif %}><label class=lbl for=custom-days>Days</label><input id=custom-days type=number name=days min={{ days_min }} max={{ days_max }} value="{{ config.days }}" aria-label="Custom days" step=1></span>
+  <div class="panel-region region-time"><div class="action-buttons"><button type=submit class=apply id=queue-refresh>Refresh Tickets</button><button type=button id=queue-cancel class=queue-cancel hidden>Cancel</button></div></div>
+   <p class=live-meta>Last refreshed {{ last_refresh_display }} · {{ cached_ticket_count }} tickets cached</p>
+   {% if live_cache_missing %}<p class=field-hint>No cache baseline yet; Refresh Tickets will initialize it.</p>{% endif %}
+   <details class=reconcile-details>
+    <summary>Reconcile history</summary>
+    <div class="panel-region region-time reconcile-panel">
+      <strong>Reconcile Range</strong>
+      <p class=field-hint>Re-check historical data and merge it into the existing cache; it does not replace your cache or local review history.</p>
+      <div class=preset-group role=group aria-label="Retrieval range">
+        {% for d in [7, 14, 30, 60, 90] %}<a {% if config.days == d %}class="preset preset-on active"{% else %}class=preset{% endif %} href="/queue?{{ preset_urls[d] }}"{% if config.days == d %} aria-current=page{% endif %}>{{ d }}d</a>{% endfor %}
+        <button type=button class="preset{% if config.days not in [7,14,30,60,90] %} active{% endif %}" id=custom-days-toggle{% if config.days not in [7,14,30,60,90] %} aria-current=page{% endif %} aria-pressed="{{ 'true' if config.days not in [7,14,30,60,90] else 'false' }}">Custom…</button>
+        <span class=custom-days id=custom-days-wrap{% if config.days in [7,14,30,60,90] %} hidden{% endif %}><label class=lbl for=custom-days>Days</label><input id=custom-days type=number name=days min={{ days_min }} max={{ days_max }} value="{{ config.days }}" aria-label="Custom days" step=1></span>
+      </div>
+      <div class=action-buttons><button type=button class=apply id=queue-reconcile>Reconcile Range</button></div>
     </div>
-    <div class=action-buttons><button type=button class=apply id=queue-reconcile>Reconcile Range</button></div>
-  </div>
-   <p class=live-meta>Last refreshed {{ last_refresh_display }} · mode {{ last_refresh_mode_display }} · cached tickets {{ cached_ticket_count }}</p>
-   <p class=field-hint>Local filters never retrieve Freshdesk data. Only Refresh Tickets or Reconcile Range retrieves data.</p>
- {% if live_cache_missing %}<p class=field-hint>Refresh Tickets uses the safe 60-day baseline when no usable cursor exists. Choose Days only when you intentionally use Reconcile Range.</p>{% endif %}
- </form>
-<div id=queue-refresh-status class=banner role=status aria-live=polite></div>
-<button type=button id=queue-cancel class=reset hidden>Cancel</button>
-</section>
-
-<section aria-labelledby=filter-cache-heading>
-<h2 id=filter-cache-heading>Filter Current Cache</h2>
-<form class="controls" method=get action=/queue novalidate id=queue-filter-form data-rendered-mode="{{ config.mode }}">
+   </details>
+</form>
+<div id=queue-refresh-status class=refresh-status role=status aria-live=polite></div>
+</div>
+<form class="controls queue-filter-controls" method=get action=/queue novalidate id=queue-filter-form data-rendered-mode="{{ config.mode }}">
+  <h2 class=queue-card-heading>REVIEW FILTERS</h2>
    <input type=hidden name=days value="{{ config.days }}">
    {% if config.mode == 'closed' and config.normal_return is defined %}{% for name, value in config.normal_return.items() %}<input type=hidden name="normal_{{ name }}" value="{{ '1' if value is sameas true else '0' if value is sameas false else value }}">{% endfor %}{% endif %}
    <div class="panel-region region-groups">
@@ -2996,6 +3015,8 @@ QUEUE_HTML = """\
     </div>
   </div>
 </form>
+<div class=queue-card-footer>Manual refresh only · Local filters never contact Freshdesk.</div>
+</section>
 <p class=filter-summary role=status>{{ active_summary }}</p>
 
 <nav class=workflow-tabs aria-label="Review workflow">
@@ -3051,7 +3072,7 @@ QUEUE_HTML = """\
   <td class=meta>{{ t.due_display | safe }}</td>
   <td class=meta>{{ t.updated_display }}</td>
   <td class=meta>{{ t.created_display }}</td>
-  <td>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<em style=color:#bbb>none</em>{% endif %}</td>
+  <td class=tags-cell>{% if t.tags %}{{ t.tags|join(', ') }}{% else %}<em style=color:#bbb>none</em>{% endif %}</td>
 </tr>
 {% endfor %}
 </table>
@@ -3306,6 +3327,10 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
       if (p.wait_seconds) { msg += ' · Waiting before next request…'; }
     }
     statusEl.textContent = msg;
+    statusEl.className = 'refresh-status';
+    if (s.state === 'succeeded') { statusEl.classList.add('success'); }
+    else if (s.state === 'failed') { statusEl.classList.add('error'); }
+    else if (s.state === 'warning') { statusEl.classList.add('warning'); }
     if (running) {
       pollTimer = window.setTimeout(poll, 1000);
     } else if (s.state === 'succeeded') {
@@ -3323,6 +3348,7 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
   }
   function poll() {
     fetch('/queue/api/refresh/status').then(function (r) { return r.json(); }).then(render).catch(function () {
+      statusEl.className = 'refresh-status error';
       statusEl.textContent = 'Unable to read refresh status.';
     });
   }
@@ -3335,11 +3361,12 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
       var daysEl = form.querySelector('input[name=days]');
       var customEl = document.getElementById('custom-days');
       var body = encode({ csrf_token: csrf ? csrf.value : '', mode: mode, days: mode === 'reconcile' ? ((customEl || daysEl) ? (customEl || daysEl).value : '60') : '60' });
+     statusEl.className = 'refresh-status';
      statusEl.textContent = 'Starting refresh…';
      if (refreshBtn) { refreshBtn.disabled = true; }
      fetch('/queue/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
        .then(function (r) { return r.json(); }).then(function (s) { render(s); if (s.state === 'running') { poll(); } })
-       .catch(function () { statusEl.textContent = 'Refresh could not be started.'; if (refreshBtn) { refreshBtn.disabled = false; } });
+       .catch(function () { statusEl.className = 'refresh-status error'; statusEl.textContent = 'Refresh could not be started.'; if (refreshBtn) { refreshBtn.disabled = false; } });
    }
    form.addEventListener('submit', function (e) {
       e.preventDefault();

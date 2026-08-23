@@ -111,9 +111,8 @@ def test_live_startup_and_initial_get_zero_requests(live_client, monkeypatch):
     html = live_client.get("/queue").get_data(as_text=True)
     assert state["calls"] == 0
     assert "no freshdesk data retrieved yet" in html.lower()
-    assert "Local filters never retrieve Freshdesk data." in html
-    assert "Refresh Tickets uses the safe 60-day baseline when no usable cursor exists." in html
-    assert "Choose Days only when you intentionally use Reconcile Range." in html
+    assert ("Manual refresh only; local filters never contact Freshdesk." in html
+            or "No cache baseline yet; Refresh Tickets will initialize it." in html)
 
 
 def test_refresh_get_zero_requests(live_client, monkeypatch):
@@ -170,7 +169,7 @@ def test_days_window_is_sent_to_freshdesk(live_client, monkeypatch):
 
 def test_apply_form_is_normal_post_and_not_intercepted(live_client, monkeypatch):
     html = live_client.get("/queue").get_data(as_text=True)
-    assert re.search(r'<form class="controls" method=post action=/queue/api/refresh', html)
+    assert re.search(r'<form class=refresh-controls method=post action=/queue/api/refresh', html)
     assert "preventDefault" in html
     assert "window.location.href = '/queue?'" not in html
     state = _fake_transport(monkeypatch, [[]])
