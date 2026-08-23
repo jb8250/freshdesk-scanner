@@ -799,6 +799,39 @@ def conversation_classification(conversation):
     return "ambiguous"
 
 
+def _is_freshdesk_id(value):
+    """Return true only for an unambiguous Freshdesk integer ID."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def conversation_is_own_private_note(conversation, current_agent_id):
+    """Whether an activity is proven to be the current agent's private note."""
+    return (
+        conversation_classification(conversation) == "private"
+        and _is_freshdesk_id(current_agent_id)
+        and _is_freshdesk_id(conversation.get("user_id"))
+        and conversation["user_id"] == current_agent_id
+    )
+
+
+def fetch_current_agent_id(api_key):
+    """Resolve the current Freshdesk agent once; ambiguity fails closed."""
+    try:
+        response = requests.get(
+            f"https://{FRESHDESK_DOMAIN}/api/v2/agents/me",
+            auth=(api_key, "X"), timeout=30,
+        )
+        if not 200 <= response.status_code < 300:
+            return None
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    agent_id = payload.get("id")
+    return agent_id if _is_freshdesk_id(agent_id) else None
+
+
 def conversation_activity_timestamp(conversation):
     """Return max(valid created_at, updated_at), or None for malformed data."""
     if not isinstance(conversation, dict):
@@ -1339,7 +1372,8 @@ def _advance_review_snapshot(ticket_id, updated_at, backup=True):
 
 
 def _reconcile_queue_refresh(old_blob, incoming_tickets, progress_callback=None,
-                              cancel_callback=None, attempt_started_at=None):
+                               cancel_callback=None, attempt_started_at=None,
+                               current_agent_id_fetcher=None):
     """Merge, analyze effective changes, retain, then defer review snapshots.
 
     Retention reads local review state only.  Its retained ticket list is the
@@ -1355,6 +1389,7 @@ def _reconcile_queue_refresh(old_blob, incoming_tickets, progress_callback=None,
     _, finalize_after_save = _prepare_conversation_review_updates(
         effective_changes, old_blob, progress_callback=progress_callback,
         cancel_callback=cancel_callback,
+        current_agent_id_fetcher=current_agent_id_fetcher,
     )
     # Load once, read-only, after conversation preparation. The pure engine
     # validates the complete merged cache and canonical state mapping before it
@@ -1381,7 +1416,8 @@ def _reconcile_queue_refresh(old_blob, incoming_tickets, progress_callback=None,
 
 
 def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=None,
-                                          cancel_callback=None):
+                                           cancel_callback=None,
+                                           current_agent_id_fetcher=None):
     """Classify narrow reviewed/newer candidates before cache commit."""
     old_tickets = (old_blob or {}).get("tickets") if isinstance(old_blob, dict) else None
     old_by_id = {t.get("id"): t for t in old_tickets or [] if isinstance(t, dict)}
@@ -1396,6 +1432,8 @@ def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=No
                 candidates.append(ticket)
     updates = {}
     inconclusive = 0
+    identity_resolved = False
+    current_agent_id = None
     for index, ticket in enumerate(candidates, 1):
         if cancel_callback and cancel_callback():
             break
@@ -1420,10 +1458,22 @@ def _prepare_conversation_review_updates(tickets, old_blob, progress_callback=No
             continue
         review_at = parse_dt(state["reviewed_updated_at"])
         ticket_at = parse_dt(ticket.get("updated_at"))
-        post = [(conversation, conversation_activity_timestamp(conversation))
-                for conversation in conversations
-                if conversation_activity_timestamp(conversation) > review_at]
-        if not post or any(conversation_classification(c) != "private" for c, _ in post):
+        post = [
+            (conversation, activity_at)
+            for conversation in conversations
+            for activity_at in [conversation_activity_timestamp(conversation)]
+            if activity_at is not None and activity_at > review_at
+        ]
+        if not post:
+            inconclusive += 1
+            continue
+        if not identity_resolved:
+            identity_resolved = True
+            try:
+                current_agent_id = current_agent_id_fetcher() if current_agent_id_fetcher else None
+            except Exception:
+                current_agent_id = None
+        if any(not conversation_is_own_private_note(c, current_agent_id) for c, _ in post):
             inconclusive += 1
             continue
         latest = max(value for _, value in post)
@@ -2654,6 +2704,7 @@ def queue_refresh_start():
                         attempt_started_at=None: _reconcile_queue_refresh(
             old_blob, incoming_tickets, progress_callback=progress_callback,
             cancel_callback=cancel_callback, attempt_started_at=attempt_started_at,
+            current_agent_id_fetcher=lambda: fetch_current_agent_id(api_key),
         ),
         plan=lambda requested_days, job_attempt_started_at, requested_mode="normal": queue_refresh_plan(
             old_blob, requested_days, job_attempt_started_at, requested_mode),
