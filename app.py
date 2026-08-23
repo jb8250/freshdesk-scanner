@@ -541,16 +541,37 @@ def filters_from_args(args, submitted=False):
     }
     workflow_tab = _last_value(args, "workflow_tab")
     cfg["workflow_tab"] = parse_workflow_tab(workflow_tab) if workflow_tab is not None else DEFAULT_FILTERS["workflow_tab"]
+    # Closed mode carries the immediately preceding Normal Review workspace in
+    # private URL parameters. Keep it absent for a direct Closed entry: there
+    # is no saved Normal workspace to synthesize in that case.
+    if mode == "closed" and any(_last_value(args, f"normal_{name}") is not None for name in NORMAL_RETURN_FIELDS):
+        cfg["normal_return"] = normal_return_from_args(args)
     return cfg
 
 
+NORMAL_RETURN_FIELDS = (
+    "photo_video_only", "hide_reviewed_tags", "missing_tags", "days",
+    "review_view", "workflow_tab",
+)
+
+
+def normal_return_from_args(args):
+    """Canonicalize the private Normal workspace preserved in Closed URLs."""
+    return {
+        "photo_video_only": parse_bool(_last_value(args, "normal_photo_video_only"), DEFAULT_FILTERS["photo_video_only"]),
+        "hide_reviewed_tags": parse_bool(_last_value(args, "normal_hide_reviewed_tags"), DEFAULT_FILTERS["hide_reviewed_tags"]),
+        "missing_tags": parse_bool(_last_value(args, "normal_missing_tags"), DEFAULT_FILTERS["missing_tags"]),
+        "days": parse_days(_last_value(args, "normal_days")),
+        "review_view": parse_review_view(_last_value(args, "normal_review_view")),
+        "workflow_tab": parse_workflow_tab(_last_value(args, "normal_workflow_tab")),
+    }
+
 
 def filter_query_string(config):
-    """Canonical query string for a filter config (review scope + manual filters
-    + review_view). Used by the form action, preset links, and redirects so
-    every URL-backed state can be reproduced exactly."""
-    return urlencode({
-        "mode": parse_queue_mode(config.get("mode")),
+    """Canonical queue query string, retaining Normal return state only in Closed mode."""
+    mode = parse_queue_mode(config.get("mode"))
+    params = {
+        "mode": mode,
         "photo_video_only": "1" if config.get("photo_video_only", True) else "0",
         "hide_reviewed_tags": "1" if config.get("hide_reviewed_tags", True) else "0",
         "overdue": "1" if config.get("overdue") else "0",
@@ -560,7 +581,20 @@ def filter_query_string(config):
         "days": str(config.get("days", DAYS_DEFAULT)),
         "review_view": config.get("review_view", "all"),
         "workflow_tab": parse_workflow_tab(config.get("workflow_tab", "main")),
-    })
+    }
+    normal_return = config.get("normal_return")
+    if mode == "closed" and isinstance(normal_return, dict):
+        for name in NORMAL_RETURN_FIELDS:
+            value = normal_return.get(name)
+            if name in ("photo_video_only", "hide_reviewed_tags", "missing_tags"):
+                params[f"normal_{name}"] = "1" if value else "0"
+            elif name == "days":
+                params[f"normal_{name}"] = str(parse_days(value))
+            elif name == "review_view":
+                params[f"normal_{name}"] = parse_review_view(value)
+            else:
+                params[f"normal_{name}"] = parse_workflow_tab(value)
+    return urlencode(params)
 
 
 _VIEW_LABEL = {"active": "Active", "completed": "Completed", "all": "All"}
@@ -2933,9 +2967,10 @@ QUEUE_HTML = """\
 
 <section aria-labelledby=filter-cache-heading>
 <h2 id=filter-cache-heading>Filter Current Cache</h2>
-<form class="controls" method=get action=/queue novalidate id=queue-filter-form>
-  <input type=hidden name=days value="{{ config.days }}">
-  <div class="panel-region region-groups">
+<form class="controls" method=get action=/queue novalidate id=queue-filter-form data-rendered-mode="{{ config.mode }}">
+   <input type=hidden name=days value="{{ config.days }}">
+   {% if config.mode == 'closed' and config.normal_return is defined %}{% for name, value in config.normal_return.items() %}<input type=hidden name="normal_{{ name }}" value="{{ '1' if value is sameas true else '0' if value is sameas false else value }}">{% endfor %}{% endif %}
+   <div class="panel-region region-groups">
     <fieldset class="filter-group scope-group">
       <legend class=group-lbl>Review Mode</legend>
       <div class=field><label for=queue-mode>Mode</label><select id=queue-mode name=mode><option value=normal {{ 'selected' if config.mode == 'normal' }}>Normal Review</option><option value=closed {{ 'selected' if config.mode == 'closed' }}>Closed Ticket Housekeeping</option></select></div>
@@ -2996,6 +3031,8 @@ QUEUE_HTML = """\
     <form class=rvform method=post action=/queue/api/review>
       <input type=hidden name=csrf_token value="{{ csrf_token }}">
       <input type=hidden name=ticket_id value="{{ t.id }}">
+      <input type=hidden name=mode value="{{ config.mode }}">
+      {% if config.mode == 'closed' and config.normal_return is defined %}{% for name, value in config.normal_return.items() %}<input type=hidden name="normal_{{ name }}" value="{{ '1' if value is sameas true else '0' if value is sameas false else value }}">{% endfor %}{% endif %}
       <input type=hidden name=photo_video_only value="{{ '1' if config.photo_video_only else '0' }}">
       <input type=hidden name=hide_reviewed_tags value="{{ '1' if config.hide_reviewed_tags else '0' }}">
       <input type=hidden name=overdue value="{{ '1' if config.overdue else '0' }}">
@@ -3177,8 +3214,41 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
   // Hidden 0 values paired with the checkboxes make this a native, bookmarkable
   // GET form: checked controls submit the later 1 value, unchecked controls
   // submit only 0. No retrieval route is involved.
+  // The mode selector represents two independent, URL-backed local workspaces.
+  // A native submission after changing it would submit the outgoing mode's
+  // hidden checkbox values (notably normal-mode missing_tags=0), accidentally
+  // overriding Closed Housekeeping defaults.  Intercept only an actual mode
+  // transition: save normal state under private return keys on entry to Closed,
+  // and reconstruct the normal URL when returning.  Ordinary Apply submissions
+  // remain native GET requests.
+  var renderedMode = form.getAttribute('data-rendered-mode') || 'normal';
+  var modeEl = form.querySelector('select[name="mode"]');
+  var normalKeys = ['photo_video_only', 'hide_reviewed_tags', 'missing_tags', 'days', 'review_view', 'workflow_tab'];
+  function currentValue(name, fallback) {
+    var checked = form.querySelector('input[type=checkbox][name="' + name + '"]');
+    if (checked) { return checked.checked ? '1' : '0'; }
+    var input = form.querySelector('[name="' + name + '"]');
+    return input ? input.value : fallback;
+  }
+  function normalReturnValue(q, name) {
+    return q.get('normal_' + name) || (name === 'photo_video_only' || name === 'hide_reviewed_tags' ? '1' : name === 'days' ? '60' : name === 'workflow_tab' ? 'main' : 'all');
+  }
   form.addEventListener('submit', function (e) {
-    // Native GET submission to /queue.
+    var targetMode = modeEl ? modeEl.value : renderedMode;
+    if (targetMode === renderedMode) { return; }
+    e.preventDefault();
+    var q = new URLSearchParams(window.location.search);
+    q.set('mode', targetMode);
+    if (renderedMode === 'normal' && targetMode === 'closed') {
+      normalKeys.forEach(function (name) { q.set('normal_' + name, currentValue(name, name === 'workflow_tab' ? 'main' : name === 'review_view' ? 'all' : '0')); });
+      // Absent is significant on Closed entry: the server supplies its ON
+      // defaults, while later explicit Closed form choices remain 0/1.
+      ['photo_video_only', 'hide_reviewed_tags', 'missing_tags'].forEach(function (name) { q.delete(name); });
+    } else if (renderedMode === 'closed' && targetMode === 'normal') {
+      normalKeys.forEach(function (name) { q.set(name, normalReturnValue(q, name)); q.delete('normal_' + name); });
+    }
+    q.delete('page');
+    window.location.assign('/queue?' + q.toString());
   });
   function syncControlsFromURL() {
     var q = new URLSearchParams(window.location.search);
