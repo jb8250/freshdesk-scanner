@@ -151,7 +151,9 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # LIVE queue cache — written ONLY after an explicit successful queue refresh
 # retrieval. GET /queue reads only this file (and never the fixtures file),
 # so offline data can never satisfy a live cache read and vice versa.
-LIVE_QUEUE_CACHE_FILE = os.path.join(CACHE_DIR, "queue_live_tickets.json")
+LIVE_QUEUE_CACHE_FILE = os.path.abspath(os.environ.get(
+    "QUEUE_CACHE_PATH", os.path.join(CACHE_DIR, "queue_live_tickets.json")
+))
 # Historical queue cache name kept for backward compatibility of read paths;
 # the live retrieval writes to LIVE_QUEUE_CACHE_FILE.
 CACHE_FILE = LIVE_QUEUE_CACHE_FILE
