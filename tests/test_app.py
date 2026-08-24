@@ -820,7 +820,7 @@ def test_live_pagination_empty_page_stops(monkeypatch):
 
 def test_offline_missing_fixture_fails_closed(monkeypatch):
     monkeypatch.setattr(app, "FIXTURES_FILE", "/tmp/does_not_exist_fd_fixtures.json")
-    with pytest.raises(OfflineDataError, match="fixture file not found"):
+    with pytest.raises(app.OfflineDataError, match="fixture file not found"):
         list(offline_paginate_tickets())
 
 
@@ -828,7 +828,7 @@ def test_offline_malformed_fixture_fails_closed(monkeypatch, tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{ this is not json")
     monkeypatch.setattr(app, "FIXTURES_FILE", str(bad))
-    with pytest.raises(OfflineDataError, match="malformed JSON"):
+    with pytest.raises(app.OfflineDataError, match="malformed JSON"):
         list(offline_paginate_tickets())
 
 
@@ -837,7 +837,7 @@ def test_offline_wrong_shape_fails_closed(monkeypatch, tmp_path):
         f = tmp_path / "shape.json"
         f.write_text(json.dumps(shape))
         monkeypatch.setattr(app, "FIXTURES_FILE", str(f))
-        with pytest.raises(OfflineDataError):
+        with pytest.raises(app.OfflineDataError):
             list(offline_paginate_tickets())
 
 
@@ -1877,9 +1877,9 @@ def test_click_highlight_css_has_visible_marker(client):
     # Spec §7: pale yellow row background + a visible left-edge marker +
     # a distinct OPENED / IN REVIEW badge, with readable text contrast.
     html = client.get("/queue").get_data(as_text=True)
-    assert "tr.rv-opened{background:#fff8e1}" in html
-    assert "tr.rv-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}" in html
-    assert ".b-review.rv-opened{background:#fff8e1;border-color:#f9a825;color:#5d4037}" in html
+    assert "tr.rv-opened{background:rgba(217,164,65,.10)}" in html
+    assert "tr.rv-opened td:first-child{box-shadow:inset 3px 0 0 var(--fd-warning)}" in html
+    assert ".b-review.rv-opened{background:rgba(217,164,65,.18);border-color:var(--fd-warning);color:#F0CC7D}" in html
 
 
 def test_opened_badge_renders_uppercase_and_highlighted(client):
@@ -2246,7 +2246,7 @@ def test_opened_and_last_opened_displayed_together(client):
 def test_followup_class_is_distinct_from_last_opened(client):
     html = client.get("/queue").get_data(as_text=True)
     # two separate CSS rules, distinct purple focus styling (spec section 4).
-    assert "tr.rv-followup{background:#fff3e0}" in html
+    assert "tr.rv-followup{background:rgba(217,164,65,.08)}" in html
     assert "tr.rv-last-opened{outline:3px solid var(--fd-last-opened)" in html
 
 
@@ -2453,7 +2453,7 @@ def test_js_toggles_jump_and_hidden_message_on_move(client):
 
 def test_last_opened_css_distinct_purple(client):
     html = client.get("/queue").get_data(as_text=True)
-    assert "--fd-last-opened:#6A1B9A" in html
+    assert "--fd-last-opened:#8B5CF6" in html
     assert "--fd-last-opened-text:#FFFFFF" in html
     assert "tr.rv-last-opened{outline:3px solid var(--fd-last-opened)" in html
     assert "tr.rv-last-opened td:first-child{box-shadow:inset 4px 0 0 var(--fd-last-opened)}" in html
@@ -2482,22 +2482,22 @@ def test_marker_row_keeps_semantic_row_anchor(client):
 
 def test_customer_responded_badge_uses_royal_blue_and_white_text(client):
     html = client.get("/queue").get_data(as_text=True)
-    assert "--fd-customer-responded:#09218D" in html
-    assert "--fd-customer-responded-text:#FFFFFF" in html
+    assert "--fd-customer-responded:#264CC2" in html
+    assert "--fd-customer-responded-text:#F6F7F8" in html
     assert ".b-responded{background:var(--fd-customer-responded);color:var(--fd-customer-responded-text)}" in html
 
 
 def test_waiting_on_customer_badge_uses_gold_and_dark_text(client):
     html = client.get("/queue").get_data(as_text=True)
-    assert "--fd-waiting-customer:#E9AE3D" in html
-    assert "--fd-waiting-customer-text:#1A1A1A" in html
+    assert "--fd-waiting-customer:#D9A441" in html
+    assert "--fd-waiting-customer-text:#17130A" in html
     assert ".b-waiting{background:var(--fd-waiting-customer);color:var(--fd-waiting-customer-text)}" in html
 
 
 def test_last_opened_badge_treatment_differs_from_customer_responded(client):
     # The LAST OPENED focus must NOT reuse the royal-blue #09218D treatment.
     html = client.get("/queue").get_data(as_text=True)
-    assert "--fd-last-opened:#6A1B9A" in html
+    assert "--fd-last-opened:#8B5CF6" in html
     assert ".b-responded{background:var(--fd-customer-responded)" in html
     assert ".b-last-opened{background:var(--fd-last-opened)" in html
     assert "--fd-last-opened:#6A1B9A" != "--fd-customer-responded:#09218D"

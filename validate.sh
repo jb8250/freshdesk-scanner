@@ -112,7 +112,7 @@ assert "preventDefault" not in ticket_part
 assert "preventDefault" in filter_part
 # Visible highlight marker + OPENED / IN REVIEW badge + save-failure toast
 # (spec sections 6-7).
-assert "tr.rv-opened td:first-child{box-shadow:inset 4px 0 0 #f9a825}" in html
+assert "tr.rv-opened td:first-child{box-shadow:inset 3px 0 0 var(--fd-warning)}" in html
 assert "OPENED / IN REVIEW" in html
 assert "showError" in html
 print("click-highlight markup, CSS marker, and JS wiring present")
@@ -183,11 +183,11 @@ import app
 # LAST OPENED kept distinct (purple), review highlight untouched.
 r = app.app.test_client().get("/queue")
 html = r.get_data(as_text=True)
-assert "--fd-customer-responded:#09218D" in html
-assert "--fd-customer-responded-text:#FFFFFF" in html
-assert "--fd-waiting-customer:#E9AE3D" in html
-assert "--fd-waiting-customer-text:#1A1A1A" in html
-assert "--fd-last-opened:#6A1B9A" in html
+assert "--fd-customer-responded:#264CC2" in html
+assert "--fd-customer-responded-text:#F6F7F8" in html
+assert "--fd-waiting-customer:#D9A441" in html
+assert "--fd-waiting-customer-text:#17130A" in html
+assert "--fd-last-opened:#8B5CF6" in html
 assert ".b-responded{background:var(--fd-customer-responded);color:var(--fd-customer-responded-text)}" in html
 assert ".b-waiting{background:var(--fd-waiting-customer);color:var(--fd-waiting-customer-text)}" in html
 assert ">CUSTOMER RESPONDED" in html
@@ -269,7 +269,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "badge b-review" in html and "badge b-last-opened" in html
     assert "closed-tags" not in html, "Prompt-13 under-Subject tags line must be gone"
     assert "<td>Closed</td>" in html, "Status column must spell Closed"
-    assert "2026-08-04 09:00" in html, "Closed column must show compact, non-ISO date"
+    assert "2026-08-04 08:00" in html, "Closed column must show compact, non-ISO date"
     assert '<em style=color:#bbb>none</em>' in html, "queue-style no-tags token required"
     assert re.search(r'name=review_view', html)
     assert re.search(r'name=review_result', html)
@@ -581,8 +581,10 @@ assert ".top-nav" in app._SHARED_CSS and "gap:" in app._SHARED_CSS
 
 # 2. Shared theme on both pages (single app stylesheet, queue design tokens).
 for html in (queue, closed):
-    assert "background:#f5f5f5" in html and "max-width:1440px" in html
-    assert "#1a73e8" in html          # queue accent
+    assert "background:var(--fd-bg-page)" in html and "max-width:1440px" in html
+    assert "--fd-bg-page:#676C74" in html and "--fd-bg-shell:#101213" in html
+    assert "class=dashboard-shell" in html
+    assert "--fd-accent:#E67E22" in html          # gray-canvas orange primary accent token
     assert "#1f5faa" not in html      # legacy closed accent absent
     assert "#f6f8fa" not in html      # legacy closed bg absent
     assert "@media (max-width:720px)" in html  # responsive CSS shared
@@ -776,7 +778,7 @@ for html, name in ((q, "queue"), (c, "closed")):
 
 # 5. Closed dates render in the Closed column as compact queue-style dates
 #    (never raw ISO), and both tables place the review select identically.
-assert re.search(r"<td class=meta>2026-08-04 09:00</td>", c), "compact Closed date missing"
+assert re.search(r"<td class=meta>2026-08-04 08:00</td>", c), "compact Closed date missing"
 assert "T09:00:00Z" not in c and "T10:00:00Z" not in c, "raw ISO leaked"
 assert q.count("form class=rvform") > 0 and c.count("form class=rvform") > 0
 

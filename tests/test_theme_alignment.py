@@ -27,8 +27,11 @@ def test_both_pages_share_the_same_theme_css(client, path, monkeypatch):
     html = _html(client, path)
     # The body background / content width / font come from the shared stylesheet
     # (the /queue theme), not a per-page fork.
-    assert "body{font-family:system-ui" in html
-    assert "background:#f5f5f5" in html
+    assert "body{font-family:Inter" in html
+    assert "background:var(--fd-bg-page)" in html
+    assert "--fd-bg-page:#676C74" in html
+    assert "--fd-bg-shell:#101213" in html
+    assert "class=dashboard-shell" in html
     assert "max-width:1440px" in html
     assert ".controls{" in html
     assert ".preset{" in html
@@ -111,8 +114,8 @@ def test_closed_uses_queue_compatible_theme_not_legacy(client, monkeypatch):
     # Legacy /closed accent + background must be gone in favor of the queue theme.
     assert "#1f5faa" not in cl
     assert "#f6f8fa" not in cl
-    assert "#1a73e8" in cl          # queue accent used for presets/buttons/nav
-    assert "background:#f5f5f5" in cl
+    assert "--fd-accent:#E67E22" in cl          # gray-canvas orange primary accent token
+    assert "background:var(--fd-bg-page)" in cl
     # Offline banner now uses the shared .banner style; summary uses .filter-summary.
     assert 'class="banner"' in cl
     assert "filter-summary" in cl
