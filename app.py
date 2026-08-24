@@ -23,15 +23,17 @@ Data sources (strictly isolated):
           no network, no API key.
 
 Network discipline (mandatory):
-  * GET /queue and GET /closed are RENDER ONLY. They must NEVER trigger a
-    Freshdesk request — not at startup, not on browser reload, not for a
-    missing or stale cache, and not on any timer. Freshness/TTL is shown
-    as information only; the user must click Refresh Tickets to re-fetch.
-  * Queue Freshdesk retrieval happens ONLY after the explicit, CSRF-protected
-    POST /queue/api/refresh starts one finite worker. Closed retrieval remains
-    POST /closed/api/refresh.
-    A bounded pagination/rate-limit sequence within that single manual
-    retrieval is permitted.
+   * GET /queue and GET /closed are RENDER ONLY. They must NEVER trigger a
+     Freshdesk request — not on browser reload or for a missing/stale cache.
+     Freshness/TTL is shown as information only; the LIVE scheduler performs
+     its separate normal refresh only after its 30-minute deadline.
+
+   * Queue Freshdesk retrieval happens through the normal finite worker after
+     an explicit, CSRF-protected POST /queue/api/refresh or the LIVE process's
+     30-minute automatic scheduler. Closed retrieval remains POST
+     /closed/api/refresh. A bounded pagination/rate-limit sequence within one
+     refresh is permitted.
+
   * Freshdesk is GET-only for data: no POST/PUT/PATCH/DELETE to the API.
 
 Cache isolation:
@@ -84,6 +86,7 @@ import review_backups
 # closed_retriever lazily, so there is no import cycle.
 import closed_live
 import queue_live
+from auto_refresh import AUTO_REFRESH_INTERVAL_SECONDS, AutoRefreshScheduler
 from queue_merge import merge_queue_tickets
 from queue_retention import apply_queue_retention
 
@@ -191,6 +194,54 @@ REVIEWED_EXCLUSION_TAGS = frozenset({
 class OfflineDataError(Exception):
     """Raised when offline mode cannot load valid fixture data. The app must
     fail closed on this — never fall back to the live API."""
+
+
+_auto_refresh_scheduler = None
+_auto_refresh_scheduler_lock = threading.Lock()
+
+
+def _automatic_queue_refresh():
+    """Start the normal queue refresh when the monotonic scheduler is due."""
+    if is_offline():
+        return "offline"
+    if queue_live.JOB.status()["running"]:
+        return "skipped_busy"
+    started, message = _start_normal_queue_refresh()
+    if started:
+        return "started"
+    return "skipped_busy" if queue_live.JOB.status()["running"] else "failed"
+
+
+def start_auto_refresh_scheduler():
+    """Start the one live-process automatic-refresh scheduler, if needed."""
+    global _auto_refresh_scheduler
+    if is_offline():
+        return False
+    with _auto_refresh_scheduler_lock:
+        if _auto_refresh_scheduler is None:
+            _auto_refresh_scheduler = AutoRefreshScheduler(_automatic_queue_refresh)
+        return _auto_refresh_scheduler.start()
+
+
+def initialize_live_auto_refresh():
+    """Production startup hook; safe for direct-app launch and testable without Flask CLI."""
+    return False if is_offline() else start_auto_refresh_scheduler()
+
+
+def reset_auto_refresh_countdown():
+    """Rearm an already-running live scheduler after an accepted user job."""
+    scheduler = _auto_refresh_scheduler
+    if scheduler is not None and not is_offline():
+        scheduler.reset()
+
+
+def auto_refresh_status():
+    """Return local scheduler metadata only; never load credentials or data."""
+    scheduler = _auto_refresh_scheduler
+    if is_offline() or scheduler is None:
+        return {"enabled": False, "interval_seconds": AUTO_REFRESH_INTERVAL_SECONDS,
+                "seconds_until_next": None, "last_attempt_at": None, "last_result": None}
+    return scheduler.status()
 
 
 def load_api_key() -> str:
@@ -2635,6 +2686,11 @@ def queue():
         last_opened_rendered=any(r["last_opened"] for r in rows),
         live_cache_missing=(None is cache_age and not offline and len(raw) == 0),
         cached_days=cached_days, cached_ticket_count=len(raw),
+        last_refresh_display=_last_refresh_display(cache_age, offline),
+        last_refresh_mode_display=((blob or {}).get("last_refresh_mode") or "No baseline").replace("baseline", "Baseline").replace("incremental", "Incremental").replace("reconcile", "Reconcile"),
+        cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
+        cache_coverage_warning=(cached_days is None or (isinstance(cached_days, int) and config["days"] > cached_days)),
+        auto_refresh=auto_refresh_status(),
     )
 
     # Default state: Review Scope controls are ON (photo/video subjects only +
@@ -2737,9 +2793,11 @@ def queue():
          cached_ticket_count=len(raw),
          last_refresh_mode_display=((blob or {}).get("last_refresh_mode") or "No baseline").replace("baseline", "Baseline").replace("incremental", "Incremental").replace("reconcile", "Reconcile"),
          last_refresh_display=_last_refresh_display(cache_age, offline),
-         cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
-         cache_coverage_warning=(cached_days is None or (isinstance(cached_days, int) and config["days"] > cached_days)),
-    )
+          cache_coverage_display=_cache_coverage_display(cached_days, config["days"]),
+          cache_coverage_warning=(cached_days is None or (isinstance(cached_days, int) and config["days"] > cached_days)),
+          auto_refresh=auto_refresh_status(),
+     )
+
 
 
 @app.route("/queue/export.xlsx")
@@ -2787,6 +2845,34 @@ def queue_export_xlsx():
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+def _start_normal_queue_refresh():
+    """Start the existing normal incremental refresh path for a user or scheduler."""
+    try:
+        api_key = load_api_key()
+    except Exception:
+        api_key = ""
+    if not api_key:
+        return False, "No Freshdesk API key is available."
+    old_blob = load_live_queue_cache()
+    attempt_started_at = now_utc().astimezone(timezone.utc).replace(microsecond=0)
+    if old_blob is None and os.path.exists(LIVE_QUEUE_CACHE_FILE):
+        return False, "Existing queue cache is malformed; refresh was not started."
+    return queue_live.JOB.start(
+        days=DAYS_DEFAULT, api_key=api_key,
+        retrieve=fetch_live_queue,
+        save=save_live_queue_cache,
+        finalize=lambda incoming_tickets, progress_callback=None, cancel_callback=None,
+                        attempt_started_at=None: _reconcile_queue_refresh(
+            old_blob, incoming_tickets, progress_callback=progress_callback,
+            cancel_callback=cancel_callback, attempt_started_at=attempt_started_at,
+            current_agent_id_fetcher=lambda: fetch_current_agent_id(api_key),
+        ),
+        plan=lambda requested_days, job_attempt_started_at: queue_refresh_plan(
+            old_blob, requested_days, job_attempt_started_at),
+        attempt_started_at=attempt_started_at, mode="normal",
+    )
+
+
 @app.route("/queue/api/refresh", methods=["POST"])
 def queue_refresh_start():
     """Start one finite normal or explicit reconcile refresh."""
@@ -2804,31 +2890,35 @@ def queue_refresh_start():
         return jsonify({"ok": False, "message": "Invalid security token."}), 403
     if is_offline():
         return jsonify({"ok": False, "message": "Offline mode: live refresh is disabled."}), 409
-    try:
-        api_key = load_api_key()
-    except Exception:
-        api_key = ""
-    if not api_key:
-        return jsonify({"ok": False, "message": "No Freshdesk API key is available."}), 503
-    old_blob = load_live_queue_cache()
-    # Capture this attempt's start before the job can issue its first request.
-    attempt_started_at = now_utc().astimezone(timezone.utc).replace(microsecond=0)
-    if old_blob is None and os.path.exists(LIVE_QUEUE_CACHE_FILE):
-        return jsonify({"ok": False, "message": "Existing queue cache is malformed; refresh was not started."}), 409
-    started, message = queue_live.JOB.start(
-        days=days, api_key=api_key,
-        retrieve=fetch_live_queue,
-        save=save_live_queue_cache,
-        finalize=lambda incoming_tickets, progress_callback=None, cancel_callback=None,
-                        attempt_started_at=None: _reconcile_queue_refresh(
-            old_blob, incoming_tickets, progress_callback=progress_callback,
-            cancel_callback=cancel_callback, attempt_started_at=attempt_started_at,
-            current_agent_id_fetcher=lambda: fetch_current_agent_id(api_key),
-        ),
-        plan=lambda requested_days, job_attempt_started_at, requested_mode="normal": queue_refresh_plan(
-            old_blob, requested_days, job_attempt_started_at, requested_mode),
-        attempt_started_at=attempt_started_at, mode=mode,
-    )
+    if mode == "normal":
+        started, message = _start_normal_queue_refresh()
+    else:
+        try:
+            api_key = load_api_key()
+        except Exception:
+            api_key = ""
+        if not api_key:
+            return jsonify({"ok": False, "message": "No Freshdesk API key is available."}), 503
+        old_blob = load_live_queue_cache()
+        attempt_started_at = now_utc().astimezone(timezone.utc).replace(microsecond=0)
+        if old_blob is None and os.path.exists(LIVE_QUEUE_CACHE_FILE):
+            return jsonify({"ok": False, "message": "Existing queue cache is malformed; refresh was not started."}), 409
+        started, message = queue_live.JOB.start(
+            days=days, api_key=api_key,
+            retrieve=fetch_live_queue,
+            save=save_live_queue_cache,
+            finalize=lambda incoming_tickets, progress_callback=None, cancel_callback=None,
+                            attempt_started_at=None: _reconcile_queue_refresh(
+                old_blob, incoming_tickets, progress_callback=progress_callback,
+                cancel_callback=cancel_callback, attempt_started_at=attempt_started_at,
+                current_agent_id_fetcher=lambda: fetch_current_agent_id(api_key),
+            ),
+            plan=lambda requested_days, job_attempt_started_at, requested_mode="normal": queue_refresh_plan(
+                old_blob, requested_days, job_attempt_started_at, requested_mode),
+            attempt_started_at=attempt_started_at, mode=mode,
+        )
+    if started:
+        reset_auto_refresh_countdown()
     status = queue_live.JOB.status()
     status.update({"ok": started, "message": message})
     return jsonify(status), (202 if started else 409)
@@ -2836,8 +2926,10 @@ def queue_refresh_start():
 
 @app.route("/queue/api/refresh/status")
 def queue_refresh_status():
-    """Return local in-memory queue refresh state only."""
-    return jsonify(queue_live.JOB.status())
+    """Return local in-memory queue refresh and auto-refresh state only."""
+    status = queue_live.JOB.status()
+    status["auto_refresh"] = auto_refresh_status()
+    return jsonify(status)
 
 
 @app.route("/queue/api/refresh/cancel", methods=["POST"])
@@ -3156,7 +3248,9 @@ QUEUE_HTML = """\
   <input type=hidden name=csrf_token value="{{ csrf_token }}">
   <input type=hidden name=mode value="normal" id=refresh-mode>
   <div class="panel-region region-time"><div class="action-buttons"><button type=submit class=apply id=queue-refresh>Refresh Tickets</button><button type=button id=queue-cancel class=queue-cancel hidden>Cancel</button></div></div>
-   <p class=live-meta>Last refreshed {{ last_refresh_display }} · {{ cached_ticket_count }} tickets cached</p>
+    <p class=live-meta>Last refreshed {{ last_refresh_display }} · {{ cached_ticket_count }} tickets cached</p>
+    <p class=live-meta id=auto-refresh-status>Auto refresh: {% if not auto_refresh.enabled %}Off{% elif auto_refresh.seconds_until_next is none or auto_refresh.seconds_until_next <= 60 %}On · due soon{% else %}On · next in {{ (auto_refresh.seconds_until_next / 60)|round(0, 'ceil')|int }} min{% endif %}</p>
+
    {% if live_cache_missing %}<p class=field-hint>No cache baseline yet; Refresh Tickets will initialize it.</p>{% endif %}
    <details class=reconcile-details>
     <summary>Reconcile history</summary>
@@ -3497,15 +3591,26 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
   if (!form || !statusEl) { return; }
   var csrf = form.querySelector('input[name=csrf_token]');
   var refreshBtn = document.getElementById('queue-refresh');
-  var cancelBtn = document.getElementById('queue-cancel');
-  var pollTimer = null;
+   var cancelBtn = document.getElementById('queue-cancel');
+   var autoStatusEl = document.getElementById('auto-refresh-status');
+   var pollTimer = null;
+   function renderAutoRefresh(autoRefresh) {
+     if (!autoStatusEl) { return; }
+     if (!autoRefresh || !autoRefresh.enabled) { autoStatusEl.textContent = 'Auto refresh: Off'; return; }
+     var seconds = autoRefresh.seconds_until_next;
+     if (seconds == null || seconds <= 60) { autoStatusEl.textContent = 'Auto refresh: On · due soon'; return; }
+     autoStatusEl.textContent = 'Auto refresh: On · next in ' + Math.ceil(seconds / 60) + ' min';
+   }
+
   function encode(obj) {
     return Object.keys(obj).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k]); }).join('&');
   }
-  function render(s) {
-    var p = s.progress || {};
-    var running = (s.state === 'running');
-    if (refreshBtn) { refreshBtn.disabled = running; }
+   function render(s) {
+     renderAutoRefresh(s.auto_refresh);
+     var p = s.progress || {};
+     var running = (s.state === 'running');
+     if (refreshBtn) { refreshBtn.disabled = running; }
+
     if (cancelBtn) { cancelBtn.hidden = !running; }
     var msg = s.message || '';
     if (running || s.state === 'running') {
@@ -3915,10 +4020,12 @@ def _queue_render(**kwargs):
     ctx.setdefault("cache_coverage_display", "Unknown")
     ctx.setdefault("cached_ticket_count", 0)
     ctx.setdefault("last_refresh_mode_display", "No baseline")
+    ctx.setdefault("auto_refresh", auto_refresh_status())
     return render_template_string(QUEUE_HTML, **ctx)
 
 
 if __name__ == "__main__":
+    initialize_live_auto_refresh()
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5050"))
     app.run(host=resolve_bind_host(host), port=port, debug=False)
