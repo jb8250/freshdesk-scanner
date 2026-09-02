@@ -503,7 +503,7 @@ def test_filters_from_args_defaults():
         def getlist(self, key):
             return []
     cfg = filters_from_args(Args())
-    assert cfg == DEFAULT_FILTERS  # includes workflow_tab default "main"
+    assert cfg == DEFAULT_FILTERS
 
 
 def test_filters_from_args_explicit():
@@ -2085,7 +2085,7 @@ def test_second_click_moves_marker_off_first(client):
 def test_exactly_one_marker_after_many_opens(client):
     for tid in (500001, 500003, 500007, 500013, 500021):
         _open(client, tid)
-    html = client.get("/queue").get_data(as_text=True)
+    html = client.get("/queue?queue_scope=triage").get_data(as_text=True)
     assert len(_opened_rows(html)) == 1
     assert html.count('class="badge b-last-opened">') == 1
     assert last_opened_ticket_id() == 500021  # newest open wins
@@ -2097,7 +2097,7 @@ def test_repeated_clicks_do_not_duplicate_database_rows(client):
     _open(client, 500001)
     rows = load_review_rows()
     assert set(rows) == {500001}                      # single row for 500001
-    html = client.get("/queue").get_data(as_text=True)
+    html = client.get("/queue?queue_scope=triage").get_data(as_text=True)
     assert html.count('class="badge b-last-opened">') == 1  # no duplicated badge
     assert len(_opened_rows(html)) == 1
 
@@ -2200,7 +2200,7 @@ def test_save_failure_does_not_move_marker(client):
 def test_needs_followup_and_last_opened_displayed_together(client):
     set_review_result(500003, "Needs Follow-Up")
     _open(client, 500003)
-    html = client.get("/queue?workflow_tab=followup").get_data(as_text=True)
+    html = client.get("/queue?workflow_tab=followup&queue_scope=triage").get_data(as_text=True)
     row = _row_for(html, 500003)
     assert "rv-followup" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
@@ -2213,7 +2213,7 @@ def test_resolved_and_last_opened_displayed_together(client):
     _open(client, 500003)
     # workflow routing is authoritative; a Resolved ticket renders on the
     # Resolved tab, not the legacy review_view=all fallback.
-    html = client.get("/queue?workflow_tab=resolved").get_data(as_text=True)
+    html = client.get("/queue?workflow_tab=resolved&queue_scope=triage").get_data(as_text=True)
     row = _row_for(html, 500003)
     assert "rv-resolved" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
@@ -2225,7 +2225,7 @@ def test_no_action_needed_and_last_opened_displayed_together(client):
     set_review_result(500003, "No Action Needed")
     _open(client, 500003)
     # No Action Needed -> no_action tab (workflow routing is authoritative).
-    html = client.get("/queue?workflow_tab=no_action").get_data(as_text=True)
+    html = client.get("/queue?workflow_tab=no_action&queue_scope=triage").get_data(as_text=True)
     row = _row_for(html, 500003)
     assert "rv-none" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
@@ -2235,7 +2235,7 @@ def test_no_action_needed_and_last_opened_displayed_together(client):
 
 def test_opened_and_last_opened_displayed_together(client):
     _open(client, 500001)
-    html = client.get("/queue").get_data(as_text=True)
+    html = client.get("/queue?queue_scope=triage").get_data(as_text=True)
     row = _row_for(html, 500001)
     assert "rv-opened" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
@@ -2255,7 +2255,7 @@ def test_changing_review_result_preserves_marker(client):
     set_review_result(500001, "Resolved")      # deliberate result change
     assert last_opened_ticket_id() == 500001   # marker keeps its focus state
     # Resolved -> resolved tab (workflow routing is authoritative).
-    html = client.get("/queue?workflow_tab=resolved").get_data(as_text=True)
+    html = client.get("/queue?workflow_tab=resolved&queue_scope=triage").get_data(as_text=True)
     row = _row_for(html, 500001)
     assert "rv-last-opened" in row.split('>', 1)[0]
 
@@ -2273,9 +2273,9 @@ def test_clicking_removes_marker_only_from_previous(client):
 
 def test_marker_persists_across_fresh_request(client):
     _open(client, 500001)
-    html = client.get("/queue").get_data(as_text=True)      # "first reload"
+    html = client.get("/queue?queue_scope=triage").get_data(as_text=True)      # "first reload"
     assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
-    html2 = client.get("/queue").get_data(as_text=True)     # "second reload"
+    html2 = client.get("/queue?queue_scope=triage").get_data(as_text=True)     # "second reload"
     assert "rv-last-opened" in _row_for(html2, 500001).split('>', 1)[0]
     assert len(_opened_rows(html2)) == 1
 
@@ -2285,7 +2285,7 @@ def test_marker_persists_across_new_client(client):
     # the same isolated review DB and still sees the marker (spec: persistent).
     _open(client, 500001)
     client2 = app.app.test_client()
-    html = client2.get("/queue").get_data(as_text=True)
+    html = client2.get("/queue?queue_scope=triage").get_data(as_text=True)
     assert "rv-last-opened" in _row_for(html, 500001).split('>', 1)[0]
     assert last_opened_ticket_id() == 500001
 

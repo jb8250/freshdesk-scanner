@@ -372,12 +372,16 @@ def test_initial_get_defaults_scope_on_manual_off(client, monkeypatch):
     assert state["calls"] == 0
 
 
-def test_initial_get_displays_only_default_scope(client):
-    ids = _ids(_html(client))
-    assert "500006" not in ids  # "Vendor painted..." non-photo subject hidden
-    assert "500028" not in ids  # "Delivery schedule confirmation" hidden
-    assert "500001" in ids      # "Customer sent photo..." visible
+def test_initial_get_defaults_to_main_queue_scope(client):
+    html = _html(client)
+    ids = _ids(html)
+    assert "500006" not in ids
+    assert "500028" not in ids
+    assert "500001" in ids
     assert len(ids) == 22
+    assert 'aria-label="Queue scope"' in html
+    assert '>Main Queue <span class=workflow-tab-count>(22)</span>' in html
+    assert '>Needs Triage <span class=workflow-tab-count>(0)</span>' in html
 
 
 def test_show_all_link_rendered(client):
