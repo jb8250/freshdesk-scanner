@@ -507,31 +507,37 @@ REVIEW_STATES = [
     "Opened / In Review",
     "Needs Supervisor Review",
     "Resolved",
-    "Not Applicable to Me",
-    "No Action Needed",
+    "No Action",
     "Needs Follow-Up",
 ]
+LEGACY_NO_ACTION_STATES = frozenset({"Not Applicable to Me", "No Action Needed"})
 # States that snapshot the ticket's updated_at at review time. A later ticket
 # update compared against that snapshot produces the "UPDATED SINCE REVIEW"
-# flag, and such tickets are treated as Active again.
-REVIEWED_STATES = {"Resolved", "Not Applicable to Me", "No Action Needed", "Needs Follow-Up", "Needs Supervisor Review"}
+# flag, and such tickets are treated as Active again, except No Action.
+REVIEWED_STATES = {"Resolved", "No Action", "Needs Follow-Up", "Needs Supervisor Review", *LEGACY_NO_ACTION_STATES}
 ACTIVE_STATES = {"Unreviewed", "Opened / In Review", "Needs Follow-Up", "Needs Supervisor Review"}
-COMPLETED_STATES = {"Resolved", "Not Applicable to Me", "No Action Needed"}
+COMPLETED_STATES = {"Resolved", "No Action", *LEGACY_NO_ACTION_STATES}
 
 
 def parse_workflow_tab(value):
     return value if value in WORKFLOW_TABS else "main"
 
 
+def canonical_review_result(state):
+    return "No Action" if state in LEGACY_NO_ACTION_STATES else state
+
+
 def workflow_destination(state, updated=False):
-    """Return the local workflow destination; updates always route to Main."""
+    """Return the local workflow destination; No Action persists across updates."""
+    state = canonical_review_result(state)
+    if state == "No Action":
+        return "no_action"
     if updated:
         return "main"
     return {
         "Unreviewed": "main", "Opened / In Review": "main",
         "Needs Supervisor Review": "supervisor", "Needs Follow-Up": "followup",
-        "Resolved": "resolved", "No Action Needed": "no_action",
-        "Not Applicable to Me": "no_action",
+        "Resolved": "resolved", "No Action": "no_action",
     }.get(state, "main")
 
 
@@ -1907,6 +1913,7 @@ def _set_review_result(table: str, ticket_id, result, reviewed_updated_at=None):
     / Opened the snapshot is cleared so no stale flag can linger."""
     if table not in _REVIEW_TABLES:
         raise ValueError(f"unknown review table: {table!r}")
+    result = canonical_review_result(result)
     if result not in REVIEW_STATES:
         raise ValueError(f"unknown review result: {result!r}")
     now = iso_now()
@@ -2012,7 +2019,8 @@ REVIEW_CLASS = {
     "Unreviewed": "rv-unreviewed",
     "Opened / In Review": "rv-opened",
     "Resolved": "rv-resolved",
-    "Not Applicable to Me": "rv-na",
+    "No Action": "rv-none",
+    "Not Applicable to Me": "rv-none",
     "No Action Needed": "rv-none",
     "Needs Follow-Up": "rv-followup",
 }
@@ -2033,7 +2041,7 @@ def ticket_badges(t, state_row, updated_flag):
     """All badges for one ticket row. Text + CSS class pair; never color alone
     (screen readers and color-blind users get the text)."""
     badges = []
-    result = state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed"
+    result = canonical_review_result(state_row.get("review_result", "Unreviewed")) if state_row else "Unreviewed"
     # Display text: the Opened state renders as the all-caps "OPENED / IN REVIEW"
     # badge (spec §3.5/§7) while the select option value stays sentence case.
     badge_text = "OPENED / IN REVIEW" if result == "Opened / In Review" else result
@@ -2711,12 +2719,30 @@ def build_current_queue_view(raw, config):
     last_opened_id = last_opened_ticket_id()
     rows = []
     workflow_counts = {tab: 0 for tab in WORKFLOW_TABS}
-    ordered_tickets = sorted(tickets, key=lambda x: (not updated_since_review(x, state_rows.get(x.get("id"))), x.get("id") is None, x.get("id") or 0))
+
+    def _ticket_id_key(ticket):
+        ticket_id = ticket.get("id")
+        return (ticket_id is None, ticket_id if isinstance(ticket_id, int) else str(ticket_id or ""))
+
+    def _workflow_sort_key(ticket):
+        state_row = state_rows.get(ticket.get("id"))
+        updated = updated_since_review(ticket, state_row)
+        destination = workflow_destination(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", updated)
+        ticket_id = _ticket_id_key(ticket)
+        if destination != "main":
+            return (0, ticket_id)
+        if updated:
+            updated_at = parse_dt(ticket.get("updated_at"))
+            return (1, updated_at is None, -updated_at.timestamp() if updated_at else 0, ticket_id)
+        created_at = parse_dt(ticket.get("created_at"))
+        return (2, created_at is None, created_at.timestamp() if created_at else 0, ticket_id)
+
+    ordered_tickets = sorted(tickets, key=_workflow_sort_key)
     for t in ordered_tickets:
         tid = t["id"]
         state_row = state_rows.get(tid)
         updated_flag = updated_since_review(t, state_row)
-        destination = workflow_destination(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", updated_flag)
+        destination = workflow_destination(canonical_review_result(state_row.get("review_result", "Unreviewed")) if state_row else "Unreviewed", updated_flag)
         workflow_counts[destination] += 1
         if not show_all_cached and destination != config["workflow_tab"]:
             continue
@@ -2724,7 +2750,8 @@ def build_current_queue_view(raw, config):
         pid = t.get("priority", 0)
         due = t.get("due_by") or t.get("fr_due_by")
         updated_at = t.get("updated_at")
-        row_class = REVIEW_CLASS.get(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", "rv-unreviewed")
+        result_state = canonical_review_result(state_row.get("review_result", "Unreviewed")) if state_row else "Unreviewed"
+        row_class = REVIEW_CLASS.get(result_state, "rv-unreviewed")
         is_last_opened = last_opened_id is not None and tid == last_opened_id
         if is_last_opened:
             row_class += " rv-last-opened"
@@ -2735,7 +2762,7 @@ def build_current_queue_view(raw, config):
             "updated_display": format_eastern_timestamp(updated_at),
             "created_display": (t.get("created_at") or "")[:10] or "—",
             "tags": (t.get("tags") or []) if isinstance(t.get("tags"), list) else [],
-            "result": state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
+            "result": result_state,
             "row_class": row_class, "last_opened": is_last_opened,
             "updated_flag": updated_flag,
             "triage_reasons": [] if closed_mode or is_main_queue_ticket(t) else main_queue_triage_reasons(t),
@@ -2848,7 +2875,7 @@ def queue():
         tid = t["id"]
         state_row = state_rows.get(tid)
         updated_flag = updated_since_review(t, state_row)
-        destination = workflow_destination(state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed", updated_flag)
+        destination = workflow_destination(canonical_review_result(state_row.get("review_result", "Unreviewed")) if state_row else "Unreviewed", updated_flag)
         workflow_counts[destination] += 1
         if not show_all_cached and destination != config["workflow_tab"]:
             continue
