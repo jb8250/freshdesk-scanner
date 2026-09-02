@@ -1696,7 +1696,7 @@ def test_follow_up_stays_in_followup_tab(client):
 
 def test_no_action_and_na_group_into_no_action_tab(client):
     tok = _csrf(client)
-    for tid, result in (("500021", "No Action Needed"), ("500022", "Not Applicable to Me")):
+    for tid, result in (("500021", "No Action"), ("500022", "No Action")):
         client.post("/queue/api/review", data={
             "csrf_token": tok, "ticket_id": tid, "review_result": result,
             "overdue": "1", "responded": "0", "waiting": "0", "missing_tags": "1",
@@ -1893,7 +1893,7 @@ def test_opened_badge_renders_uppercase_and_highlighted(client):
 
 
 def test_mark_opened_preserves_deliberate_states():
-    for result in ("Resolved", "Not Applicable to Me", "No Action Needed", "Needs Follow-Up"):
+    for result in ("Resolved", "No Action", "Needs Follow-Up"):
         set_review_result(500002, result)
         effective = mark_opened(500002)
         rows = load_review_rows()
@@ -2221,15 +2221,15 @@ def test_resolved_and_last_opened_displayed_together(client):
     assert ">LAST OPENED" in row
 
 
-def test_no_action_needed_and_last_opened_displayed_together(client):
-    set_review_result(500003, "No Action Needed")
+def test_no_action_and_last_opened_displayed_together(client):
+    set_review_result(500003, "No Action")
     _open(client, 500003)
-    # No Action Needed -> no_action tab (workflow routing is authoritative).
+    # No Action -> no_action tab (workflow routing is authoritative).
     html = client.get("/queue?workflow_tab=no_action&queue_scope=triage").get_data(as_text=True)
     row = _row_for(html, 500003)
     assert "rv-none" in row.split('>', 1)[0]
     assert "rv-last-opened" in row.split('>', 1)[0]
-    assert ">No Action Needed" in row
+    assert ">No Action" in row
     assert ">LAST OPENED" in row
 
 
