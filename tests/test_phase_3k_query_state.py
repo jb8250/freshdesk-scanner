@@ -30,8 +30,8 @@ def _ids(html):
 
 
 def _main_queue_count(html):
-    m = re.search(r'Main Queue[^<]*<span[^>]*>\((\d+)\)', html)
-    assert m, "Main Queue tab count not found in HTML"
+    m = re.search(r'To Review[^<]*<span[^>]*>\((\d+)\)', html)
+    assert m, "To Review tab count not found in HTML"
     return int(m.group(1))
 
 
