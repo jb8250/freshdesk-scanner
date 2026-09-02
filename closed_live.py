@@ -35,7 +35,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 #: Separate from the queue cache on purpose: /closed must never read or write
 #: cache/tickets.json, and the queue must never see closed rows.
-CLOSED_CACHE_FILE = os.path.join(CACHE_DIR, "closed_tickets.json")
+CLOSED_CACHE_FILE = os.environ.get(
+    "CLOSED_CACHE_PATH", os.path.join(CACHE_DIR, "closed_tickets.json")
+)
 
 #: The ONLY ticket fields persisted to the closed cache.
 ALLOWED_TICKET_FIELDS = ("id", "subject", "status", "tags", "created_at", "updated_at")

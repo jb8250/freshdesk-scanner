@@ -32,6 +32,7 @@ Thumbs.db
 cache/
 closed_ui_prompt24/
 data/
+.preview-runtime/
 *.csv
 *.html
 
