@@ -27,11 +27,16 @@ def test_main_queue_accepts_all_required_statuses():
     assert app.main_queue_triage_reasons(_ticket(status=4)) == [app.TRIAGE_REASON_STATUS]
 
 
-def test_main_queue_type_group_tag_and_subject_rules():
+def test_main_queue_type_group_and_tag_rules():
     assert app.main_queue_triage_reasons(_ticket(type="Other")) == [app.TRIAGE_REASON_TYPE]
     assert app.main_queue_triage_reasons(_ticket(custom_fields={"cf_follow_up_group": "Retail"})) == [app.TRIAGE_REASON_GROUP]
     assert app.main_queue_triage_reasons(_ticket(tags=["other"])) == [app.TRIAGE_REASON_TAG]
-    assert app.main_queue_triage_reasons(_ticket(subject="Photo attached")) == [app.TRIAGE_REASON_SUBJECT]
+
+
+def test_subject_is_not_a_main_queue_gate():
+    for subject in ("Photo request", "Photo/video", "Unrelated subject text", ""):
+        assert app.is_main_queue_ticket(_ticket(subject=subject))
+        assert app.main_queue_triage_reasons(_ticket(subject=subject)) == []
 
 
 def test_each_dashboard_tag_is_case_and_whitespace_tolerant():
@@ -60,7 +65,6 @@ def test_triage_reasons_are_complete_and_deterministic():
         app.TRIAGE_REASON_TYPE,
         app.TRIAGE_REASON_GROUP,
         app.TRIAGE_REASON_TAG,
-        app.TRIAGE_REASON_SUBJECT,
     ]
 
 

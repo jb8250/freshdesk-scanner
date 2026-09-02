@@ -199,7 +199,6 @@ TRIAGE_REASON_STATUS = "Status not in Main Queue"
 TRIAGE_REASON_TYPE = "Wrong Type"
 TRIAGE_REASON_GROUP = "Wrong Group"
 TRIAGE_REASON_TAG = "Missing photo/video tag"
-TRIAGE_REASON_SUBJECT = "Subject doesn't match Photo/Video Request"
 
 # Reviewed/closed Freshdesk tags (human-applied). Any ONE of these removes a
 # ticket from the DEFAULT review queue. Comparison is case-insensitive and
@@ -367,8 +366,6 @@ def main_queue_triage_reasons(ticket):
         reasons.append(TRIAGE_REASON_GROUP)
     if not has_main_queue_photo_video_tag(ticket):
         reasons.append(TRIAGE_REASON_TAG)
-    if not subject_matches_main_queue_photo_video_request(ticket):
-        reasons.append(TRIAGE_REASON_SUBJECT)
     return reasons
 
 
