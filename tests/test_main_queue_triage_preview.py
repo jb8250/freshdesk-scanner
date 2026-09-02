@@ -80,6 +80,19 @@ def test_queue_partition_and_review_identity(monkeypatch):
     assert triage_rows[0]["triage_reasons"] == [app.TRIAGE_REASON_TAG]
 
 
+def test_queue_scope_and_workflow_labels_are_distinct(client):
+    response = client.get("/queue")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert 'aria-label="Queue scope"' in html
+    assert ">Main Queue <span" in html
+    assert ">Needs Triage <span" in html
+    assert ">To Review <span" in html
+    for label in ("Supervisor Review", "Follow-Up", "Resolved", "No Action"):
+        assert f">{label} <span" in html
+    assert app.WORKFLOW_LABELS["main"] == "To Review"
+
+
 def test_queue_scope_defaults_main_and_closed_mode_does_not_split(client):
     assert app.filters_from_args({}).get("queue_scope", "main") == "main"
     assert app.filters_from_args({"queue_scope": "unexpected"}).get("queue_scope", "main") == "main"

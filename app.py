@@ -503,7 +503,7 @@ DAYS_MIN, DAYS_MAX, DAYS_DEFAULT = 1, 365, 60
 REVIEW_VIEWS = ("active", "completed", "all")
 WORKFLOW_TABS = ("main", "supervisor", "followup", "resolved", "no_action")
 WORKFLOW_LABELS = {
-    "main": "Main Queue", "supervisor": "Supervisor Review", "followup": "Follow-Up",
+    "main": "To Review", "supervisor": "Supervisor Review", "followup": "Follow-Up",
     "resolved": "Resolved", "no_action": "No Action",
 }
 
@@ -3432,7 +3432,7 @@ QUEUE_HTML = """\
 </nav>
 {% endif %}
 <nav class=workflow-tabs aria-label="Review workflow">
-{% for tab in ['main','supervisor','followup','resolved','no_action'] %}<a class="workflow-tab{% if config.workflow_tab == tab %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, workflow_tab=tab)) }}" {% if config.workflow_tab == tab %}aria-current=page{% endif %}>{{ {'main':'Main Queue','supervisor':'Supervisor Review','followup':'Follow-Up','resolved':'Resolved','no_action':'No Action'}[tab] }} <span class=workflow-tab-count>({{ workflow_counts[tab] }})</span></a>{% endfor %}
+{% for tab in ['main','supervisor','followup','resolved','no_action'] %}<a class="workflow-tab{% if config.workflow_tab == tab %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, workflow_tab=tab)) }}" {% if config.workflow_tab == tab %}aria-current=page{% endif %}>{{ workflow_labels[tab] }} <span class=workflow-tab-count>({{ workflow_counts[tab] }})</span></a>{% endfor %}
 </nav>
 <p class=count>{{ total }} tickets displayed from the current cache</p>
 {% if last_opened_id is not none %}
@@ -4144,6 +4144,7 @@ def _queue_render(**kwargs):
     ctx.setdefault("active_summary", filter_summary_text(cfg))
     ctx.setdefault("filter_query_string", filter_query_string)
     ctx.setdefault("workflow_counts", {tab: 0 for tab in WORKFLOW_TABS})
+    ctx.setdefault("workflow_labels", WORKFLOW_LABELS)
     ctx.setdefault("queue_scope_counts", {"main": 0, "triage": 0})
     ctx.setdefault("live_cache_missing", False)
     ctx.setdefault("last_refresh_display", "Never")
