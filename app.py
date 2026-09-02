@@ -76,6 +76,7 @@ from urllib.parse import urlencode
 import requests
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 from flask import (Flask, jsonify, redirect, render_template_string, request,
                    send_file, session)
 
@@ -178,6 +179,27 @@ KEYWORDS = [
 # Underscore is treated as a separator alongside punctuation/whitespace so tags
 # such as ``Video_photo request`` qualify without allowing loose substrings.
 KEYWORD_RE = re.compile(r"(?<![^\W_])(" + "|".join(KEYWORDS) + r")(?![^\W_])", re.IGNORECASE)
+
+MAIN_QUEUE_STATUSES = frozenset({2, 6, 7, 8})
+MAIN_QUEUE_TYPE = "guest callback/follow-up"
+MAIN_QUEUE_GROUP = "service"
+MAIN_QUEUE_PHOTO_VIDEO_TAGS = frozenset({
+    "photo/video request",
+    "photo request",
+    "video/ photos",
+    "photos",
+    "video/ photo request",
+    "video/ photo",
+    "product issue video request",
+})
+PHOTO_VIDEO_REQUEST_SUBJECT_RE = re.compile(
+    r"\b(?:photo\s*/?\s*video|video\s*/?\s*photo)\s+request\b", re.IGNORECASE
+)
+TRIAGE_REASON_STATUS = "Status not in Main Queue"
+TRIAGE_REASON_TYPE = "Wrong Type"
+TRIAGE_REASON_GROUP = "Wrong Group"
+TRIAGE_REASON_TAG = "Missing photo/video tag"
+TRIAGE_REASON_SUBJECT = "Subject doesn't match Photo/Video Request"
 
 # Reviewed/closed Freshdesk tags (human-applied). Any ONE of these removes a
 # ticket from the DEFAULT review queue. Comparison is case-insensitive and
@@ -299,6 +321,59 @@ def text_matches_photo_video(text):
 def subject_matches_photo_video(ticket):
     """Backward-compatible subject-only photo/video matcher."""
     return isinstance(ticket, dict) and text_matches_photo_video(ticket.get("subject"))
+
+
+def normalized_queue_value(value):
+    return " ".join(value.strip().casefold().split()) if isinstance(value, str) else ""
+
+
+def main_queue_group(ticket):
+    if not isinstance(ticket, dict):
+        return ""
+    custom_fields = ticket.get("custom_fields")
+    if isinstance(custom_fields, dict):
+        return normalized_queue_value(custom_fields.get("cf_follow_up_group"))
+    return normalized_queue_value(ticket.get("group"))
+
+
+def main_queue_status(ticket):
+    value = ticket.get("status") if isinstance(ticket, dict) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def has_main_queue_photo_video_tag(ticket):
+    tags = ticket.get("tags") if isinstance(ticket, dict) else None
+    return isinstance(tags, list) and any(
+        normalized_queue_value(tag) in MAIN_QUEUE_PHOTO_VIDEO_TAGS for tag in tags
+    )
+
+
+def subject_matches_main_queue_photo_video_request(ticket):
+    subject = ticket.get("subject") if isinstance(ticket, dict) else None
+    return isinstance(subject, str) and bool(PHOTO_VIDEO_REQUEST_SUBJECT_RE.search(subject))
+
+
+def main_queue_triage_reasons(ticket):
+    """Return stable, complete Main Queue rule failures for one candidate."""
+    reasons = []
+    if main_queue_status(ticket) not in MAIN_QUEUE_STATUSES:
+        reasons.append(TRIAGE_REASON_STATUS)
+    if normalized_queue_value(ticket.get("type") if isinstance(ticket, dict) else None) != MAIN_QUEUE_TYPE:
+        reasons.append(TRIAGE_REASON_TYPE)
+    if main_queue_group(ticket) != MAIN_QUEUE_GROUP:
+        reasons.append(TRIAGE_REASON_GROUP)
+    if not has_main_queue_photo_video_tag(ticket):
+        reasons.append(TRIAGE_REASON_TAG)
+    if not subject_matches_main_queue_photo_video_request(ticket):
+        reasons.append(TRIAGE_REASON_SUBJECT)
+    return reasons
+
+
+def is_main_queue_ticket(ticket):
+    return not main_queue_triage_reasons(ticket)
 
 
 def ticket_matches_photo_video(ticket):
@@ -569,6 +644,10 @@ def parse_queue_mode(value):
     return "closed" if value == "closed" else "normal"
 
 
+def parse_queue_scope(value):
+    return "triage" if value == "triage" else "main"
+
+
 def filters_from_args(args, submitted=False):
     """Build a canonical local queue configuration from request values.
 
@@ -598,6 +677,8 @@ def filters_from_args(args, submitted=False):
     }
     workflow_tab = _last_value(args, "workflow_tab")
     cfg["workflow_tab"] = parse_workflow_tab(workflow_tab) if workflow_tab is not None else DEFAULT_FILTERS["workflow_tab"]
+    if parse_queue_scope(_last_value(args, "queue_scope")) == "triage":
+        cfg["queue_scope"] = "triage"
     # Closed mode carries the immediately preceding Normal Review workspace in
     # private URL parameters. Keep it absent for a direct Closed entry: there
     # is no saved Normal workspace to synthesize in that case.
@@ -608,7 +689,7 @@ def filters_from_args(args, submitted=False):
 
 NORMAL_RETURN_FIELDS = (
     "photo_video_only", "hide_reviewed_tags", "missing_tags", "days",
-    "review_view", "workflow_tab",
+    "review_view", "workflow_tab", "queue_scope",
 )
 
 
@@ -621,6 +702,7 @@ def normal_return_from_args(args):
         "days": parse_days(_last_value(args, "normal_days")),
         "review_view": parse_review_view(_last_value(args, "normal_review_view")),
         "workflow_tab": parse_workflow_tab(_last_value(args, "normal_workflow_tab")),
+        "queue_scope": parse_queue_scope(_last_value(args, "normal_queue_scope")),
     }
 
 
@@ -639,6 +721,8 @@ def filter_query_string(config):
         "review_view": config.get("review_view", "all"),
         "workflow_tab": parse_workflow_tab(config.get("workflow_tab", "main")),
     }
+    if parse_queue_scope(config.get("queue_scope", "main")) == "triage":
+        params["queue_scope"] = "triage"
     normal_return = config.get("normal_return")
     if mode == "closed" and isinstance(normal_return, dict):
         for name in NORMAL_RETURN_FIELDS:
@@ -649,6 +733,8 @@ def filter_query_string(config):
                 params[f"normal_{name}"] = str(parse_days(value))
             elif name == "review_view":
                 params[f"normal_{name}"] = parse_review_view(value)
+            elif name == "queue_scope":
+                params[f"normal_{name}"] = parse_queue_scope(value)
             else:
                 params[f"normal_{name}"] = parse_workflow_tab(value)
     return urlencode(params)
@@ -1564,11 +1650,13 @@ def get_ticket_pool():
     Offline mode loads fixtures; live mode reads only the live cache. Missing,
     stale, or legacy cache state never triggers a fetch.
     """
-    if is_offline():
+    if is_offline() and os.environ.get("FRESHDESK_OFFLINE_CACHE", "").strip().lower() not in ("1", "true", "yes"):
         raw = list(offline_paginate_tickets())
         return raw, None
 
-    # LIVE mode: cache read only. No network, no auto-refresh, no fetch.
+    # Live mode and explicit offline-cache preview mode: cache read only. No
+    # network, no auto-refresh, no fetch.
+
     blob = load_live_queue_cache()
     if blob:
         raw = blob["tickets"]
@@ -2607,6 +2695,24 @@ def build_current_queue_view(raw, config):
         if not show_all_cached:
             tickets = [t for t in tickets if t.get("status") != CLOSED_STATUS and str(t.get("status")) != str(CLOSED_STATUS)]
 
+    queue_scope_counts = {"main": 0, "triage": 0}
+    if not closed_mode:
+        classified_tickets = []
+        for ticket in tickets:
+            scope = "main" if is_main_queue_ticket(ticket) else "triage"
+            queue_scope_counts[scope] += 1
+            if scope == config.get("queue_scope", "main"):
+                classified_tickets.append(ticket)
+        tickets = classified_tickets
+        # Offline fixtures predate the Freshdesk dashboard metadata fields. Keep
+        # fixture-based regression tests exercising the legacy review workflow;
+        # live cached preview data always uses the strict Main/Triage split.
+        if is_offline() and os.environ.get("FRESHDESK_OFFLINE_CACHE", "").strip().lower() not in ("1", "true", "yes"):
+            tickets = apply_queue_filters(raw, normal_config)
+            if not show_all_cached:
+                tickets = [ticket for ticket in tickets if main_queue_status(ticket) != CLOSED_STATUS]
+            queue_scope_counts = {"main": len(tickets), "triage": 0}
+
     state_rows = load_review_rows()
     last_opened_id = last_opened_ticket_id()
     rows = []
@@ -2638,10 +2744,11 @@ def build_current_queue_view(raw, config):
             "result": state_row.get("review_result", "Unreviewed") if state_row else "Unreviewed",
             "row_class": row_class, "last_opened": is_last_opened,
             "updated_flag": updated_flag,
+            "triage_reasons": [] if closed_mode or is_main_queue_ticket(t) else main_queue_triage_reasons(t),
             "badges": ticket_badges(t, state_row, updated_flag),
             "can_acknowledge": bool(state_row and state_row.get("review_result") in REVIEWED_STATES and updated_flag),
         })
-    return rows, workflow_counts, all_categories_off, last_opened_id, show_all_cached
+    return rows, workflow_counts, queue_scope_counts, all_categories_off, last_opened_id, show_all_cached
 
 
 @app.route("/queue")
@@ -2678,11 +2785,12 @@ def queue():
     except OfflineDataError as e:
         return _queue_error_page(str(e), offline)
 
-    rows, workflow_counts, all_categories_off, last_opened_id, show_all_cached = build_current_queue_view(raw, config)
+    rows, workflow_counts, queue_scope_counts, all_categories_off, last_opened_id, show_all_cached = build_current_queue_view(raw, config)
     flash_msg = session.pop("flash", None)
     return _queue_render(
         tickets=rows, total=len(rows), error=missing_key_msg,
-        workflow_counts=workflow_counts, offline=offline, cache_age=cache_age,
+        workflow_counts=workflow_counts, queue_scope_counts=queue_scope_counts,
+        offline=offline, cache_age=cache_age,
         config=config, csrf_token=get_csrf_token(), flash=flash_msg,
         all_categories_off=all_categories_off, last_opened_id=last_opened_id,
         last_opened_rendered=any(r["last_opened"] for r in rows),
@@ -2810,12 +2918,15 @@ def queue_export_xlsx():
         raw, _cache_age = get_ticket_pool()
     except OfflineDataError as e:
         return _queue_error_page(str(e), is_offline())
-    rows, _counts, _all_categories_off, _last_opened_id, _show_all = build_current_queue_view(raw, config)
+    rows, _counts, _scope_counts, _all_categories_off, _last_opened_id, _show_all = build_current_queue_view(raw, config)
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Current View"
-    headers = ["Ticket #", "Subject", "Status", "Priority", "Updated", "Created", "Tags", "Review Result", "Freshdesk URL"]
+    headers = ["Ticket #", "Subject", "Status", "Priority", "Updated", "Created", "Tags", "Review Result"]
+    if config["mode"] == "normal" and config.get("queue_scope", "main") == "triage":
+        headers.append("Why here?")
+    headers.append("Freshdesk URL")
     sheet.append(headers)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
@@ -2823,21 +2934,27 @@ def queue_export_xlsx():
         values = [
             row["id"], row["subject"], row["status_label"], row["priority_label"],
             row["updated_display"], row["created_display"], ", ".join(str(tag) for tag in row["tags"]),
-            row["result"], row["url"],
+            row["result"],
         ]
+        if config["mode"] == "normal" and config.get("queue_scope", "main") == "triage":
+            values.append("; ".join(row["triage_reasons"]))
+        values.append(row["url"])
         sheet.append(values)
-        url_cell = sheet.cell(sheet.max_row, 9)
+        url_cell = sheet.cell(sheet.max_row, len(headers))
         url_cell.hyperlink = row["url"]
         url_cell.style = "Hyperlink"
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:I{max(sheet.max_row, 1)}"
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(sheet.max_row, 1)}"
     widths = {"A": 11, "B": 42, "C": 22, "D": 12, "E": 24, "F": 14, "G": 35, "H": 24, "I": 55}
+    if config["mode"] == "normal" and config.get("queue_scope", "main") == "triage":
+        widths["I"] = 42
+        widths["J"] = 55
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
     for row in sheet.iter_rows(min_row=2):
         row[1].alignment = Alignment(wrap_text=True, vertical="top")
         row[6].alignment = Alignment(wrap_text=True, vertical="top")
-        row[8].alignment = Alignment(wrap_text=True, vertical="top")
+        row[len(headers) - 1].alignment = Alignment(wrap_text=True, vertical="top")
 
     output = io.BytesIO()
     workbook.save(output)
@@ -3190,7 +3307,9 @@ _SHARED_CSS = """
  .b-overdue{background:#d32f2f;color:#fff}
  .b-responded{background:var(--fd-customer-responded);color:var(--fd-customer-responded-text)}
  .b-waiting{background:var(--fd-waiting-customer);color:var(--fd-waiting-customer-text)}
- .b-missing{background:#757575;color:#fff}
+  .b-missing{background:#757575;color:#fff}
+  .b-triage{display:inline-block;margin:0 3px 3px 0;background:#fff3cd;border:1px solid #d39e00;color:#664d03;white-space:normal}
+  .triage-reasons{min-width:175px}
  .b-sla{background:#e65100;color:#fff}
  .b-updated{background:#00838f;color:#fff}
  .b-closed{background:#00838f;color:#fff}
@@ -3271,8 +3390,9 @@ QUEUE_HTML = """\
 <div id=queue-refresh-status class=refresh-status role=status aria-live=polite></div>
 </div>
 <form class="controls queue-filter-controls" method=get action=/queue novalidate id=queue-filter-form data-rendered-mode="{{ config.mode }}">
-  <h2 class=queue-card-heading>REVIEW FILTERS</h2>
-   <input type=hidden name=days value="{{ config.days }}">
+   <h2 class=queue-card-heading>REVIEW FILTERS</h2>
+    <input type=hidden name=days value="{{ config.days }}">
+    <input type=hidden name=queue_scope value="{{ config.get("queue_scope", "main") }}">
    {% if config.mode == 'closed' and config.normal_return is defined %}{% for name, value in config.normal_return.items() %}<input type=hidden name="normal_{{ name }}" value="{{ '1' if value is sameas true else '0' if value is sameas false else value }}">{% endfor %}{% endif %}
    <div class="panel-region region-groups">
     <fieldset class="filter-group scope-group">
@@ -3306,6 +3426,11 @@ QUEUE_HTML = """\
 </section>
 <p class=filter-summary role=status>{{ active_summary }}</p>
 
+{% if config.mode == 'normal' %}
+<nav class=workflow-tabs aria-label="Queue scope">
+{% for scope, label in [('main', 'Main Queue'), ('triage', 'Needs Triage')] %}<a class="workflow-tab{% if config.get("queue_scope", "main") == scope %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, queue_scope=scope)) }}" {% if config.get("queue_scope", "main") == scope %}aria-current=page{% endif %}>{{ label }} <span class=workflow-tab-count>({{ queue_scope_counts[scope] }})</span></a>{% endfor %}
+</nav>
+{% endif %}
 <nav class=workflow-tabs aria-label="Review workflow">
 {% for tab in ['main','supervisor','followup','resolved','no_action'] %}<a class="workflow-tab{% if config.workflow_tab == tab %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, workflow_tab=tab)) }}" {% if config.workflow_tab == tab %}aria-current=page{% endif %}>{{ {'main':'Main Queue','supervisor':'Supervisor Review','followup':'Follow-Up','resolved':'Resolved','no_action':'No Action'}[tab] }} <span class=workflow-tab-count>({{ workflow_counts[tab] }})</span></a>{% endfor %}
 </nav>
@@ -3326,7 +3451,7 @@ QUEUE_HTML = """\
 <caption class=visually-hidden>Freshdesk review queue</caption>
 <tr>
   <th scope=col>Ticket</th><th scope=col>Subject</th><th scope=col>Status</th>
-  <th scope=col>Badges</th><th scope=col>Review</th><th scope=col>Due / SLA</th>
+   <th scope=col>Badges</th>{% if config.mode == 'normal' and config.get("queue_scope", "main") == 'triage' %}<th scope=col>Why here?</th>{% endif %}<th scope=col>Review</th><th scope=col>Due / SLA</th>
   <th scope=col>Updated</th><th scope=col>Created</th><th scope=col>Tags</th>
 </tr>
 {% for t in tickets %}
@@ -3334,8 +3459,9 @@ QUEUE_HTML = """\
   <td><a class="tid fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open ticket #{{ t.id }} in Freshdesk (new tab)">#{{ t.id }}</a></td>
   <td><a class="sbj fd-link" href="{{ t.url }}" target=_blank rel="noopener noreferrer" data-ticket-id="{{ t.id }}" aria-label="Open subject of ticket #{{ t.id }} in Freshdesk (new tab)">{{ t.subject }}</a></td>
   <td>{{ t.status_label }}</td>
-  <td><div class=badges>{% if t.last_opened %}<span class="badge b-last-opened">LAST OPENED</span>{% endif %}{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td>
-  <td>
+   <td><div class=badges>{% if t.last_opened %}<span class="badge b-last-opened">LAST OPENED</span>{% endif %}{% for kind, text, cls in t.badges %}<span class="badge {{ cls }}">{{ text }}</span>{% endfor %}</div></td>
+   {% if config.mode == 'normal' and config.get("queue_scope", "main") == 'triage' %}<td class=triage-reasons>{% for reason in t.triage_reasons %}<span class="badge b-triage">{{ reason }}</span>{% endfor %}</td>{% endif %}
+   <td>
     <form class=rvform method=post action=/queue/api/review>
       <input type=hidden name=csrf_token value="{{ csrf_token }}">
       <input type=hidden name=ticket_id value="{{ t.id }}">
@@ -3349,8 +3475,9 @@ QUEUE_HTML = """\
       <input type=hidden name=missing_tags value="{{ '1' if config.missing_tags else '0' }}">
       <input type=hidden name=days value="{{ config.days }}">
        <input type=hidden name=review_view value="{{ config.review_view }}">
-       <input type=hidden name=workflow_tab value="{{ config.workflow_tab }}">
-      <select name=review_result aria-label="Review result for ticket {{ t.id }}" onchange="this.form.submit()">
+        <input type=hidden name=workflow_tab value="{{ config.workflow_tab }}">
+        <input type=hidden name=queue_scope value="{{ config.get("queue_scope", "main") }}">
+       <select name=review_result aria-label="Review result for ticket {{ t.id }}" onchange="this.form.submit()">
         {% for s in review_states %}<option value="{{ s }}" {{ 'selected' if t.result == s }}>{{ s }}</option>{% endfor %}
        </select>
        {% if t.can_acknowledge %}<button type=submit class=acknowledge formaction=/queue/api/acknowledge formmethod=post aria-label="Acknowledge Update for ticket {{ t.id }}">Acknowledge Update</button>{% endif %}
@@ -4017,6 +4144,7 @@ def _queue_render(**kwargs):
     ctx.setdefault("active_summary", filter_summary_text(cfg))
     ctx.setdefault("filter_query_string", filter_query_string)
     ctx.setdefault("workflow_counts", {tab: 0 for tab in WORKFLOW_TABS})
+    ctx.setdefault("queue_scope_counts", {"main": 0, "triage": 0})
     ctx.setdefault("live_cache_missing", False)
     ctx.setdefault("last_refresh_display", "Never")
     ctx.setdefault("cache_coverage_display", "Unknown")

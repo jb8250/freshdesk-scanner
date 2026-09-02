@@ -34,6 +34,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 FRESHDESK_OFFLINE=1 \
+FRESHDESK_OFFLINE_CACHE=1 \
 REVIEW_DB_PATH="$RUNTIME_DIR/review_state.sqlite3" \
 QUEUE_CACHE_PATH="$RUNTIME_DIR/queue_live_tickets.json" \
 CLOSED_CACHE_PATH="$RUNTIME_DIR/closed_tickets.json" \
