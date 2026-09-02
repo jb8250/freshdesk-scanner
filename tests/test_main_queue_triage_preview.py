@@ -12,6 +12,7 @@ def _ticket(ticket_id=950001, **changes):
         "status": 2,
         "type": "Guest Callback/Follow-Up",
         "custom_fields": {"cf_follow_up_group": "Service"},
+        "group_id": 154000437139,
         "tags": ["PHOTOS"],
         "priority": 2,
         "created_at": "2026-09-01T12:00:00Z",
@@ -29,7 +30,7 @@ def test_main_queue_accepts_all_required_statuses():
 
 def test_main_queue_type_group_and_tag_rules():
     assert app.main_queue_triage_reasons(_ticket(type="Other")) == [app.TRIAGE_REASON_TYPE]
-    assert app.main_queue_triage_reasons(_ticket(custom_fields={"cf_follow_up_group": "Retail"})) == [app.TRIAGE_REASON_GROUP]
+    assert app.main_queue_triage_reasons(_ticket(group_id=154000472479)) == [app.TRIAGE_REASON_GROUP]
     assert app.main_queue_triage_reasons(_ticket(tags=["other"])) == [app.TRIAGE_REASON_TAG]
 
 
@@ -37,6 +38,24 @@ def test_subject_is_not_a_main_queue_gate():
     for subject in ("Photo request", "Photo/video", "Unrelated subject text", ""):
         assert app.is_main_queue_ticket(_ticket(subject=subject))
         assert app.main_queue_triage_reasons(_ticket(subject=subject)) == []
+
+
+def test_native_service_group_is_authoritative():
+    assert app.is_main_queue_ticket(_ticket(custom_fields={"cf_follow_up_group": "Retail"}))
+    assert app.is_main_queue_ticket(_ticket(custom_fields={}))
+    assert app.main_queue_triage_reasons(_ticket(group_id="154000437139")) == []
+    assert app.main_queue_triage_reasons(_ticket(group_id=154000472479)) == [app.TRIAGE_REASON_GROUP]
+    assert app.main_queue_triage_reasons(_ticket(group_id=None)) == [app.TRIAGE_REASON_GROUP]
+
+
+def test_ticket_444185_like_custom_service_group_is_triage():
+    ticket = _ticket(
+        ticket_id=444185,
+        group_id=154000472479,
+        custom_fields={"cf_follow_up_group": "Service"},
+    )
+    assert not app.is_main_queue_ticket(ticket)
+    assert app.main_queue_triage_reasons(ticket) == [app.TRIAGE_REASON_GROUP]
 
 
 def test_each_dashboard_tag_is_case_and_whitespace_tolerant():
@@ -59,7 +78,7 @@ def test_subject_matcher_accepts_request_variations_and_rejects_loose_words():
 
 
 def test_triage_reasons_are_complete_and_deterministic():
-    ticket = _ticket(status=4, type="Other", custom_fields={"cf_follow_up_group": "Retail"}, tags=[], subject="Photo attached")
+    ticket = _ticket(status=4, type="Other", group_id=154000472479, tags=[], subject="Photo attached")
     assert app.main_queue_triage_reasons(ticket) == [
         app.TRIAGE_REASON_STATUS,
         app.TRIAGE_REASON_TYPE,

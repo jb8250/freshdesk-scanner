@@ -180,7 +180,7 @@ KEYWORD_RE = re.compile(r"(?<![^\W_])(" + "|".join(KEYWORDS) + r")(?![^\W_])", r
 
 MAIN_QUEUE_STATUSES = frozenset({2, 6, 7, 8})
 MAIN_QUEUE_TYPE = "guest callback/follow-up"
-MAIN_QUEUE_GROUP = "service"
+MAIN_QUEUE_GROUP_ID = 154000437139
 MAIN_QUEUE_PHOTO_VIDEO_TAGS = frozenset({
     "photo/video request",
     "photo request",
@@ -324,13 +324,12 @@ def normalized_queue_value(value):
     return " ".join(value.strip().casefold().split()) if isinstance(value, str) else ""
 
 
-def main_queue_group(ticket):
-    if not isinstance(ticket, dict):
-        return ""
-    custom_fields = ticket.get("custom_fields")
-    if isinstance(custom_fields, dict):
-        return normalized_queue_value(custom_fields.get("cf_follow_up_group"))
-    return normalized_queue_value(ticket.get("group"))
+def main_queue_group_id(ticket):
+    value = ticket.get("group_id") if isinstance(ticket, dict) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def main_queue_status(ticket):
@@ -360,7 +359,7 @@ def main_queue_triage_reasons(ticket):
         reasons.append(TRIAGE_REASON_STATUS)
     if normalized_queue_value(ticket.get("type") if isinstance(ticket, dict) else None) != MAIN_QUEUE_TYPE:
         reasons.append(TRIAGE_REASON_TYPE)
-    if main_queue_group(ticket) != MAIN_QUEUE_GROUP:
+    if main_queue_group_id(ticket) != MAIN_QUEUE_GROUP_ID:
         reasons.append(TRIAGE_REASON_GROUP)
     if not has_main_queue_photo_video_tag(ticket):
         reasons.append(TRIAGE_REASON_TAG)
