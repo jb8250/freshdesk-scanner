@@ -62,7 +62,7 @@ def test_expired_active_cached_ticket_absent_from_incoming_survives_merge_and_re
     assert {row["id"] for row in cache_rows()} == {123, 999}
 
 
-@pytest.mark.parametrize("state", ["Resolved", "No Action Needed", "Not Applicable to Me", "Unreviewed"])
+@pytest.mark.parametrize("state", ["Resolved", "No Action", "No Action Needed", "Not Applicable to Me", "Unreviewed"])
 def test_expired_non_active_cached_ticket_is_pruned_without_deleting_review_row(state):
     app.set_review_result(456, state, reviewed_updated_at="2026-01-01T00:00:00Z")
     before = app.load_review_rows()[456].copy()

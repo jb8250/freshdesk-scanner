@@ -18,6 +18,7 @@ CANONICAL_REVIEW_STATES = frozenset({
     "Opened / In Review",
     "Needs Supervisor Review",
     "Resolved",
+    "No Action",
     "Not Applicable to Me",
     "No Action Needed",
     "Needs Follow-Up",

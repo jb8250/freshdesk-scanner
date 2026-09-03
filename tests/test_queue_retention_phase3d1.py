@@ -15,7 +15,7 @@ from queue_retention import (
 REF = "2026-08-21T10:00:00Z"
 CUTOFF = "2026-06-22T10:00:00Z"
 ACTIVE = ["Opened / In Review", "Needs Follow-Up", "Needs Supervisor Review"]
-NON_ACTIVE = ["Resolved", "No Action Needed", "Not Applicable to Me", "Unreviewed"]
+NON_ACTIVE = ["Resolved", "No Action", "No Action Needed", "Not Applicable to Me", "Unreviewed"]
 
 
 def ticket(ticket_id=1, updated_at=CUTOFF, status=2, **extra):
@@ -59,6 +59,14 @@ def test_each_active_state_protects_expired_ticket(state):
 @pytest.mark.parametrize("state", NON_ACTIVE)
 def test_each_non_active_state_does_not_protect_expired_ticket(state):
     assert run([ticket(updated_at="2026-06-21T10:00:00Z")], {1: state}).tickets == []
+
+
+def test_no_action_within_retention_window_is_accepted():
+    assert ids(run([ticket(updated_at="2026-08-20T10:00:00Z")], {1: "No Action"})) == [1]
+
+
+def test_no_action_beyond_retention_window_is_not_an_active_exception():
+    assert run([ticket(updated_at="2026-06-21T10:00:00Z")], {1: "No Action"}).tickets == []
 
 
 def test_missing_review_row_is_ordinary():
@@ -143,7 +151,7 @@ def test_retention_days_must_be_positive_integer(days): invalid(lambda: run([tic
 def test_review_states_must_be_mapping(states): invalid(lambda: apply_queue_retention([ticket()], states, reference_time=REF))
 def test_invalid_review_state_key_fails(): invalid(lambda: run([ticket()], {0: "Resolved"}))
 def test_invalid_review_state_value_type_fails(): invalid(lambda: run([ticket()], {1: 3}))
-def test_unknown_review_state_fails(): invalid(lambda: run([ticket()], {1: "Unknown"}))
+def test_unknown_review_state_fails(): invalid(lambda: run([ticket()], {1: "Totally Unknown State"}))
 def test_null_review_state_is_allowed_but_non_active(): assert run([ticket(updated_at="2026-01-01T00:00:00Z")], {1: None}).tickets == []
 
 def test_validation_is_fail_closed_without_partial_result():
