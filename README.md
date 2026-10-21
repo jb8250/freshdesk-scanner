@@ -26,6 +26,70 @@ Successful **Refresh Tickets** applies a rolling 60-day retention policy after r
 
 The SQLite review database is automatically protected with verified, SQLite-consistent backups in `~/FreshdeskScannerBackups/review_state` by default. Set `REVIEW_BACKUP_DIR` to override the location and `REVIEW_BACKUP_KEEP` to configure retention (default: 200 automatic generations; malformed values use the safe default). A startup baseline and successful queue review, acknowledge-update, automatic review advancement, opened-state, and closed-review mutation create backups. Each backup uses SQLite's backup API, integrity verification, SHA-256 metadata, a temporary file, and atomic finalization. Manual/recovery files are never pruned; only the feature's automatic filename pattern is rotated. If backup work fails, the local database mutation remains committed and the failure is logged (with a concise warning where practical). Tests always use temporary `REVIEW_DB_PATH` and `REVIEW_BACKUP_DIR`; backup protection makes no Freshdesk requests.
 
+## Portland / No Coverage — provisional preview
+
+`/queue?queue_scope=portland` reuses the normal cached-ticket filters, review
+workflow tabs, review identity, and XLSX export. **By default this is only a
+classification preview.** Tentative candidates remain in their original Main
+Queue or Needs Triage; the separately labelled preview count overlaps those
+working queues and must not be added to active membership totals. No ticket is
+confirmed or automatically excluded by installing this feature.
+
+The initial **provisional** grammar `ascii-10-comma-v1` accepts only the complete
+string at `ticket["custom_fields"]["cf_order"]`: exactly ten ASCII digits per
+reference, optionally separated by commas, with ASCII spaces/tabs around the
+field and commas. It preserves identifiers as strings, including leading zeros,
+and never alters the source field. All parsed references must start with `7` to
+appear as a Portland-only candidate. Mixed-prefix, missing, malformed, partially
+supported, or wrong-type values stay in their original working queue. Other
+delimiters, labels, non-ASCII digits, and other lengths are currently unsupported;
+**ten digits is not an approved universal sales-order rule**. No numbers are
+extracted from subjects, descriptions, phone fields, or other text. Store/home
+store fields have no verified mapping and are not used as proof. Raw order values
+are not added to UI diagnostics or exports.
+
+### Activation boundary — do not activate before business approval
+
+The only routing switch is the process environment variable
+`FRESHDESK_PORTLAND_APPROVED_GRAMMAR`. It is disabled when absent or when its value
+differs from the exact supported grammar identifier. URL/form values cannot
+activate it. Existing installations therefore default to preview.
+
+Final activation requires **separate authorization**:
+
+1. Confirm that `cf_order` is authoritative and approve the complete grammar,
+   including lengths, comma-separated multi-order semantics, and the prefix-7
+   mapping. Decide how mixed-origin and conflicting-location tickets are handled.
+2. If that contract differs from `ascii-10-comma-v1`, revise the parser, grammar
+   identifier, and synthetic tests first; do not activate an approximation.
+3. Review preview results privately without publishing customer records or raw
+   orders. Run the isolated offline tests; obtain rollout approval.
+4. Only then configure the scanner process with
+   `FRESHDESK_PORTLAND_APPROVED_GRAMMAR=ascii-10-comma-v1` and restart it through the
+   separately approved operational procedure. Do not put this setting in a
+   public credential/environment file. No database migration, cache conversion,
+   or Freshdesk request is required for classification.
+5. Approved routing evaluates Portland **before** the unchanged Main/Triage
+   rules. Three active scopes are disjoint; mixed/unknown tickets remain under
+   existing Main/Triage rules. Unset the variable and restart to return to
+   non-excluding preview without rewriting tickets or reviews.
+
+Scope changes never save/reset review results, notes, timestamps, or update
+snapshots. Explicit review/open/acknowledge actions retain their existing local
+behavior. Normal/Closed mode switching preserves the selected normal scope;
+Closed mode itself and the separate legacy `/closed` cache remain unchanged.
+Successful manual refresh, Reset, and Show All retain their existing return-to-
+Main behavior. Filters and workflow can still hide a preview/Portland ticket;
+this is not an inventory of every historical Portland order. Existing retention
+and scheduling are unchanged.
+
+For offline tests use synthetic tickets and temporary database/cache/backup
+paths. `FRESHDESK_OFFLINE=1` alone does **not** isolate the review database.
+Ordinary old fixtures keep their legacy queue behavior while routing is off;
+strict cache-preview tests must use temporary synthetic caches. Activated
+offline tests use the real three-way partition. Do not use production caches or
+manual live probes for validation.
+
 ## What It Does
 
 - Retrieves Freshdesk tickets only when **Refresh Tickets** is explicitly clicked

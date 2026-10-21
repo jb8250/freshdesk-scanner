@@ -107,7 +107,7 @@ def test_closed_mode_uses_only_master_cache_and_local_toggles(client, monkeypatc
 def test_mode_switch_script_preserves_normal_state_and_enters_closed_defaults(client):
     page = client.get("/queue?workflow_tab=resolved&photo_video_only=0&hide_reviewed_tags=0&missing_tags=1&review_view=completed").get_data(as_text=True)
     assert 'data-rendered-mode="normal"' in page
-    assert "normalKeys = ['photo_video_only', 'hide_reviewed_tags', 'missing_tags', 'days', 'review_view', 'workflow_tab']" in page
+    assert "normalKeys = ['photo_video_only', 'hide_reviewed_tags', 'missing_tags', 'days', 'review_view', 'workflow_tab', 'queue_scope']" in page
     assert "q.set('normal_' + name" in page
     assert "q.delete(name);" in page
     assert "normalReturnValue(q, name)" in page
@@ -138,7 +138,7 @@ def test_closed_navigation_preserves_normal_return_state(client):
         "photo_video_only": ["0"], "hide_reviewed_tags": ["0"],
         "missing_tags": ["1"], "days": ["17"],
         "review_view": ["completed"], "workflow_tab": ["resolved"],
-        "mode": ["normal"],
+        "mode": ["normal"], "queue_scope": ["main"],
     }
     normal = client.get(returned).get_data(as_text=True)
     assert 'data-rendered-mode="normal"' in normal

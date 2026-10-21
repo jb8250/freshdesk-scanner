@@ -370,6 +370,59 @@ def is_main_queue_ticket(ticket):
     return not main_queue_triage_reasons(ticket)
 
 
+PORTLAND_ORDER_GRAMMAR = "ascii-10-comma-v1"
+_PROVISIONAL_ORDER_RE = re.compile(r"[0-9]{10}(?:[ \t]*,[ \t]*[0-9]{10})*")
+
+
+def parse_sales_orders(ticket):
+    """Parse a COMPLETE provisional field, never arbitrary ticket text.
+
+    This grammar is not a universal sales-order validity rule. It accepts only
+    ten ASCII digits per reference, optionally comma-separated, with ASCII
+    spaces/tabs around the field and commas. Unsupported input is unknown.
+    Source dictionaries/strings are never changed and leading zeros survive.
+    """
+    custom = ticket.get("custom_fields") if isinstance(ticket, dict) else None
+    raw = custom.get("cf_order") if isinstance(custom, dict) else None
+    if not isinstance(raw, str):
+        return ()
+    value = raw.strip(" \t")
+    if not _PROVISIONAL_ORDER_RE.fullmatch(value):
+        return ()
+    return tuple(dict.fromkeys(part.strip(" \t") for part in value.split(",")))
+
+
+def classify_portland_ticket(ticket):
+    """Describe provisional order evidence, NOT confirmed store ownership.
+
+    Missing, malformed, and partially supported fields are unknown. Location
+    fields have no verified mapping and are deliberately not consulted.
+    """
+    orders = parse_sales_orders(ticket)
+    if not orders:
+        return "unknown"
+    prefixes = {order.startswith("7") for order in orders}
+    if len(prefixes) > 1:
+        return "mixed"
+    return "portland_only" if True in prefixes else "non_portland_only"
+
+
+def portland_routing_enabled():
+    """Only explicit operator approval of this exact grammar enables exclusion.
+
+    Default/unknown values fail safe to preview. This is process configuration,
+    never a request parameter; do not set it before business-rule approval.
+    """
+    return os.environ.get("FRESHDESK_PORTLAND_APPROVED_GRAMMAR") == PORTLAND_ORDER_GRAMMAR
+
+
+def queue_scope_for_ticket(ticket, *, portland_enabled=False):
+    """Pure active-membership decision, independent of the overlapping preview."""
+    if portland_enabled and classify_portland_ticket(ticket) == "portland_only":
+        return "portland"
+    return "main" if is_main_queue_ticket(ticket) else "triage"
+
+
 def ticket_matches_photo_video(ticket):
     """True when a ticket's subject or any valid Freshdesk tag matches.
 
@@ -645,7 +698,7 @@ def parse_queue_mode(value):
 
 
 def parse_queue_scope(value):
-    return "triage" if value == "triage" else "main"
+    return value if value in ("triage", "portland") else "main"
 
 
 def filters_from_args(args, submitted=False):
@@ -677,8 +730,9 @@ def filters_from_args(args, submitted=False):
     }
     workflow_tab = _last_value(args, "workflow_tab")
     cfg["workflow_tab"] = parse_workflow_tab(workflow_tab) if workflow_tab is not None else DEFAULT_FILTERS["workflow_tab"]
-    if parse_queue_scope(_last_value(args, "queue_scope")) == "triage":
-        cfg["queue_scope"] = "triage"
+    scope = parse_queue_scope(_last_value(args, "queue_scope"))
+    if scope != "main":
+        cfg["queue_scope"] = scope
     # Closed mode carries the immediately preceding Normal Review workspace in
     # private URL parameters. Keep it absent for a direct Closed entry: there
     # is no saved Normal workspace to synthesize in that case.
@@ -721,8 +775,9 @@ def filter_query_string(config):
         "review_view": config.get("review_view", "all"),
         "workflow_tab": parse_workflow_tab(config.get("workflow_tab", "main")),
     }
-    if parse_queue_scope(config.get("queue_scope", "main")) == "triage":
-        params["queue_scope"] = "triage"
+    scope = parse_queue_scope(config.get("queue_scope", "main"))
+    if scope != "main":
+        params["queue_scope"] = scope
     normal_return = config.get("normal_return")
     if mode == "closed" and isinstance(normal_return, dict):
         for name in NORMAL_RETURN_FIELDS:
@@ -2697,23 +2752,37 @@ def build_current_queue_view(raw, config):
         if not show_all_cached:
             tickets = [t for t in tickets if t.get("status") != CLOSED_STATUS and str(t.get("status")) != str(CLOSED_STATUS)]
 
-    queue_scope_counts = {"main": 0, "triage": 0}
+    queue_scope_counts = {"main": 0, "triage": 0, "portland": 0}
+    portland_preview_count = 0
     if not closed_mode:
-        classified_tickets = []
-        for ticket in tickets:
-            scope = "main" if is_main_queue_ticket(ticket) else "triage"
-            queue_scope_counts[scope] += 1
-            if scope == config.get("queue_scope", "main"):
-                classified_tickets.append(ticket)
-        tickets = classified_tickets
-        # Offline fixtures predate the Freshdesk dashboard metadata fields. Keep
-        # fixture-based regression tests exercising the legacy review workflow;
-        # live cached preview data always uses the strict Main/Triage split.
-        if is_offline() and os.environ.get("FRESHDESK_OFFLINE_CACHE", "").strip().lower() not in ("1", "true", "yes"):
+        enabled = portland_routing_enabled()
+        selected_scope = config.get("queue_scope", "main")
+        candidates = [ticket for ticket in tickets
+                      if classify_portland_ticket(ticket) == "portland_only"]
+        legacy_offline = (is_offline() and os.environ.get("FRESHDESK_OFFLINE_CACHE", "").strip().lower()
+                          not in ("1", "true", "yes"))
+        # Preserve metadata-poor fixture compatibility while routing is OFF.
+        # Once approved, offline data must exercise the real disjoint partition.
+        if legacy_offline and not enabled:
             tickets = apply_queue_filters(raw, normal_config)
             if not show_all_cached:
                 tickets = [ticket for ticket in tickets if main_queue_status(ticket) != CLOSED_STATUS]
-            queue_scope_counts = {"main": len(tickets), "triage": 0}
+            candidates = [ticket for ticket in tickets
+                          if classify_portland_ticket(ticket) == "portland_only"]
+            queue_scope_counts["main"] = len(tickets)
+            active_tickets = tickets
+        else:
+            active_tickets = []
+            for ticket in tickets:
+                scope = queue_scope_for_ticket(ticket, portland_enabled=enabled)
+                queue_scope_counts[scope] += 1
+                if scope == selected_scope:
+                    active_tickets.append(ticket)
+        # Preview membership overlaps working queues deliberately. Its count is
+        # separate from active membership totals; portland stays zero above.
+        if not enabled:
+            portland_preview_count = len(candidates)
+        tickets = candidates if selected_scope == "portland" and not enabled else active_tickets
 
     state_rows = load_review_rows()
     last_opened_id = last_opened_ticket_id()
@@ -2769,7 +2838,7 @@ def build_current_queue_view(raw, config):
             "badges": ticket_badges(t, state_row, updated_flag),
             "can_acknowledge": bool(state_row and state_row.get("review_result") in REVIEWED_STATES and updated_flag),
         })
-    return rows, workflow_counts, queue_scope_counts, all_categories_off, last_opened_id, show_all_cached
+    return rows, workflow_counts, queue_scope_counts, all_categories_off, last_opened_id, show_all_cached, portland_preview_count
 
 
 @app.route("/queue")
@@ -2806,11 +2875,12 @@ def queue():
     except OfflineDataError as e:
         return _queue_error_page(str(e), offline)
 
-    rows, workflow_counts, queue_scope_counts, all_categories_off, last_opened_id, show_all_cached = build_current_queue_view(raw, config)
+    rows, workflow_counts, queue_scope_counts, all_categories_off, last_opened_id, show_all_cached, portland_preview_count = build_current_queue_view(raw, config)
     flash_msg = session.pop("flash", None)
     return _queue_render(
         tickets=rows, total=len(rows), error=missing_key_msg,
         workflow_counts=workflow_counts, queue_scope_counts=queue_scope_counts,
+        portland_preview_count=portland_preview_count,
         offline=offline, cache_age=cache_age,
         config=config, csrf_token=get_csrf_token(), flash=flash_msg,
         all_categories_off=all_categories_off, last_opened_id=last_opened_id,
@@ -2939,11 +3009,20 @@ def queue_export_xlsx():
         raw, _cache_age = get_ticket_pool()
     except OfflineDataError as e:
         return _queue_error_page(str(e), is_offline())
-    rows, _counts, _scope_counts, _all_categories_off, _last_opened_id, _show_all = build_current_queue_view(raw, config)
+    rows, _counts, _scope_counts, _all_categories_off, _last_opened_id, _show_all, _preview_count = build_current_queue_view(raw, config)
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Current View"
+    if config["mode"] == "normal" and config.get("queue_scope") == "portland":
+        enabled = portland_routing_enabled()
+        sheet.title = "Portland" if enabled else "Portland Preview"
+        notice = workbook.create_sheet("Classification Notice")
+        notice.append(["Portland / No Coverage" if enabled else "Provisional Portland classification preview"])
+        notice.append([f"Supported grammar: {PORTLAND_ORDER_GRAMMAR}"])
+        notice.append(["Operator-approved routing enabled." if enabled else
+                       "Tentative candidates only; active Main/Triage membership is unchanged. Exclusion requires grammar validation and explicit activation."])
+        notice.column_dimensions["A"].width = 100
     headers = ["Ticket #", "Subject", "Status", "Priority", "Updated", "Created", "Tags", "Review Result"]
     if config["mode"] == "normal" and config.get("queue_scope", "main") == "triage":
         headers.append("Why here?")
@@ -3449,8 +3528,13 @@ QUEUE_HTML = """\
 
 {% if config.mode == 'normal' %}
 <nav class=workflow-tabs aria-label="Queue scope">
-{% for scope, label in [('main', 'Main Queue'), ('triage', 'Needs Triage')] %}<a class="workflow-tab{% if config.get("queue_scope", "main") == scope %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, queue_scope=scope)) }}" {% if config.get("queue_scope", "main") == scope %}aria-current=page{% endif %}>{{ label }} <span class=workflow-tab-count>({{ queue_scope_counts[scope] }})</span></a>{% endfor %}
+{% for scope, label in [('main', 'Main Queue'), ('triage', 'Needs Triage'), ('portland', 'Portland / No Coverage')] %}<a class="workflow-tab{% if config.get("queue_scope", "main") == scope %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, queue_scope=scope)) }}" {% if config.get("queue_scope", "main") == scope %}aria-current=page{% endif %}>{{ label }}{% if scope == 'portland' and not portland_routing_active %} — Preview <span class=workflow-tab-count>({{ portland_preview_count }} tentative)</span>{% else %} <span class=workflow-tab-count>({{ queue_scope_counts[scope] }})</span>{% endif %}</a>{% endfor %}
 </nav>
+{% if not portland_routing_active %}
+<div class=banner role=status>Portland classification is provisional. Preview candidates are not confirmed and remain in their existing Main Queue or Needs Triage. The preview count overlaps working queues and is not an active membership total. Active exclusion requires grammar validation and explicit operator activation.</div>
+{% elif config.get("queue_scope") == 'portland' %}
+<div class=banner role=status>Portland routing is enabled for the operator-approved order grammar. Mixed or unsupported order fields remain in Main Queue or Needs Triage under existing rules.</div>
+{% endif %}
 {% endif %}
 <nav class=workflow-tabs aria-label="Review workflow">
 {% for tab in ['main','supervisor','followup','resolved','no_action'] %}<a class="workflow-tab{% if config.workflow_tab == tab %} active{% endif %}" href="/queue?{{ filter_query_string(dict(config, workflow_tab=tab)) }}" {% if config.workflow_tab == tab %}aria-current=page{% endif %}>{{ workflow_labels[tab] }} <span class=workflow-tab-count>({{ workflow_counts[tab] }})</span></a>{% endfor %}
@@ -3679,7 +3763,7 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
   // remain native GET requests.
   var renderedMode = form.getAttribute('data-rendered-mode') || 'normal';
   var modeEl = form.querySelector('select[name="mode"]');
-  var normalKeys = ['photo_video_only', 'hide_reviewed_tags', 'missing_tags', 'days', 'review_view', 'workflow_tab'];
+  var normalKeys = ['photo_video_only', 'hide_reviewed_tags', 'missing_tags', 'days', 'review_view', 'workflow_tab', 'queue_scope'];
   function currentValue(name, fallback) {
     var checked = form.querySelector('input[type=checkbox][name="' + name + '"]');
     if (checked) { return checked.checked ? '1' : '0'; }
@@ -3693,7 +3777,8 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
       missing_tags: '0',
       days: '60',
       review_view: 'all',
-      workflow_tab: 'main'
+      workflow_tab: 'main',
+      queue_scope: 'main'
     };
     return q.has('normal_' + name) ? q.get('normal_' + name) : canonical[name];
   }
@@ -3704,7 +3789,7 @@ document.querySelectorAll('a[data-ticket-id]').forEach(function (a) {
     var q = new URLSearchParams(window.location.search);
     q.set('mode', targetMode);
     if (renderedMode === 'normal' && targetMode === 'closed') {
-      normalKeys.forEach(function (name) { q.set('normal_' + name, currentValue(name, name === 'workflow_tab' ? 'main' : name === 'review_view' ? 'all' : '0')); });
+      normalKeys.forEach(function (name) { q.set('normal_' + name, currentValue(name, name === 'workflow_tab' || name === 'queue_scope' ? 'main' : name === 'review_view' ? 'all' : '0')); });
       // Absent is significant on Closed entry: the server supplies its ON
       // defaults, while later explicit Closed form choices remain 0/1.
       ['photo_video_only', 'hide_reviewed_tags', 'missing_tags'].forEach(function (name) { q.delete(name); });
@@ -4166,7 +4251,9 @@ def _queue_render(**kwargs):
     ctx.setdefault("filter_query_string", filter_query_string)
     ctx.setdefault("workflow_counts", {tab: 0 for tab in WORKFLOW_TABS})
     ctx.setdefault("workflow_labels", WORKFLOW_LABELS)
-    ctx.setdefault("queue_scope_counts", {"main": 0, "triage": 0})
+    ctx.setdefault("queue_scope_counts", {"main": 0, "triage": 0, "portland": 0})
+    ctx.setdefault("portland_preview_count", 0)
+    ctx.setdefault("portland_routing_active", portland_routing_enabled())
     ctx.setdefault("live_cache_missing", False)
     ctx.setdefault("last_refresh_display", "Never")
     ctx.setdefault("cache_coverage_display", "Unknown")

@@ -96,7 +96,7 @@ def test_queue_partition_and_review_identity(monkeypatch):
     monkeypatch.setattr(app, "updated_since_review", lambda ticket, state: False)
     main_rows, _, counts, *_ = app.build_current_queue_view([main, triage], dict(config, queue_scope="main"))
     triage_rows, _, _, *_ = app.build_current_queue_view([main, triage], dict(config, queue_scope="triage"))
-    assert counts == {"main": 1, "triage": 1}
+    assert counts == {"main": 1, "triage": 1, "portland": 0}
     assert [row["id"] for row in main_rows] == [950010]
     assert [row["id"] for row in triage_rows] == [950011]
     assert main_rows[0]["result"] == triage_rows[0]["result"] == "Resolved"
